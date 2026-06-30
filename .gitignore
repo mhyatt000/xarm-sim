@@ -1,3 +1,7 @@
+# other
+*.ply
+*.exr
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -8,3 +12,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local and generated simulation data
+tmpgenesis/
+__nyx_cache__/
+outputs/
+logs/
+last.ply
+*.mp4
+left.png
+depth.png
+depth.npy
