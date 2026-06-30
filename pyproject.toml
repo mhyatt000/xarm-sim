@@ -21,6 +21,7 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "tensordict>=0.13.0",
     "torch>=2.12.1",
+    "tyro>=1.0.15",
 ]
 
 [tool.uv]
