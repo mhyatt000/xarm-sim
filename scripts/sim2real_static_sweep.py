@@ -1,21 +1,56 @@
-import argparse
 import csv
+from dataclasses import dataclass
 import itertools
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal, TypeVar
 
 import av
 import numpy as np
 import torch
+import tyro
 from PIL import Image
 
 import genesis as gs
 import scripted_grasp_policy_room as room
 
 
+T = TypeVar("T")
+
+
+@dataclass
+class Config:
+    """Configuration for the sim-to-real static sweep."""
+
+    output_dir: Path = Path("outputs/sim2real_static_sweep")  # Directory for rendered cases and the CSV summary.
+    reference: Path = Path("left.png")  # Optional reference image for image statistics.
+    backend: Literal["cpu", "gpu"] = "gpu"  # Genesis backend to initialize.
+    envmap_multipliers: str = "0.8,1.2,1.6"  # Comma-separated environment map multipliers.
+    envmap_rotations: str = "0,30,60"  # Comma-separated environment map rotations in degrees.
+    camera_fovs: str = str(room.ZED_LEFT_FHD_VERTICAL_FOV_DEG)  # Comma-separated camera FOV values.
+    floor_roughnesses: str = "0.25,0.45"  # Comma-separated floor roughness values.
+    floor_metallics: str = "0.0,0.3"  # Comma-separated floor metallic values.
+    floor_color: str = "#6f767b"  # Floor color as a hex RGB string.
+    wall_color: str = "#aaabab"  # Wall color as a hex RGB string.
+    steps: int = 3  # Simulation steps to render for each static case.
+    single_case: bool = False  # Render one case instead of launching the full sweep.
+    case_name: str | None = None  # Single-case output stem.
+    envmap_multiplier: float | None = None  # Single-case environment map multiplier.
+    envmap_rotation: float | None = None  # Single-case environment map rotation in degrees.
+    camera_fov: float | None = None  # Single-case camera FOV.
+    floor_roughness: float | None = None  # Single-case floor roughness.
+    floor_metallic: float | None = None  # Single-case floor metallic value.
+
+
 def parse_floats(value: str) -> list[float]:
     return [float(item) for item in value.split(",") if item]
+
+
+def require_single_case_value(value: T | None, name: str) -> T:
+    if value is None:
+        raise SystemExit(f"--{name.replace('_', '-')} is required with --single-case.")
+    return value
 
 
 def render_case(
@@ -33,7 +68,7 @@ def render_case(
     mp4_path = output_dir / f"{case_name}.mp4"
     png_path = output_dir / f"{case_name}.png"
 
-    env_cfg = dict(room.ROOM_ENV_CFG)
+    env_cfg = room.make_room_env_cfg()
     env_cfg.update(
         {
             "envmap_multiplier": envmap_multiplier,
@@ -52,7 +87,7 @@ def render_case(
     env = room.base.build_env(
         video_path=str(mp4_path),
         show_viewer=False,
-        envmap_hdr=str(Path("lab-hdri.exr")),
+        envmap_hdr=str(room.DEFAULT_HDR_PATH),
         use_nyx_camera=True,
         extra_env_cfg=env_cfg,
         robot_cfg_overrides=room.XARM7_ROBOT_CFG,
@@ -91,60 +126,39 @@ def image_stats(path: Path, reference: np.ndarray | None) -> dict[str, float]:
     return stats
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", default="outputs/sim2real_static_sweep")
-    parser.add_argument("--reference", default="left.png")
-    parser.add_argument("--backend", choices=["cpu", "gpu"], default="gpu")
-    parser.add_argument("--envmap-multipliers", default="0.8,1.2,1.6")
-    parser.add_argument("--envmap-rotations", default="0,30,60")
-    parser.add_argument("--camera-fovs", default=str(room.ZED_LEFT_FHD_VERTICAL_FOV_DEG))
-    parser.add_argument("--floor-roughnesses", default="0.25,0.45")
-    parser.add_argument("--floor-metallics", default="0.0,0.3")
-    parser.add_argument("--floor-color", default="#6f767b")
-    parser.add_argument("--wall-color", default="#aaabab")
-    parser.add_argument("--steps", type=int, default=3)
-    parser.add_argument("--single-case", action="store_true")
-    parser.add_argument("--case-name")
-    parser.add_argument("--envmap-multiplier", type=float)
-    parser.add_argument("--envmap-rotation", type=float)
-    parser.add_argument("--camera-fov", type=float)
-    parser.add_argument("--floor-roughness", type=float)
-    parser.add_argument("--floor-metallic", type=float)
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
+def main(cfg: Config) -> None:
+    output_dir = cfg.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.single_case:
-        backend = gs.cpu if args.backend == "cpu" else gs.gpu
+    if cfg.single_case:
+        backend = gs.cpu if cfg.backend == "cpu" else gs.gpu
         gs.init(backend=backend, precision="32", logging_level="warning")
         render_case(
             output_dir=output_dir,
-            case_name=args.case_name,
-            envmap_multiplier=args.envmap_multiplier,
-            envmap_rotation_deg=args.envmap_rotation,
-            camera_fov=args.camera_fov,
-            floor_roughness=args.floor_roughness,
-            floor_metallic=args.floor_metallic,
-            floor_color=room.hex_rgb(args.floor_color),
-            wall_color=room.hex_rgb(args.wall_color),
-            steps=args.steps,
+            case_name=require_single_case_value(cfg.case_name, "case_name"),
+            envmap_multiplier=require_single_case_value(cfg.envmap_multiplier, "envmap_multiplier"),
+            envmap_rotation_deg=require_single_case_value(cfg.envmap_rotation, "envmap_rotation"),
+            camera_fov=require_single_case_value(cfg.camera_fov, "camera_fov"),
+            floor_roughness=require_single_case_value(cfg.floor_roughness, "floor_roughness"),
+            floor_metallic=require_single_case_value(cfg.floor_metallic, "floor_metallic"),
+            floor_color=room.hex_rgb(cfg.floor_color),
+            wall_color=room.hex_rgb(cfg.wall_color),
+            steps=cfg.steps,
         )
         return
 
     reference = None
-    ref_path = Path(args.reference)
+    ref_path = cfg.reference
     if ref_path.exists():
         reference = np.asarray(Image.open(ref_path).convert("RGB"))
 
     rows = []
     combos = itertools.product(
-        parse_floats(args.envmap_multipliers),
-        parse_floats(args.envmap_rotations),
-        parse_floats(args.camera_fovs),
-        parse_floats(args.floor_roughnesses),
-        parse_floats(args.floor_metallics),
+        parse_floats(cfg.envmap_multipliers),
+        parse_floats(cfg.envmap_rotations),
+        parse_floats(cfg.camera_fovs),
+        parse_floats(cfg.floor_roughnesses),
+        parse_floats(cfg.floor_metallics),
     )
     for idx, (multiplier, rotation, fov, roughness, metallic) in enumerate(combos):
         case_name = (
@@ -157,7 +171,7 @@ def main() -> None:
                 __file__,
                 "--single-case",
                 "--backend",
-                args.backend,
+                cfg.backend,
                 "--output-dir",
                 str(output_dir),
                 "--case-name",
@@ -173,11 +187,11 @@ def main() -> None:
                 "--floor-metallic",
                 str(metallic),
                 "--floor-color",
-                args.floor_color,
+                cfg.floor_color,
                 "--wall-color",
-                args.wall_color,
+                cfg.wall_color,
                 "--steps",
-                str(args.steps),
+                str(cfg.steps),
             ],
             check=True,
         )
@@ -205,4 +219,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(Config))

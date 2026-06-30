@@ -1,12 +1,18 @@
-import argparse
 from copy import deepcopy
+from dataclasses import dataclass
 import math
 from pathlib import Path
+import sys
+from typing import Literal
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import torch
+import tyro
 
 import genesis as gs
-import scripted_grasp_policy as base
+from xsim import scripted_grasp_policy as base
 
 
 def hex_rgb(value: str) -> tuple[float, float, float]:
@@ -17,7 +23,9 @@ def hex_rgb(value: str) -> tuple[float, float, float]:
 ZED_FHD_RESOLUTION = (1920, 1080)
 ZED_LEFT_FHD_FY = 1066.84
 ZED_LEFT_FHD_VERTICAL_FOV_DEG = 53.69412375493809
-LAST_PLY = Path(__file__).with_name("last.ply")
+DEFAULT_HDR_PATH = PROJECT_ROOT / "assets" / "lab-hdri.hdr"
+DEFAULT_SPLAT_PATH = PROJECT_ROOT / "last.ply"
+ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
 
 
 ROOM_ENV_CFG = {
@@ -32,12 +40,7 @@ ROOM_ENV_CFG = {
     "envmap_camera_pos": (1.1204473972320557, 0.445988267660141, 0.23296283185482025),
     "envmap_camera_lookat": (0.28134316205978394, -0.09777036309242249, 0.24815453682094812),
     "envmap_camera_up": (0.025124434381723404, -0.010843032971024513, 0.9996255040168762),
-    "nyx_light_fields": [
-        {
-            "uri": str(LAST_PLY),
-            "rotation": (0.0, 0.0, -0.70710678, 0.70710678),
-        },
-    ],
+    "nyx_light_fields": [],
     "walls": [],
 }
 
@@ -48,7 +51,7 @@ XARM7_GRIPPER_CLOSED_QPOS = 0.0
 
 XARM7_ROBOT_CFG = {
     "robot_morph": "urdf",
-    "robot_file": str(Path(__file__).with_name("xarm7_standalone.urdf")),
+    "robot_file": str(ROBOT_URDF_PATH),
     "robot_fixed": True,
     "merge_fixed_links": False,
     "ee_link_name": "link_tcp",
@@ -88,13 +91,27 @@ def quat_xyzw_from_rpy_deg(roll: float, pitch: float, yaw: float) -> tuple[float
 
 
 def make_room_env_cfg(
-    splat_pos: list[float] | None = None,
-    splat_rot_rpy_deg: list[float] | None = None,
-    splat_quat: list[float] | None = None,
+    splat_uri: str | Path | None = None,
+    splat_pos: tuple[float, float, float] | None = None,
+    splat_rot_rpy_deg: tuple[float, float, float] | None = None,
+    splat_quat: tuple[float, float, float, float] | None = None,
     splat_scale: float | None = None,
 ) -> dict:
     env_cfg = deepcopy(ROOM_ENV_CFG)
-    splat_cfg = env_cfg["nyx_light_fields"][0]
+    if splat_uri is None and DEFAULT_SPLAT_PATH.exists():
+        splat_uri = DEFAULT_SPLAT_PATH
+
+    if splat_uri is not None:
+        splat_cfg = {
+            "uri": str(Path(splat_uri).expanduser()),
+            "rotation": (0.0, 0.0, -0.70710678, 0.70710678),
+        }
+        env_cfg["nyx_light_fields"] = [splat_cfg]
+    elif any(value is not None for value in (splat_pos, splat_rot_rpy_deg, splat_quat, splat_scale)):
+        raise ValueError("Splat transform arguments require --splat-uri or a repo-root last.ply.")
+    else:
+        return env_cfg
+
     if splat_pos is not None:
         splat_cfg["position"] = tuple(splat_pos)
     if splat_rot_rpy_deg is not None:
@@ -108,6 +125,24 @@ def make_room_env_cfg(
 
 class RoomGraspPolicy(base.GraspPolicy):
     pass
+
+
+@dataclass
+class Config:
+    """Configuration for the scripted room grasp rollout."""
+
+    video_path: Path = Path("scripted_grasp_room.mp4")  # Output MP4 path.
+    steps_per_segment: int = 50  # Simulation steps for each scripted motion segment.
+    viewer: bool = False  # Show the Genesis viewer while rendering.
+    backend: Literal["cpu", "gpu"] = "gpu"  # Genesis backend to initialize.
+    envmap_hdr: Path = DEFAULT_HDR_PATH  # HDR environment map path.
+    splat_uri: Path | None = None  # Optional splat path; defaults to repo-root last.ply when present.
+    no_envmap: bool = False  # Disable the HDR environment map.
+    use_nyx_camera: bool = False  # Render through the Nyx camera.
+    splat_pos: tuple[float, float, float] | None = None  # Optional splat XYZ position.
+    splat_rot_rpy_deg: tuple[float, float, float] | None = None  # Optional splat RPY rotation in degrees.
+    splat_quat: tuple[float, float, float, float] | None = None  # Optional splat quaternion as XYZW.
+    splat_scale: float | None = None  # Optional splat scale.
 
 
 def build_env(
@@ -127,44 +162,32 @@ def build_env(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video-path", default="scripted_grasp_room.mp4")
-    parser.add_argument("--steps-per-segment", type=int, default=50)
-    parser.add_argument("--viewer", action="store_true")
-    parser.add_argument("--backend", choices=["cpu", "gpu"], default="gpu")
-    parser.add_argument("--envmap-hdr", default=str(Path(__file__).with_name("lab-hdri.exr")))
-    parser.add_argument("--no-envmap", action="store_true")
-    parser.add_argument("--use-nyx-camera", action="store_true")
-    parser.add_argument("--splat-pos", type=float, nargs=3, metavar=("X", "Y", "Z"))
-    parser.add_argument("--splat-rot-rpy-deg", type=float, nargs=3, metavar=("ROLL", "PITCH", "YAW"))
-    parser.add_argument("--splat-quat", type=float, nargs=4, metavar=("X", "Y", "Z", "W"))
-    parser.add_argument("--splat-scale", type=float)
-    args = parser.parse_args()
-    if args.splat_rot_rpy_deg is not None and args.splat_quat is not None:
-        parser.error("Use either --splat-rot-rpy-deg or --splat-quat, not both.")
+def main(cfg: Config) -> None:
+    if cfg.splat_rot_rpy_deg is not None and cfg.splat_quat is not None:
+        raise SystemExit("Use either --splat-rot-rpy-deg or --splat-quat, not both.")
 
-    backend = gs.cpu if args.backend == "cpu" else gs.gpu
+    backend = gs.cpu if cfg.backend == "cpu" else gs.gpu
     gs.init(backend=backend, precision="32", logging_level="warning")
 
-    video_path = str(Path(args.video_path))
-    envmap_hdr = None if args.no_envmap else args.envmap_hdr
+    video_path = str(cfg.video_path)
+    envmap_hdr = None if cfg.no_envmap else str(cfg.envmap_hdr)
     room_env_cfg = make_room_env_cfg(
-        splat_pos=args.splat_pos,
-        splat_rot_rpy_deg=args.splat_rot_rpy_deg,
-        splat_quat=args.splat_quat,
-        splat_scale=args.splat_scale,
+        splat_uri=cfg.splat_uri,
+        splat_pos=cfg.splat_pos,
+        splat_rot_rpy_deg=cfg.splat_rot_rpy_deg,
+        splat_quat=cfg.splat_quat,
+        splat_scale=cfg.splat_scale,
     )
     env = build_env(
         video_path=video_path,
-        show_viewer=args.viewer,
+        show_viewer=cfg.viewer,
         envmap_hdr=envmap_hdr,
-        use_nyx_camera=args.use_nyx_camera or envmap_hdr is not None,
+        use_nyx_camera=cfg.use_nyx_camera or envmap_hdr is not None,
         room_env_cfg=room_env_cfg,
     )
-    policy = RoomGraspPolicy(env, steps_per_segment=args.steps_per_segment)
+    policy = RoomGraspPolicy(env, steps_per_segment=cfg.steps_per_segment)
 
-    total_steps = 1 + (6 - 1) * args.steps_per_segment
+    total_steps = 1 + (6 - 1) * cfg.steps_per_segment
     with torch.no_grad():
         env.reset()
         for _ in range(total_steps):
@@ -177,4 +200,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(Config))
