@@ -31,7 +31,10 @@ from xsim.grasp_env import Manipulator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
-DEFAULT_SPLAT_PATH = Path("/data/store/lab.ply")
+# cleaned copy (scripts/clean_splat.py strips the see-through table mush + baked robot);
+# fall back to the raw scan if it hasn't been generated
+_CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
+DEFAULT_SPLAT_PATH = _CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply")
 
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
 BLOCK_COLOR = (0.6, 0.15, 0.13)
@@ -244,7 +247,11 @@ DEFAULT_SPLAT_POS, DEFAULT_SPLAT_QUAT = splat_world_transform()
 @dataclass
 class TableCfg:
     top_z: float = 0.0                                  # table-top height (robot base sits here)
-    color: tuple[float, float, float] = (0.55, 0.55, 0.6)
+    # real cart footprint, measured by inverse-perspective-mapping the calibrated
+    # cap.npz photos onto the z=0 plane (robot base at one end of the table)
+    center_xy: tuple[float, float] = (0.375, 0.01)
+    size_xy: tuple[float, float] = (0.93, 0.62)
+    color: tuple[float, float, float] = (0.13, 0.14, 0.17)  # dark slate like the real cart
 
 
 @dataclass
@@ -265,7 +272,7 @@ class LiftEnvCfg:
     splat_quat: tuple[float, float, float, float] = DEFAULT_SPLAT_QUAT
     splat_scale: float | None = None
     nyx_spp: int = 8
-    nyx_light_intensity: float = 5.0
+    nyx_light_intensity: float = 2.0  # 5.0 washed out the mesh entities vs the dim splat
 
 
 class LiftBlockEnv:
@@ -289,16 +296,26 @@ class LiftBlockEnv:
             show_viewer=self.cfg.show_viewer,
         )
 
-        # flat table plane: collision at the aligned table-top height (z=0). Under the nyx
-        # backend the splat provides the table's appearance, so the plane stays invisible.
+        # flat table plane: invisible collision at the aligned table-top height (z=0)
         t = self.cfg.table
         self.table = self.scene.add_entity(
-            gs.morphs.Plane(
-                pos=(0.0, 0.0, t.top_z),
-                visualization=self.cfg.render_backend != "nyx",
-                collision=True,
+            gs.morphs.Plane(pos=(0.0, 0.0, t.top_z), visualization=False, collision=True),
+        )
+        # visual-only cart body with the real cart's measured footprint: the real dark
+        # metal cart scans as sparse see-through mush in the splat (scripts/clean_splat.py
+        # crops that region out), so this box stands in for it — full depth down to the
+        # floor so it occludes the under-table region from every camera angle, exactly
+        # like the real cart does
+        slab_h = 0.72
+        self.scene.add_entity(
+            gs.morphs.Box(
+                size=(t.size_xy[0], t.size_xy[1], slab_h),
+                pos=(t.center_xy[0], t.center_xy[1], t.top_z - slab_h / 2.0),
+                fixed=True,
+                visualization=True,
+                collision=False,
             ),
-            surface=gs.surfaces.Plastic(color=t.color, roughness=0.7),
+            surface=gs.surfaces.Plastic(color=t.color, roughness=0.8),
         )
 
         # robot (base at world origin, on the table top)
