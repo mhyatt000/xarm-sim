@@ -148,8 +148,7 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
                 if i % env.cfg.record_every == 0:
                     imgs = env.render()
                     pos, vel, eff, ee = env.proprio()
-                    extr = {name: env.extrinsic_base_cam(name) for name in specs}
-                    writer.log_step(base_ns + rec * record_dt_ns, imgs, pos, vel, eff, extr,
+                    writer.log_step(base_ns + rec * record_dt_ns, imgs, pos, vel, eff, None,
                                     ee_pose=ee, gripper_norm=env.gripper_norm())
                     rec += 1
 

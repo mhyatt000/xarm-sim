@@ -3,7 +3,7 @@
 A purpose-built Genesis env (reuses ``Manipulator`` from ``grasp_env`` but does not touch
 ``GraspEnv``) with:
 
-- an explicit **collision-box table** (not just a visual splat), top face at z=0,
+- a flat **collision-plane table** at z=0, aligned with the splat's real table top,
 - a **0.03175 m red cube** (1.25 in) spawned in a configurable table rectangle,
 - three cameras matching the real MCAP rig: ``low``/``side`` static and ``wrist``
   mounted on the EE; each defaults to 640x480.
@@ -214,13 +214,37 @@ DEFAULT_CAMERAS: tuple[CameraView, ...] = (
 )
 
 
+# Splat (lab.ply) → world alignment, solved 2026-07-01. The splat frame is y-down; yaw
+# and horizontal offsets were fitted photometrically (projecting the splat points through
+# the calibrated cameras from /data/store/opencv_calibrated and matching the cap.npz
+# photos), cross-checked against the camera poles located in the scan (agreement ≈ 3 cm).
+# The height pins the scan's table-top plane (y_s = 0.19) exactly to z = 0.
+# Semantics: p_world = R p_splat + t.
+SPLAT_YAW_DEG = 5.0
+SPLAT_ROBOT_BASE = (0.775, 0.19, 0.195)  # robot base point in splat coords (y = cart top)
+
+
+def splat_world_transform(yaw_deg: float = SPLAT_YAW_DEG, base=SPLAT_ROBOT_BASE):
+    """(position, quaternion xyzw) placing lab.ply in the world (robot-base) frame."""
+    th = math.radians(yaw_deg)
+    R0 = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float64)  # y-down → z-up, z_s → +x_w
+    Rz = np.array(
+        [[math.cos(th), -math.sin(th), 0], [math.sin(th), math.cos(th), 0], [0, 0, 1]], dtype=np.float64
+    )
+    R = Rz @ R0
+    t = -R @ np.asarray(base, dtype=np.float64)
+    w = math.sqrt(1.0 + R[0, 0] + R[1, 1] + R[2, 2]) / 2.0
+    quat = ((R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w), w)
+    return tuple(float(v) for v in t), tuple(float(v) for v in quat)
+
+
+DEFAULT_SPLAT_POS, DEFAULT_SPLAT_QUAT = splat_world_transform()
+
+
 @dataclass
 class TableCfg:
-    size: tuple[float, float, float] = (1.2, 1.6, 0.4)  # x, y, z
-    center_xy: tuple[float, float] = (0.45, 0.0)
-    top_z: float = 0.0                                  # top face height (robot base sits here)
+    top_z: float = 0.0                                  # table-top height (robot base sits here)
     color: tuple[float, float, float] = (0.55, 0.55, 0.6)
-    visualization: bool = True
 
 
 @dataclass
@@ -236,9 +260,9 @@ class LiftEnvCfg:
     show_viewer: bool = False
     render_backend: Literal["raster", "nyx"] = "raster"
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
-    splat_pos: tuple[float, float, float] | None = None
+    splat_pos: tuple[float, float, float] | None = DEFAULT_SPLAT_POS
     splat_rot_rpy_deg: tuple[float, float, float] | None = None
-    splat_quat: tuple[float, float, float, float] = (0.0, 0.0, -0.70710678, 0.70710678)
+    splat_quat: tuple[float, float, float, float] = DEFAULT_SPLAT_QUAT
     splat_scale: float | None = None
     nyx_spp: int = 8
     nyx_light_intensity: float = 5.0
@@ -265,17 +289,13 @@ class LiftBlockEnv:
             show_viewer=self.cfg.show_viewer,
         )
 
-        # ground plane (below the table) for physics stability
-        self.scene.add_entity(gs.morphs.Plane(visualization=False, collision=True))
-
-        # explicit collision-box table: top face at cfg.table.top_z
+        # flat table plane: collision at the aligned table-top height (z=0). Under the nyx
+        # backend the splat provides the table's appearance, so the plane stays invisible.
         t = self.cfg.table
         self.table = self.scene.add_entity(
-            gs.morphs.Box(
-                size=t.size,
-                pos=(t.center_xy[0], t.center_xy[1], t.top_z - t.size[2] / 2.0),
-                fixed=True,
-                visualization=t.visualization,
+            gs.morphs.Plane(
+                pos=(0.0, 0.0, t.top_z),
+                visualization=self.cfg.render_backend != "nyx",
                 collision=True,
             ),
             surface=gs.surfaces.Plastic(color=t.color, roughness=0.7),
@@ -410,7 +430,14 @@ class LiftBlockEnv:
         return out
 
     def intrinsics(self, name: str) -> np.ndarray:
-        return np.asarray(self.cams[name].intrinsics, dtype=np.float64)
+        cam = self.cams[name]
+        if hasattr(cam, "intrinsics"):
+            return np.asarray(cam.intrinsics, dtype=np.float64)
+        # nyx sensors don't expose K; derive it from the view's vertical FOV
+        view = next(v for v in self.camera_views if v.name == name)
+        w, h = self.res
+        fy = (h / 2.0) / math.tan(math.radians(view.fov_deg or self.cfg.fov_deg) / 2.0)
+        return np.array([[fy, 0.0, w / 2.0], [0.0, fy, h / 2.0], [0.0, 0.0, 1.0]])
 
     def extrinsic_base_cam(self, name: str) -> np.ndarray:
         """4x4 camera(optical)-to-base transform for FrameTransform (base → cam)."""
