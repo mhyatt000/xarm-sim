@@ -1,13 +1,8 @@
-"""Validate a synthetic episode MCAP against the reference `_base.mcap` schema.
+"""Inspect and compare Foxglove protobuf MCAP episode files.
 
-Reads an MCAP with only numpy/opencv/numcodecs (no mcap/foxglove reader needed):
-lists channels + schemas, counts messages per channel, decodes the first RawImage of each
-camera (dims/encoding/frame_id + YUYV sanity), and checks the channel set is a superset of
-a reference file's image channels.
-
-Usage:
-    python scripts/validate_mcap.py outputs/sim_mcap/fake.mcap \
-        --reference /data/fast/episodes/260618-122602_000007_base.mcap
+MCAP files are logs, so their "shape" is topic -> schema -> message count -> payload
+shape. This script prints that summary and decodes the first message for the training
+relevant real robot topics.
 """
 
 from __future__ import annotations
@@ -20,8 +15,6 @@ import cv2
 import numpy as np
 from numcodecs import Zstd
 
-REFERENCE_IMAGE_TOPICS = {"/cam/side/image_raw", "/cam/wrist/image_raw", "/cam/over/image_raw"}
-
 
 def _str(b: bytes, o: int) -> tuple[str, int]:
     (n,) = struct.unpack_from("<I", b, o)
@@ -30,7 +23,7 @@ def _str(b: bytes, o: int) -> tuple[str, int]:
 
 
 def read_records(path: str):
-    """Yield (op, body) for every top-level record, transparently unchunking (zstd/none)."""
+    """Yield (op, body) for every top-level record, transparently unchunking zstd/none."""
     with open(path, "rb") as f:
         f.seek(8)  # skip magic
         data = f.read()
@@ -90,25 +83,126 @@ def _varint(b: bytes, o: int) -> tuple[int, int]:
             return v, o
 
 
-def parse_rawimage(buf: bytes) -> dict:
-    """Foxglove RawImage: f2=width(fixed32), f3=height, f4=encoding, f5=step, f6=data, f7=frame_id."""
+def _read_fields(buf: bytes) -> dict[int, list[object]]:
     o = 0
-    out: dict = {}
+    out: dict[int, list[object]] = {}
     while o < len(buf):
         tag, o = _varint(buf, o)
         fn, wt = tag >> 3, tag & 7
         if wt == 0:
-            out[fn], o = _varint(buf, o)
+            value, o = _varint(buf, o)
+        elif wt == 1:
+            (value,) = struct.unpack_from("<d", buf, o)
+            o += 8
         elif wt == 2:
             n, o = _varint(buf, o)
-            out[fn] = buf[o : o + n]
+            value = buf[o : o + n]
             o += n
-        elif wt == 1:
-            o += 8
         elif wt == 5:
-            (out[fn],) = struct.unpack_from("<I", buf, o)
+            (value,) = struct.unpack_from("<I", buf, o)
             o += 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wt}")
+        out.setdefault(fn, []).append(value)
     return out
+
+
+def _one(fields: dict[int, list[object]], number: int, default=None):
+    values = fields.get(number)
+    return values[0] if values else default
+
+
+def _decode_str(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def parse_rawimage(buf: bytes) -> dict:
+    """Foxglove RawImage fields: timestamp=1 width=2 height=3 encoding=4 step=5 data=6 frame_id=7."""
+    fields = _read_fields(buf)
+    return {
+        "width": int(_one(fields, 2, 0)),
+        "height": int(_one(fields, 3, 0)),
+        "encoding": _decode_str(_one(fields, 4, b"")),
+        "step": int(_one(fields, 5, 0)),
+        "data": _one(fields, 6, b""),
+        "frame_id": _decode_str(_one(fields, 7, b"")),
+    }
+
+
+def _vec3(buf: bytes) -> tuple[float, float, float]:
+    fields = _read_fields(buf)
+    return (float(_one(fields, 1, 0.0)), float(_one(fields, 2, 0.0)), float(_one(fields, 3, 0.0)))
+
+
+def _quat(buf: bytes) -> tuple[float, float, float, float]:
+    fields = _read_fields(buf)
+    return (
+        float(_one(fields, 1, 0.0)),
+        float(_one(fields, 2, 0.0)),
+        float(_one(fields, 3, 0.0)),
+        float(_one(fields, 4, 0.0)),
+    )
+
+
+def parse_pose(buf: bytes) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    fields = _read_fields(buf)
+    pos = _vec3(_one(fields, 1, b""))
+    quat = _quat(_one(fields, 2, b""))
+    return pos, quat
+
+
+def parse_joint_states(buf: bytes) -> list[dict[str, float | str]]:
+    fields = _read_fields(buf)
+    joints = []
+    for raw in fields.get(2, []):
+        jf = _read_fields(raw)
+        joints.append(
+            {
+                "name": _decode_str(_one(jf, 1, b"")),
+                "position": float(_one(jf, 2, 0.0)),
+                "velocity": float(_one(jf, 3, 0.0)),
+                "effort": float(_one(jf, 5, 0.0)),
+            }
+        )
+    return joints
+
+
+def parse_gripper(buf: bytes) -> dict[str, float]:
+    fields = _read_fields(buf)
+    return {
+        "rad": float(_one(fields, 2, 0.0)),
+        "norm": float(_one(fields, 3, 0.0)),
+        "raw": float(_one(fields, 4, 0.0)),
+    }
+
+
+def rawimage_summary(topic: str, msg: bytes) -> str:
+    ri = parse_rawimage(msg)
+    w, h, step, enc = ri["width"], ri["height"], ri["step"], ri["encoding"]
+    data = ri["data"]
+    shape = "?"
+    mean = "?"
+    ok = "??"
+    try:
+        if enc == "yuv422_yuy2":
+            arr = np.frombuffer(data, np.uint8).reshape(h, w, 2)
+            rgb = cv2.cvtColor(arr, cv2.COLOR_YUV2RGB_YUY2)
+            shape = f"uint8[{h},{w},2]"
+            mean = f"{rgb.mean():.0f}"
+            ok = "OK" if step == w * 2 and len(data) == w * h * 2 else "??"
+        elif enc == "rgb8":
+            rgb = np.frombuffer(data, np.uint8).reshape(h, w, 3)
+            shape = f"uint8[{h},{w},3]"
+            mean = f"{rgb.mean():.0f}"
+            ok = "OK" if step == w * 3 and len(data) == w * h * 3 else "??"
+    except Exception as exc:  # noqa: BLE001 - this is an inspection script
+        mean = f"decode-error:{exc}"
+    return (
+        f"  [{ok}] {topic:45s} {w}x{h} step={step} enc={enc} "
+        f"shape={shape} frame_id={ri['frame_id']!r} rgb_mean={mean}"
+    )
 
 
 def main() -> None:
@@ -121,31 +215,48 @@ def main() -> None:
     by_topic = {t: (cid, sid) for cid, (t, sid) in chans.items()}
 
     print(f"== {args.mcap} ==")
-    print(f"{'topic':30s} {'schema':28s} count")
+    print(f"{'topic':45s} {'schema':24s} count")
     for cid, (topic, sid) in sorted(chans.items(), key=lambda kv: kv[1][0]):
-        print(f"{topic:30s} {schemas.get(sid, '?'):28s} {counts.get(cid, 0)}")
+        print(f"{topic:45s} {schemas.get(sid, '?'):24s} {counts.get(cid, 0)}")
 
-    print("\n-- RawImage decode --")
-    for topic in sorted(t for t in by_topic if t.endswith("/image_raw")):
-        cid, _ = by_topic[topic]
-        ri = parse_rawimage(first[cid])
-        w, h, step = ri.get(2), ri.get(3), ri.get(5)
-        enc = ri[4].decode() if 4 in ri else "?"
-        fid = ri[7].decode() if 7 in ri else "?"
-        ok = "OK" if (enc == "yuv422_yuy2" and step == (w or 0) * 2 and len(ri.get(6, b"")) == (w or 0) * (h or 0) * 2) else "??"
-        yuyv = np.frombuffer(ri[6], np.uint8).reshape(h, w, 2)
-        rgb = cv2.cvtColor(yuyv, cv2.COLOR_YUV2RGB_YUY2)
-        print(f"  [{ok}] {topic:24s} {w}x{h} step={step} enc={enc} frame_id={fid!r} rgb_mean={rgb.mean():.0f}")
+    print()
+    print("-- RawImage payloads --")
+    for cid, (topic, sid) in sorted(chans.items(), key=lambda kv: kv[1][0]):
+        if schemas.get(sid) == "foxglove.RawImage":
+            print(rawimage_summary(topic, first[cid]))
+
+    print()
+    print("-- Proprio samples --")
+    for topic in ("/xarm/joint_states", "/xarm/robot_states", "/xgym/gripper"):
+        if topic not in by_topic:
+            continue
+        cid, sid = by_topic[topic]
+        schema = schemas.get(sid)
+        if schema == "foxglove.JointStates":
+            joints = parse_joint_states(first[cid])
+            names = [j["name"] for j in joints]
+            positions = [round(float(j["position"]), 4) for j in joints]
+            print(f"  {topic}: names={names} position={positions}")
+        elif schema == "foxglove.Pose":
+            pos, quat = parse_pose(first[cid])
+            print(f"  {topic}: position={tuple(round(v, 3) for v in pos)} quat={tuple(round(v, 4) for v in quat)}")
+        elif schema == "xclients.Gripper":
+            print(f"  {topic}: {parse_gripper(first[cid])}")
 
     if args.reference and args.reference.exists():
-        ref_chans, *_ = scan(str(args.reference))
-        ref_topics = {t for _, (t, _) in ref_chans.items()}
-        img_ref = ref_topics & REFERENCE_IMAGE_TOPICS
-        have = set(by_topic)
-        missing = img_ref - have
-        print(f"\n-- vs reference {args.reference.name} --")
-        print(f"  reference image topics: {sorted(ref_topics)}")
-        print(f"  superset of reference image channels: {'YES' if not missing else f'MISSING {missing}'}")
+        ref_chans, ref_schemas, _, _ = scan(str(args.reference))
+        ref_topics = {t: ref_schemas.get(sid, "?") for _, (t, sid) in ref_chans.items()}
+        have_topics = {t: schemas.get(sid, "?") for _, (t, sid) in chans.items()}
+        missing = sorted(set(ref_topics) - set(have_topics))
+        extra = sorted(set(have_topics) - set(ref_topics))
+        schema_diff = sorted(
+            topic for topic in set(ref_topics) & set(have_topics) if ref_topics[topic] != have_topics[topic]
+        )
+        print()
+        print(f"-- vs reference {args.reference.name} --")
+        print(f"  missing topics: {missing or 'none'}")
+        print(f"  extra topics: {extra or 'none'}")
+        print(f"  schema mismatches: {schema_diff or 'none'}")
 
 
 if __name__ == "__main__":

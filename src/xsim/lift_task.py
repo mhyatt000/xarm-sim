@@ -5,13 +5,11 @@ A purpose-built Genesis env (reuses ``Manipulator`` from ``grasp_env`` but does 
 
 - an explicit **collision-box table** (not just a visual splat), top face at z=0,
 - a **0.03175 m red cube** (1.25 in) spawned in a configurable table rectangle,
-- three cameras matching the reference MCAP rig — ``side``/``over`` static, ``wrist``
-  mounted on the EE — each 640×480, exposing intrinsics (fov→K) and extrinsics
-  (base→optical-frame 4×4),
+- three cameras matching the real MCAP rig: ``low``/``side`` static and ``wrist``
+  mounted on the EE; each defaults to 640x480.
 - **physics dt vs record decimation** decoupling.
 
-Frames/axes: Genesis cameras use an OpenGL convention; extrinsics are converted to the
-OpenCV optical frame (z forward, x right, y down) to match the ``*_optical_frame`` naming.
+Frames/axes: Genesis cameras use an OpenGL convention internally.
 """
 
 from __future__ import annotations
@@ -19,22 +17,92 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 
 import genesis as gs
+import gs_nyx.nyx_py_renderer as npr
+import gs_nyx.nyx_py_sdk as nps
+from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
 from xsim.grasp_env import Manipulator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
+DEFAULT_SPLAT_PATH = Path("/data/store/lab.ply")
 
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
 BLOCK_COLOR = (0.6, 0.15, 0.13)
 
 # OpenGL camera (x right, y up, -z forward) → OpenCV optical (x right, y down, +z forward).
 _T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
+
+
+def quat_xyzw_from_rpy_deg(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    roll, pitch, yaw = math.radians(roll), math.radians(pitch), math.radians(yaw)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def _make_light_field(
+    uri: Path,
+    position: tuple[float, float, float] | None,
+    rotation_xyzw: tuple[float, float, float, float],
+    scale: float | tuple[float, float, float] | None,
+):
+    light_field = nps.LightFieldAsset()
+    light_field.type = nps.ELightFieldType.GaussianField
+    light_field.uri = str(uri.expanduser())
+    if position is not None:
+        light_field.position = nps.float3(*position)
+    light_field.rotation = nps.quaternion(*rotation_xyzw)
+    if scale is not None:
+        if isinstance(scale, (int, float)):
+            scale = (float(scale), float(scale), float(scale))
+        light_field.scale = nps.float3(*scale)
+    return light_field
+
+
+def _as_single_np(value) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim > 1 and arr.shape[0] == 1:
+        arr = arr[0]
+    return arr
+
+
+def _quat_wxyz_to_rot(quat) -> np.ndarray:
+    w, x, y, z = _as_single_np(quat)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n == 0.0:
+        return np.eye(3)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _pose_to_T(pos, quat_wxyz) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = _quat_wxyz_to_rot(quat_wxyz)
+    T[:3, 3] = _as_single_np(pos)
+    return T
+
 
 XARM7_ROBOT_CFG: dict = {
     "robot_morph": "urdf",
@@ -73,50 +141,107 @@ class CameraView:
     pos: tuple[float, float, float] | None = None
     lookat: tuple[float, float, float] | None = None
     up: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    fov_deg: float | None = None          # vertical FOV; falls back to cfg.fov_deg
     attach_link: str | None = None        # e.g. "link_tcp" for the wrist cam
     attach_offset: tuple = field(default=None)  # 4x4 offset_T from link frame to camera
 
 
-def _look_offset_T(back=0.12, side=0.0) -> np.ndarray:
+def view_from_c2w_cv(name: str, c2w: np.ndarray | tuple, fov_deg: float | None = None) -> CameraView:
+    """CameraView from a calibrated OpenCV camera-to-world (robot-base) pose."""
+    T = np.asarray(c2w, dtype=np.float64)
+    pos = T[:3, 3]
+    return CameraView(
+        name,
+        pos=tuple(pos),
+        lookat=tuple(pos + T[:3, 2]),  # CV optical +z = view direction
+        up=tuple(-T[:3, 1]),           # CV optical +y points down
+        fov_deg=fov_deg,
+    )
+
+
+def _look_offset_T(back=0.12, side=0.0, lift=0.0, pitch_deg=0.0) -> np.ndarray:
     """Offset transform mounting the wrist camera on ``link_tcp``.
 
     The TCP approach axis is +z (points out of the gripper / downward at home). A Genesis
     camera looks along its own −z, so a 180°-about-x rotation aims the camera along +z_tcp
     (down the tool toward the grasp point). The camera is set ``back`` metres up the tool
-    axis (−z_tcp) so the fingertips and workspace are in view.
+    axis (−z_tcp) so the fingertips and workspace are in view. ``pitch_deg`` tilts the view
+    about the camera x-axis; negative values push the gripper toward the bottom of the
+    image like the real EE-mounted RealSense.
     """
-    R = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])  # 180° about x
+    R0 = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])  # 180° about x
+    th = math.radians(pitch_deg)
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0, math.cos(th), -math.sin(th)], [0.0, math.sin(th), math.cos(th)]])
     T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = (side, 0.0, -back)
+    T[:3, :3] = R0 @ Rx
+    T[:3, 3] = (side, lift, -back)  # lift: off the gripper body, along y_tcp
     return T
 
 
+# Logitech extrinsics from /data/store/opencv_calibrated (dream_sam_roboreg, pose_c2w_cv,
+# robot-base frame): low = 1e9c6aae (/dev/video8), side = ad3f052e (/dev/video10). Both
+# were solved with approximate intrinsics fx=fy=515, cx=320, cy=240 → vFOV ≈ 49.98°, so
+# the sim cameras must render with that same FOV for the extrinsics to be consistent.
+LOGITECH_FOV_DEG = math.degrees(2.0 * math.atan(240.0 / 515.0))
+# RealSense D435 colour at 640×480: fx ≈ 617 → vFOV ≈ 42.6° (no calibration data; guess).
+REALSENSE_FOV_DEG = 42.5
+
+LOW_C2W_CV = (
+    (-0.6532074213027954, 0.09281682223081589, -0.7514687180519104, 1.0390468835830688),
+    (0.7571737170219421, 0.07631510496139526, -0.6487403512001038, 0.48672395944595337),
+    (-0.0028656369540840387, -0.9927542209625244, -0.12012804299592972, 0.23500925302505493),
+    (0.0, 0.0, 0.0, 1.0),
+)
+SIDE_C2W_CV = (
+    (-0.9901586174964905, 0.07804439961910248, -0.11616794764995575, 0.4850386679172516),
+    (0.13690687716007233, 0.7123172879219055, -0.6883754134178162, 0.6458088159561157),
+    (0.02902454137802124, -0.697504997253418, -0.7159919738769531, 0.9215802550315857),
+    (0.0, 0.0, 0.0, 1.0),
+)
+
 DEFAULT_CAMERAS: tuple[CameraView, ...] = (
-    CameraView("side", pos=(0.45, 0.75, 0.35), lookat=(0.45, 0.0, 0.05)),
-    CameraView("over", pos=(0.45, 0.0, 0.95), lookat=(0.45, 0.0, 0.0)),
-    CameraView("wrist", attach_link="link_tcp", attach_offset=_look_offset_T()),
+    view_from_c2w_cv("low", LOW_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
+    view_from_c2w_cv("side", SIDE_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
+    # Eyeballed against the real wrist stream (no calibration data): bracket behind and
+    # beside the gripper, tilted so the fingers sit at the frame bottom and the cube stays
+    # visible through approach → grasp → lift.
+    CameraView(
+        "wrist",
+        fov_deg=REALSENSE_FOV_DEG,
+        attach_link="link_tcp",
+        attach_offset=_look_offset_T(back=0.16, lift=-0.13, pitch_deg=-28.0),
+    ),
 )
 
 
 @dataclass
 class TableCfg:
     size: tuple[float, float, float] = (1.2, 1.6, 0.4)  # x, y, z
+    center_xy: tuple[float, float] = (0.45, 0.0)
     top_z: float = 0.0                                  # top face height (robot base sits here)
     color: tuple[float, float, float] = (0.55, 0.55, 0.6)
+    visualization: bool = True
 
 
 @dataclass
 class LiftEnvCfg:
     res: tuple[int, int] = (640, 480)
-    fov_deg: float = 42.0                 # vertical FOV → intrinsics
-    physics_dt: float = 0.01              # stable sim step
-    record_every: int = 2                 # emit every k-th step → record_dt = physics_dt*k
+    fov_deg: float = 42.0                 # fallback vertical FOV → intrinsics
+    physics_dt: float = 1.0 / 120.0       # stable sim step; ×record_every → 30 Hz like real
+    record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
     rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
     drop_zone: tuple[float, float, float] = (0.46, 0.0, 0.12)  # central zone (a few in above center)
     table: TableCfg = field(default_factory=TableCfg)
     show_viewer: bool = False
+    render_backend: Literal["raster", "nyx"] = "raster"
+    splat_uri: Path | None = DEFAULT_SPLAT_PATH
+    splat_pos: tuple[float, float, float] | None = None
+    splat_rot_rpy_deg: tuple[float, float, float] | None = None
+    splat_quat: tuple[float, float, float, float] = (0.0, 0.0, -0.70710678, 0.70710678)
+    splat_scale: float | None = None
+    nyx_spp: int = 8
+    nyx_light_intensity: float = 5.0
 
 
 class LiftBlockEnv:
@@ -129,7 +254,7 @@ class LiftBlockEnv:
         self.record_dt = self.cfg.physics_dt * self.cfg.record_every
 
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.cfg.physics_dt, substeps=2),
+            sim_options=gs.options.SimOptions(dt=self.cfg.physics_dt, substeps=4),
             rigid_options=gs.options.RigidOptions(
                 dt=self.cfg.physics_dt,
                 constraint_solver=gs.constraint_solver.Newton,
@@ -146,7 +271,13 @@ class LiftBlockEnv:
         # explicit collision-box table: top face at cfg.table.top_z
         t = self.cfg.table
         self.table = self.scene.add_entity(
-            gs.morphs.Box(size=t.size, pos=(0.45, 0.0, t.top_z - t.size[2] / 2.0), fixed=True),
+            gs.morphs.Box(
+                size=t.size,
+                pos=(t.center_xy[0], t.center_xy[1], t.top_z - t.size[2] / 2.0),
+                fixed=True,
+                visualization=t.visualization,
+                collision=True,
+            ),
             surface=gs.surfaces.Plastic(color=t.color, roughness=0.7),
         )
 
@@ -160,14 +291,10 @@ class LiftBlockEnv:
             surface=gs.surfaces.Plastic(color=BLOCK_COLOR, roughness=0.6),
         )
 
-        # cameras (rasterizer, headless): gives intrinsics/extrinsics + attach
-        self.cams: dict[str, "gs.vis.camera.Camera"] = {}
-        for view in self.camera_views:
-            cam = self.scene.add_camera(
-                res=self.res, fov=self.cfg.fov_deg, GUI=False,
-                pos=view.pos or (1.0, 0.0, 0.5), lookat=view.lookat or (0.0, 0.0, 0.0),
-            )
-            self.cams[view.name] = cam
+        self.cams = {}
+        self._manual_attached_cams = []
+        self._rig_attached_camera_names = set()
+        self._add_cameras()
 
         self.scene.build(n_envs=1)
         self.robot.set_pd_gains()
@@ -177,11 +304,63 @@ class LiftBlockEnv:
             cam = self.cams[view.name]
             if view.attach_link is not None:
                 link = self.robot._robot_entity.get_link(view.attach_link)
-                cam.attach(link, view.attach_offset)
-            else:
+                if hasattr(cam, "attach"):
+                    cam.attach(link, view.attach_offset)
+                    self._rig_attached_camera_names.add(view.name)
+                else:
+                    self._manual_attached_cams.append((cam, link, np.asarray(view.attach_offset, dtype=np.float64)))
+            elif hasattr(cam, "set_pose"):
                 cam.set_pose(pos=view.pos, lookat=view.lookat, up=view.up)
 
         self.reset()
+
+    def _splat_light_fields(self):
+        if self.cfg.splat_uri is None:
+            return ()
+        splat_uri = Path(self.cfg.splat_uri).expanduser()
+        if not splat_uri.exists():
+            raise FileNotFoundError(f"splat file does not exist: {splat_uri}")
+        rotation = self.cfg.splat_quat
+        if self.cfg.splat_rot_rpy_deg is not None:
+            rotation = quat_xyzw_from_rpy_deg(*self.cfg.splat_rot_rpy_deg)
+        return (_make_light_field(splat_uri, self.cfg.splat_pos, rotation, self.cfg.splat_scale),)
+
+    def _add_cameras(self) -> None:
+        if self.cfg.render_backend == "nyx":
+            lights = [
+                {
+                    "type": "directional",
+                    "dir": (-0.4, -0.4, -0.8),
+                    "color": (1.0, 1.0, 1.0),
+                    "intensity": self.cfg.nyx_light_intensity,
+                    "shadow": True,
+                }
+            ]
+            light_fields = self._splat_light_fields()
+            for view in self.camera_views:
+                self.cams[view.name] = self.scene.add_sensor(
+                    NyxCameraOptions(
+                        res=self.res,
+                        fov=view.fov_deg or self.cfg.fov_deg,
+                        pos=view.pos or (1.0, 0.0, 0.5),
+                        lookat=view.lookat or (0.0, 0.0, 0.0),
+                        up=view.up,
+                        near=0.02,
+                        far=50.0,
+                        spp=self.cfg.nyx_spp,
+                        render_mode=npr.ERenderMode.FastPathTracer,
+                        lights=lights,
+                        light_fields=light_fields,
+                    )
+                )
+            return
+
+        for view in self.camera_views:
+            self.cams[view.name] = self.scene.add_camera(
+                res=self.res, fov=view.fov_deg or self.cfg.fov_deg, GUI=False,
+                pos=view.pos or (1.0, 0.0, 0.5), lookat=view.lookat or (0.0, 0.0, 0.0),
+                near=0.02, far=50.0,  # default near=0.1 clips the wrist cam's own gripper
+            )
 
     # -- lifecycle --
     def reset(self, seed: int | None = None) -> None:
@@ -203,15 +382,28 @@ class LiftBlockEnv:
 
     def _sync_attached_cams(self) -> None:
         for view in self.camera_views:
-            if view.attach_link is not None:
+            if view.name in self._rig_attached_camera_names:
                 self.cams[view.name].move_to_attach()
+        for cam, link, offset_T in self._manual_attached_cams:
+            link_T = _pose_to_T(link.get_pos(), link.get_quat())
+            cam_T = link_T @ offset_T
+            pos = cam_T[:3, 3]
+            lookat = pos - cam_T[:3, 2]
+            up = cam_T[:3, 1]
+            cam.update_camera_pose(pos=tuple(pos), lookat=tuple(lookat), up=tuple(up))
 
     # -- observations --
     def render(self) -> dict[str, np.ndarray]:
         out = {}
         for name, cam in self.cams.items():
-            rgb = cam.render(rgb=True)[0]
-            rgb = np.asarray(rgb)
+            if hasattr(cam, "render"):
+                rgb = cam.render(rgb=True)[0]
+            else:
+                rgb = cam.read(envs_idx=0).rgb
+            if hasattr(rgb, "detach"):
+                rgb = rgb.detach().cpu().numpy()
+            else:
+                rgb = np.asarray(rgb)
             if rgb.ndim == 4:
                 rgb = rgb[0]
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)

@@ -40,8 +40,8 @@ class Config:
     n_episodes: int = 1
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
-    steps_per_segment: int = 40
-    hold_steps: int = 20            # extra settle steps after the sequence
+    steps_per_segment: int = 108    # 8 segments at 120 Hz → ~7.5 s episodes (like real)
+    hold_steps: int = 48            # extra settle steps after the sequence
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
     deliver_radius: float = 0.12    # max xy dist (m) from drop zone at episode end
     save_failures: bool = False
@@ -55,7 +55,7 @@ def _spec_dict(env: LiftBlockEnv) -> dict[str, CameraSpec]:
     return specs
 
 
-PREVIEW_CAMERA_ORDER = ("side", "wrist", "over")
+PREVIEW_CAMERA_ORDER = ("low", "side", "wrist", "over")
 
 
 def _safe_label(label: str) -> str:
