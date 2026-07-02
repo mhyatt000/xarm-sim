@@ -344,16 +344,18 @@ class LiftBlockEnv:
         # (z=0). In plane mode it is also the visible infinite tabletop.
         t = self.cfg.table
         table_surface = gs.surfaces.Plastic(color=t.color, roughness=0.8)
-        table_plane_kwargs = {}
-        if self.cfg.table_mode == "plane":
-            table_plane_kwargs["surface"] = table_surface
+        # The surface must be set even in slab mode: Nyx exports collision-only
+        # primitives regardless of visualization=False, so without it the infinite
+        # plane renders in Nyx's default light gray and shows up as a bright sheet
+        # where the dark room floor belongs. With the dark slate surface it blends
+        # into the room floor exactly as in all verified batches.
         self.table = self.scene.add_entity(
             gs.morphs.Plane(
                 pos=(0.0, 0.0, t.top_z),
                 visualization=self.cfg.table_mode == "plane",
                 collision=True,
             ),
-            **table_plane_kwargs,
+            surface=table_surface,
         )
         if self.cfg.table_mode == "slab":
             if not self.cfg.table_transparent:
