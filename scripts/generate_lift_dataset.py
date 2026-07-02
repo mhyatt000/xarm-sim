@@ -9,6 +9,7 @@ computed per episode; by default only successful episodes are kept.
     uv run python scripts/generate_lift_dataset.py --n-episodes 3 --backend gpu
     uv run python scripts/generate_lift_dataset.py --mode preview --backend cpu
     uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx
+    uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx --env.table-transparent
     uv run python scripts/generate_lift_dataset.py --mode video --env.table-mode plane
 """
 
