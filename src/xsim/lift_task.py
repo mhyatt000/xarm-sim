@@ -37,7 +37,7 @@ _CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
 DEFAULT_SPLAT_PATH = _CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply")
 
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
-BLOCK_COLOR = (0.6, 0.15, 0.13)
+BLOCK_COLOR = (0.48, 0.05, 0.04)  # saturated red; brighter albedos wash to salmon under the nyx light
 
 # OpenGL camera (x right, y up, -z forward) → OpenCV optical (x right, y down, +z forward).
 _T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
@@ -219,7 +219,7 @@ DEFAULT_CAMERAS: tuple[CameraView, ...] = (
         "wrist",
         fov_deg=REALSENSE_FOV_DEG,
         attach_link="link_tcp",
-        attach_offset=_look_offset_T(back=0.16, lift=-0.13, pitch_deg=-28.0),
+        attach_offset=_look_offset_T(back=0.16, side=-0.02, lift=-0.13, pitch_deg=-28.0),
     ),
 )
 

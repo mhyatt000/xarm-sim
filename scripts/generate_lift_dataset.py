@@ -250,18 +250,70 @@ def main(cfg: Config) -> None:
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     n_success = 0
+    all_stats = []
     for ep in range(cfg.n_episodes):
         path = cfg.out_dir / f"episode_{ep:06d}.mcap"
         stats = run_episode(env, cfg, ep, path)
         keep = stats["success"] or cfg.save_failures
         if not keep:
             path.unlink(missing_ok=True)
+        stats["kept"] = keep
+        stats["seed"] = cfg.seed + ep
+        all_stats.append(stats)
         n_success += int(stats["success"])
         flag = "OK " if stats["success"] else ("kept" if keep else "drop")
         print(f"[{flag}] ep{ep}: frames={stats['frames']} rise={stats['max_rise']:.3f} "
               f"deliver={stats['deliver_dist']:.3f} lifted={stats['lifted']} delivered={stats['delivered']}")
 
+    _write_manifest(cfg, env, all_stats, n_success)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
+
+
+def _write_manifest(cfg: Config, env: LiftBlockEnv, all_stats: list[dict], n_success: int) -> None:
+    """Provenance sidecar: enough to regenerate any episode bit-for-bit."""
+    import dataclasses
+    import hashlib
+    import json
+    import subprocess
+
+    def _jsonable(obj):
+        if dataclasses.is_dataclass(obj):
+            return {k: _jsonable(v) for k, v in dataclasses.asdict(obj).items()}
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, (list, tuple)):
+            return [_jsonable(v) for v in obj]
+        if isinstance(obj, dict):
+            return {k: _jsonable(v) for k, v in obj.items()}
+        return obj
+
+    try:
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+                             capture_output=True, text=True).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT,
+                                    capture_output=True, text=True).stdout.strip())
+    except OSError:
+        sha, dirty = "unknown", True
+
+    splat = Path(env.cfg.splat_uri).expanduser() if env.cfg.splat_uri else None
+    splat_md5 = None
+    if splat is not None and splat.exists() and env.cfg.render_backend == "nyx":
+        h = hashlib.md5()
+        with open(splat, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                h.update(chunk)
+        splat_md5 = h.hexdigest()
+
+    manifest = {
+        "git_sha": sha, "git_dirty": dirty,
+        "config": _jsonable(cfg),
+        "splat_file": str(splat) if splat else None,
+        "splat_md5": splat_md5,
+        "success_rate": f"{n_success}/{cfg.n_episodes}",
+        "episodes": all_stats,
+    }
+    (cfg.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"wrote {cfg.out_dir / 'manifest.json'}")
 
 
 if __name__ == "__main__":
