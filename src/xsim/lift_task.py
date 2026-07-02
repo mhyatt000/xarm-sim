@@ -123,7 +123,10 @@ XARM7_ROBOT_CFG: dict = {
     "gripper_link_names": ["left_finger", "right_finger"],
     "arm_dof_dim": 7,
     "gripper_dof_dim": 6,
-    "default_arm_dof": [math.radians(v) for v in [0.0, -45.0, 0.0, 35.0, 0.0, 65.0, 90.0]],
+    # low ready pose matching the real demos' start (TCP ≈ (0.34, 0, 0.10), top-down) —
+    # IK-solved; the old high home (TCP z=0.29) gave episodes a different opening style
+    # than the real recordings (see compare_batches report)
+    "default_arm_dof": [math.radians(v) for v in [0.0, -26.2, 0.0, 13.5, 0.0, 25.0, 90.0]],
     # xArm gripper joint convention (verified by finger separation): 0.0 = open (fingers
     # apart), 0.85 = hard fully closed. For a 31.75 mm cube, command a tighter
     # task grasp target instead of the hard stop; this holds the block without
@@ -131,6 +134,8 @@ XARM7_ROBOT_CFG: dict = {
     "default_gripper_dof": [0.0] * 6,
     "gripper_open_dof": 0.0,
     "gripper_close_dof": 0.85,
+    # 0.58 -> recorded norm floor 0.32 (real demos read ~0.37, but rigid sim fingers need
+    # the extra squeeze; 0.53 matches the real reading exactly and drops the cube)
     "gripper_grasp_dof": 0.58,
     "dofs_kp": [4500, 4500, 3500, 3500, 2000, 2000, 2000, 350, 350, 350, 350, 350, 350],
     "dofs_kv": [450, 450, 350, 350, 200, 200, 200, 35, 35, 35, 35, 35, 35],
@@ -267,7 +272,7 @@ class LiftEnvCfg:
     record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
     rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
-    drop_zone: tuple[float, float, float] = (0.46, 0.0, 0.12)  # central zone (a few in above center)
+    drop_zone: tuple[float, float, float] = (0.46, 0.0, 0.09)  # central zone, low like the real demos
     table: TableCfg = field(default_factory=TableCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     show_viewer: bool = False

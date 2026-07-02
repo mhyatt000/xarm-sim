@@ -198,7 +198,10 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
 
 def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
     env.reset(seed=cfg.seed + episode_idx)
-    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
+    # vary episode tempo per seed (the real demos range roughly 6.5-10 s)
+    tempo_rng = np.random.default_rng((cfg.seed + episode_idx) * 7919 + 1)
+    sps = int(round(cfg.steps_per_segment * tempo_rng.uniform(0.85, 1.30)))
+    policy = ScriptedLiftPolicy(env, steps_per_segment=sps, grasp_tcp_offset=cfg.grasp_tcp_offset)
     policy.reset()
 
     cube_start = env.cube_pos().copy()

@@ -20,14 +20,22 @@ class LiftCommand:
     open_gripper: bool
 
 
+# Per-segment duration weights (× steps_per_segment). Tuned so the profile matches the
+# real demonstrations (compare_batches report): slow approach, grasp completing at
+# ~55-60% of the episode, release at ~85-95%.
+SEGMENT_WEIGHTS = (2.2, 1.2, 1.0, 0.8, 1.0, 0.8, 0.5, 0.5)
+
+
 class ScriptedLiftPolicy:
     def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.018,
-                 approach_height: float = 0.14, lift_height: float = 0.22):
+                 approach_height: float = 0.06, lift_height: float = 0.09,
+                 segment_weights: tuple[float, ...] = SEGMENT_WEIGHTS):
         self.env = env
         self.steps_per_segment = steps_per_segment
         self.grasp_tcp_offset = grasp_tcp_offset
         self.approach_height = approach_height
         self.lift_height = lift_height
+        self.segment_weights = segment_weights
         self._commands = None
         self.waypoint_names = []
         self.n_steps = 0
@@ -50,7 +58,8 @@ class ScriptedLiftPolicy:
         above = pose([cube[0], cube[1], grasp_z + self.approach_height])
         at = pose([cube[0], cube[1], grasp_z])
         lift = pose([cube[0], cube[1], grasp_z + self.lift_height])
-        over_drop = pose([drop[0], drop[1], drop[2] + self.lift_height])
+        # transport level with the lift (the real demos stay low; no extra hop)
+        over_drop = pose([drop[0], drop[1], grasp_z + self.lift_height])
         at_drop = pose([drop[0], drop[1], drop[2]])
         retreat = pose([drop[0], drop[1], drop[2] + self.lift_height])
 
@@ -78,16 +87,18 @@ class ScriptedLiftPolicy:
             (at_drop, True),            # release
             (retreat, True),            # retreat
         ]
+        n_seg = len(self._waypoints) - 1
+        weights = self.segment_weights if len(self.segment_weights) == n_seg else (1.0,) * n_seg
+        self._segment_steps = [max(2, round(w * self.steps_per_segment)) for w in weights]
         self._commands = self._make_generator()
-        # total steps = 1 (initial) + (n_wp-1)*steps_per_segment, then hold
-        self.n_steps = 1 + (len(self._waypoints) - 1) * self.steps_per_segment
+        self.n_steps = 1 + sum(self._segment_steps)
 
     def _make_generator(self):
         last_pose, last_open = self._waypoints[0]
         yield LiftCommand(last_pose, last_open)
-        for target_pose, target_open in self._waypoints[1:]:
-            for i in range(1, self.steps_per_segment + 1):
-                alpha = i / self.steps_per_segment
+        for (target_pose, target_open), seg_steps in zip(self._waypoints[1:], self._segment_steps):
+            for i in range(1, seg_steps + 1):
+                alpha = i / seg_steps
                 p = last_pose.lerp(target_pose, alpha)
                 yield LiftCommand(p, target_open)
             last_pose = target_pose
