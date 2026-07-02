@@ -43,6 +43,23 @@ BLOCK_COLOR = (0.48, 0.05, 0.04)  # saturated red; brighter albedos wash to salm
 _T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
 
 
+def _rot_from_rpy_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    x, y, z, w = quat_xyzw_from_rpy_deg(roll, pitch, yaw)
+    return _quat_wxyz_to_rot((w, x, y, z))
+
+
+def _c2w_gl_from_view(pos, lookat, up) -> np.ndarray:
+    """OpenGL camera-to-world (x right, y up, −z forward) from a pos/lookat/up view."""
+    pos = np.asarray(pos, dtype=np.float64)
+    forward = np.asarray(lookat, dtype=np.float64) - pos
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, np.asarray(up, dtype=np.float64))
+    right /= np.linalg.norm(right)
+    T = np.eye(4)
+    T[:3, 0], T[:3, 1], T[:3, 2], T[:3, 3] = right, np.cross(right, forward), -forward, pos
+    return T
+
+
 def quat_xyzw_from_rpy_deg(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
     roll, pitch, yaw = math.radians(roll), math.radians(pitch), math.radians(yaw)
     cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
@@ -174,7 +191,7 @@ def view_from_c2w_cv(name: str, c2w: np.ndarray | tuple, fov_deg: float | None =
     )
 
 
-def _look_offset_T(back=0.12, side=0.0, lift=0.0, pitch_deg=0.0) -> np.ndarray:
+def _look_offset_T(back=0.12, side=0.0, lift=0.0, pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0) -> np.ndarray:
     """Offset transform mounting the wrist camera on ``link_tcp``.
 
     The TCP approach axis is +z (points out of the gripper / downward at home). A Genesis
@@ -182,13 +199,19 @@ def _look_offset_T(back=0.12, side=0.0, lift=0.0, pitch_deg=0.0) -> np.ndarray:
     (down the tool toward the grasp point). The camera is set ``back`` metres up the tool
     axis (−z_tcp) so the fingertips and workspace are in view. ``pitch_deg`` tilts the view
     about the camera x-axis; negative values push the gripper toward the bottom of the
-    image like the real EE-mounted RealSense.
+    image like the real EE-mounted RealSense. ``yaw_deg`` tilts about the camera y-axis
+    (aims a side-mounted camera back toward the tool axis). ``roll_deg`` spins the image
+    about the optical axis.
     """
     R0 = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])  # 180° about x
     th = math.radians(pitch_deg)
     Rx = np.array([[1.0, 0.0, 0.0], [0.0, math.cos(th), -math.sin(th)], [0.0, math.sin(th), math.cos(th)]])
+    ps = math.radians(yaw_deg)
+    Ry = np.array([[math.cos(ps), 0.0, math.sin(ps)], [0.0, 1.0, 0.0], [-math.sin(ps), 0.0, math.cos(ps)]])
+    ph = math.radians(roll_deg)
+    Rz = np.array([[math.cos(ph), -math.sin(ph), 0.0], [math.sin(ph), math.cos(ph), 0.0], [0.0, 0.0, 1.0]])
     T = np.eye(4)
-    T[:3, :3] = R0 @ Rx
+    T[:3, :3] = R0 @ Rx @ Ry @ Rz
     T[:3, 3] = (side, lift, -back)  # lift: off the gripper body, along y_tcp
     return T
 
@@ -217,14 +240,16 @@ SIDE_C2W_CV = (
 DEFAULT_CAMERAS: tuple[CameraView, ...] = (
     view_from_c2w_cv("low", LOW_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
     view_from_c2w_cv("side", SIDE_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
-    # Eyeballed against the real wrist stream (no calibration data): bracket behind and
-    # beside the gripper, tilted so the fingers sit at the frame bottom and the cube stays
-    # visible through approach → grasp → lift.
+    # Matched against the real wrist stream (no calibration data): the real RealSense is
+    # side-mounted, so the finger axis runs near-horizontal, the fingers enter from the
+    # frame bottom with the assembly parked on the right half, and the white housing peeks
+    # in at the bottom. Candidate "P1" from the 2026-07-02 iterative mount sweep
+    # (outputs/wrist_mount/wrist_mount_final_P.png), verified frame-by-frame by grifflee.
     CameraView(
         "wrist",
         fov_deg=REALSENSE_FOV_DEG,
         attach_link="link_tcp",
-        attach_offset=_look_offset_T(back=0.16, side=-0.02, lift=-0.13, pitch_deg=-28.0),
+        attach_offset=_look_offset_T(back=0.14, side=0.085, lift=-0.03, pitch_deg=-5.0, yaw_deg=25.0, roll_deg=-90.0),
     ),
 )
 
@@ -285,6 +310,13 @@ class LiftEnvCfg:
     splat_scale: float | None = DEFAULT_SPLAT_SCALE
     nyx_spp: int = 8
     nyx_light_intensity: float = 2.0  # 5.0 washed out the mesh entities vs the dim splat
+    # per-episode camera jitter, applied in reset() around the calibrated nominal poses
+    # (the nominals themselves never move); the actual sampled poses are exposed via
+    # episode_extrinsics so batch manifests can record them. 0 = off.
+    cam_jitter_deg: float = 0.0    # low/side: ± per-axis rpy, in the camera frame (deg)
+    cam_jitter_cm: float = 0.0     # low/side: ± per-axis world xyz (cm)
+    wrist_jitter_deg: float = 0.0  # wrist mount offset: ± per-axis rpy (deg)
+    wrist_jitter_cm: float = 0.0   # wrist mount offset: ± per-axis xyz (cm)
 
 
 class LiftBlockEnv:
@@ -362,16 +394,25 @@ class LiftBlockEnv:
         self.scene.build(n_envs=1)
         self.robot.set_pd_gains()
 
-        # place static cams + attach wrist cam
+        # place static cams + attach wrist cam; keep the nominal poses that per-episode
+        # jitter centers on, and the attach machinery so reset() can re-pose everything
+        self._nominal_c2w_gl = {
+            v.name: _c2w_gl_from_view(v.pos, v.lookat, v.up) for v in self.camera_views if v.attach_link is None
+        }
+        self._attach_links = {}
+        self._attach_offsets = {}
+        self.episode_extrinsics: dict[str, np.ndarray] = {}
         for view in self.camera_views:
             cam = self.cams[view.name]
             if view.attach_link is not None:
                 link = self.robot._robot_entity.get_link(view.attach_link)
+                self._attach_links[view.name] = link
+                self._attach_offsets[view.name] = np.asarray(view.attach_offset, dtype=np.float64)
                 if hasattr(cam, "attach"):
                     cam.attach(link, view.attach_offset)
                     self._rig_attached_camera_names.add(view.name)
                 else:
-                    self._manual_attached_cams.append((cam, link, np.asarray(view.attach_offset, dtype=np.float64)))
+                    self._manual_attached_cams.append((view.name, cam, link))
             elif hasattr(cam, "set_pose"):
                 cam.set_pose(pos=view.pos, lookat=view.lookat, up=view.up)
 
@@ -437,7 +478,49 @@ class LiftBlockEnv:
         quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]], device=self.device, dtype=gs.tc_float)
         self.cube.set_pos(pos, skip_forward=True)
         self.cube.set_quat(quat, skip_forward=False)
+        # after the cube draws, so a given seed reproduces the same cube placement as
+        # jitter-free runs
+        self._randomize_cameras(rng)
         self._sync_attached_cams()
+
+    def _randomize_cameras(self, rng: np.random.Generator) -> None:
+        """Per-episode camera jitter around the nominal poses; records actual extrinsics.
+
+        Static cams get an orientation delta (± cam_jitter_deg per rpy axis, applied in
+        the camera frame) and a world-frame position delta (± cam_jitter_cm per axis).
+        The wrist mount offset gets the same treatment in its own frame when wrist jitter
+        is enabled. ``episode_extrinsics`` then holds camera(optical CV)→world for static
+        cams — the same convention as LOW_C2W_CV/SIDE_C2W_CV — and link_tcp→camera
+        (optical CV) under ``wrist_mount``.
+        """
+        self.episode_extrinsics = {}
+        for view in self.camera_views:
+            cam = self.cams[view.name]
+            if view.attach_link is None:
+                c2w = self._nominal_c2w_gl[view.name].copy()
+                d_rpy = rng.uniform(-1.0, 1.0, 3) * self.cfg.cam_jitter_deg
+                d_xyz = rng.uniform(-1.0, 1.0, 3) * (self.cfg.cam_jitter_cm / 100.0)
+                c2w[:3, :3] = c2w[:3, :3] @ _rot_from_rpy_deg(*d_rpy)
+                c2w[:3, 3] += d_xyz
+                pos = tuple(c2w[:3, 3])
+                lookat = tuple(c2w[:3, 3] - c2w[:3, 2])
+                up = tuple(c2w[:3, 1])
+                if hasattr(cam, "set_pose"):
+                    cam.set_pose(pos=pos, lookat=lookat, up=up)
+                else:
+                    cam.update_camera_pose(pos=pos, lookat=lookat, up=up)
+                self.episode_extrinsics[view.name] = c2w @ _T_GL_TO_CV
+            else:
+                offset = np.asarray(view.attach_offset, dtype=np.float64).copy()
+                if self.cfg.wrist_jitter_deg or self.cfg.wrist_jitter_cm:
+                    delta = np.eye(4)
+                    delta[:3, :3] = _rot_from_rpy_deg(*(rng.uniform(-1.0, 1.0, 3) * self.cfg.wrist_jitter_deg))
+                    delta[:3, 3] = rng.uniform(-1.0, 1.0, 3) * (self.cfg.wrist_jitter_cm / 100.0)
+                    offset = offset @ delta
+                    if view.name in self._rig_attached_camera_names:
+                        cam.attach(self._attach_links[view.name], offset)
+                self._attach_offsets[view.name] = offset
+                self.episode_extrinsics[f"{view.name}_mount"] = offset @ _T_GL_TO_CV
 
     def step(self) -> None:
         self.scene.step()
@@ -447,9 +530,9 @@ class LiftBlockEnv:
         for view in self.camera_views:
             if view.name in self._rig_attached_camera_names:
                 self.cams[view.name].move_to_attach()
-        for cam, link, offset_T in self._manual_attached_cams:
+        for name, cam, link in self._manual_attached_cams:
             link_T = _pose_to_T(link.get_pos(), link.get_quat())
-            cam_T = link_T @ offset_T
+            cam_T = link_T @ self._attach_offsets[name]
             pos = cam_T[:3, 3]
             lookat = pos - cam_T[:3, 2]
             up = cam_T[:3, 1]

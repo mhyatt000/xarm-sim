@@ -495,7 +495,9 @@
         <mesh filename="assets/left_outer_knuckle.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -522,7 +524,9 @@
         <mesh filename="assets/left_finger.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -550,7 +554,9 @@
         <mesh filename="assets/left_inner_knuckle.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -578,7 +584,9 @@
         <mesh filename="assets/right_outer_knuckle.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -606,7 +614,9 @@
         <mesh filename="assets/right_finger.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>
@@ -634,7 +644,9 @@
         <mesh filename="assets/right_inner_knuckle.stl"/>
       </geometry>
       <origin rpy="0 0 0" xyz="0 0 0"/>
-      <material name="White"/>
+      <material name="Black">
+        <color rgba="0.0 0.0 0.0 1.0"/>
+      </material>
     </visual>
     <collision>
       <geometry>

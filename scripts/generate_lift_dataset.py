@@ -237,6 +237,9 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
         "episode": episode_idx, "frames": rec, "max_rise": max_rise,
         "deliver_dist": deliver_dist, "lifted": lifted, "delivered": delivered,
         "success": lifted and delivered,
+        # actual (jittered) camera poses this episode: c2w OpenCV for low/side, plus the
+        # link_tcp->camera(optical) wrist mount; lands in manifest.json for training use
+        "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
     }
 
 
