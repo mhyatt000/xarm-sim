@@ -107,7 +107,9 @@ def check_format(sim_files: list[Path], reference: Path) -> list[str]:
             if have[t] != ref[t]:
                 problems.append(f"{f.name}: schema mismatch on {t}: {have[t]} != {ref[t]}")
         n = list(counts.values())
-        if n and (min(n) < 190 or max(n) > 280):
+        # generator design range: base 229 frames x tempo jitter 0.85-1.30, plus margin;
+        # this gate exists to catch truncated or runaway files, not tempo variation
+        if n and (min(n) < 150 or max(n) > 320):
             problems.append(f"{f.name}: message count out of range: {min(n)}..{max(n)}")
     return problems
 
