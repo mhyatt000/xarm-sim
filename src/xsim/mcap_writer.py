@@ -23,8 +23,24 @@ import cv2
 import numpy as np
 
 import foxglove
-from foxglove.channels import JointStatesChannel, PoseChannel, RawImageChannel
-from foxglove.messages import JointState, JointStates, Pose, Quaternion, RawImage, Timestamp, Vector3
+from foxglove.channels import (
+    CameraCalibrationChannel,
+    FrameTransformChannel,
+    JointStatesChannel,
+    PoseChannel,
+    RawImageChannel,
+)
+from foxglove.messages import (
+    CameraCalibration,
+    FrameTransform,
+    JointState,
+    JointStates,
+    Pose,
+    Quaternion,
+    RawImage,
+    Timestamp,
+    Vector3,
+)
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory, timestamp_pb2
 
 YUYV_ENCODING = "yuv422_yuy2"
@@ -35,6 +51,14 @@ JOINT_NAMES: tuple[str, ...] = ("joint1", "joint2", "joint3", "joint4", "joint5"
 
 def topic_for_camera(name: str) -> str:
     return WRIST_TOPIC if name == "wrist" else f"/cam/{name}/image_raw"
+
+
+def calibration_topic_for_camera(name: str) -> str:
+    return "/camera/camera/color/camera_info" if name == "wrist" else f"/cam/{name}/camera_info"
+
+
+def optical_frame_for_camera(name: str) -> str:
+    return f"cam_{name}_optical"
 
 
 def encoding_for_camera(name: str) -> str:
@@ -62,6 +86,27 @@ def rgb_to_yuyv(rgb: np.ndarray) -> np.ndarray:
 def _timestamp(stamp_ns: int) -> Timestamp:
     sec, nsec = divmod(int(stamp_ns), 1_000_000_000)
     return Timestamp(sec=sec, nsec=nsec)
+
+
+def _quat_wxyz_from_rot(R: np.ndarray) -> tuple[float, float, float, float]:
+    """Rotation matrix → quaternion (w,x,y,z), Shepperd's method."""
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+    tr = m00 + m11 + m22
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        w, x, y, z = 0.25 * s, (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2
+        w, x, y, z = (m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s
+    elif m11 > m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2
+        w, x, y, z = (m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2
+        w, x, y, z = (m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s
+    return float(w), float(x), float(y), float(z)
 
 
 # /xgym/gripper: replicate xclients.messages.Gripper without importing xclients.
@@ -169,7 +214,54 @@ class EpisodeMcapWriter:
         self._joints = JointStatesChannel("/xarm/joint_states")
         self._robot_states = PoseChannel("/xarm/robot_states")
         self._gripper = foxglove.Channel("/xgym/gripper", schema=GRIPPER_SCHEMA, message_encoding="protobuf")
+        self._calib = {name: CameraCalibrationChannel(calibration_topic_for_camera(name)) for name in self.cameras}
+        self._tf = FrameTransformChannel("/tf")
         return self
+
+    def log_calibration(self, stamp_ns: int, extrinsics: dict[str, np.ndarray]) -> None:
+        """Write ground-truth camera intrinsics + extrinsics once per episode.
+
+        Intrinsics: foxglove.CameraCalibration per camera from the CameraSpec (zero
+        distortion — the sim cameras are ideal pinholes). Extrinsics: FrameTransforms on
+        /tf, ``base → cam_<name>_optical`` for static cameras (the episode's actual
+        jittered camera-to-base pose, OpenCV optical convention) and
+        ``link_tcp → cam_wrist_optical`` for the wrist mount. Keys in ``extrinsics``
+        follow LiftBlockEnv.episode_extrinsics: "low", "side", "wrist_mount".
+        """
+        ts = _timestamp(stamp_ns)
+        for name, spec in self.cameras.items():
+            k = [spec.fx, 0.0, spec.cx, 0.0, spec.fy, spec.cy, 0.0, 0.0, 1.0]
+            self._calib[name].log(
+                CameraCalibration(
+                    timestamp=ts,
+                    frame_id=optical_frame_for_camera(name),
+                    width=spec.width,
+                    height=spec.height,
+                    distortion_model="plumb_bob",
+                    D=[0.0] * 5,
+                    K=k,
+                    R=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    P=[k[0], k[1], k[2], 0.0, k[3], k[4], k[5], 0.0, k[6], k[7], k[8], 0.0],
+                ),
+                log_time=int(stamp_ns),
+            )
+        for key, T in extrinsics.items():
+            T = np.asarray(T, dtype=np.float64)
+            if key.endswith("_mount"):
+                parent, child = "link_tcp", optical_frame_for_camera(key[: -len("_mount")])
+            else:
+                parent, child = "base", optical_frame_for_camera(key)
+            qw, qx, qy, qz = _quat_wxyz_from_rot(T[:3, :3])
+            self._tf.log(
+                FrameTransform(
+                    timestamp=ts,
+                    parent_frame_id=parent,
+                    child_frame_id=child,
+                    translation=Vector3(x=float(T[0, 3]), y=float(T[1, 3]), z=float(T[2, 3])),
+                    rotation=Quaternion(x=qx, y=qy, z=qz, w=qw),
+                ),
+                log_time=int(stamp_ns),
+            )
 
     def __exit__(self, *exc) -> None:
         if self._mcap is not None:

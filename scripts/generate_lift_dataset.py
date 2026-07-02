@@ -45,10 +45,11 @@ class Config:
     n_episodes: int = 1
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
-    steps_per_segment: int = 108    # 8 segments at 120 Hz → ~7.5 s episodes (like real)
-    hold_steps: int = 48            # extra settle steps after the sequence
+    steps_per_segment: int = 108    # 5 weighted segments at 120 Hz → ~6 s episodes
+    hold_steps: int = 48            # unrecorded settle steps after release (success eval only)
+    release_tail_s: float = 0.3     # recorded tail after the open command (fingers opening)
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
-    deliver_radius: float = 0.12    # max xy dist (m) from drop zone at episode end
+    deliver_radius: float = 0.12    # max xy dist (m) from the drop target after settling
     grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
     save_failures: bool = False
     env: LiftEnvCfg = field(default_factory=LiftEnvCfg)
@@ -135,16 +136,21 @@ def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
     for waypoint_idx, name in enumerate(waypoint_names[1:], start=1):
         milestone_steps[waypoint_idx * cfg.steps_per_segment] = name
 
-    total = policy.n_steps + cfg.hold_steps
+    release_tail = max(1, int(round(cfg.release_tail_s / env.cfg.physics_dt)))
+    total = policy.release_step + release_tail
     with torch.no_grad():
         for step_idx in range(total):
             cmd = policy.step()
+            if step_idx == policy.grasp_lock_step:
+                env.grasp_lock()
+            if step_idx == policy.release_step:
+                env.grasp_release()
             env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
             env.step()
             if step_idx in milestone_steps:
                 save_preview_frame(env, cfg.preview_dir, step_idx, milestone_steps[step_idx])
 
-    save_preview_frame(env, cfg.preview_dir, total - 1, "settled")
+    save_preview_frame(env, cfg.preview_dir, total - 1, "release")
     print(f"wrote preview frames to {cfg.preview_dir}")
 
 
@@ -167,13 +173,18 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
     if not writer.isOpened():
         raise OSError(f"failed to open video writer for {cfg.video_path}")
 
-    total = policy.n_steps + cfg.hold_steps
+    release_tail = max(1, int(round(cfg.release_tail_s / env.cfg.physics_dt)))
+    record_until = policy.release_step + release_tail
     frame_idx = 0
     try:
         writer.write(cv2.cvtColor(first, cv2.COLOR_RGB2BGR))
         with torch.no_grad():
-            for step_idx in range(total):
+            for step_idx in range(record_until):
                 cmd = policy.step()
+                if step_idx == policy.grasp_lock_step:
+                    env.grasp_lock()
+                if step_idx == policy.release_step:
+                    env.grasp_release()
                 env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
                 env.step()
                 cube = env.cube_pos()
@@ -182,14 +193,19 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
                     sheet = contact_sheet(env.render(), f"{frame_idx:04d}")
                     writer.write(cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
                     frame_idx += 1
+            # unrecorded settle for the success stats, matching run_episode
+            for _ in range(cfg.hold_steps):
+                cmd = policy.step()
+                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+                env.step()
     finally:
         writer.release()
 
     cube_end = env.cube_pos()
-    drop = np.asarray(env.cfg.drop_zone)
-    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop[:2]))
+    drop = np.asarray(env.current_drop_xy)
+    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
     lifted = max_rise >= cfg.lift_threshold
-    delivered = deliver_dist <= cfg.deliver_radius
+    delivered = deliver_dist <= cfg.deliver_radius and float(cube_end[2]) < 0.05
     print(f"wrote video ({frame_idx + 1} frames @ {cfg.video_fps:g} fps) to {cfg.video_path}")
     print(
         f"video stats: rise={max_rise:.3f} deliver={deliver_dist:.3f} "
@@ -212,11 +228,19 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
     rec = 0
 
     specs = _spec_dict(env)
-    total = policy.n_steps + cfg.hold_steps
+    # recording ends shortly after the open command: the fingers opening are in the data,
+    # the robot moving away from the dropped cube never is (grifflee's protocol)
+    release_tail = max(1, int(round(cfg.release_tail_s / env.cfg.physics_dt)))
+    record_until = policy.release_step + release_tail
     with EpisodeMcapWriter(path, specs) as writer:
+        writer.log_calibration(base_ns, env.episode_extrinsics)
         with torch.no_grad():
-            for i in range(total):
+            for i in range(record_until):
                 cmd = policy.step()
+                if i == policy.grasp_lock_step:
+                    env.grasp_lock()      # gripped: the cube can no longer slip
+                if i == policy.release_step:
+                    env.grasp_release()   # open command: the cube free-falls
                 env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
                 env.step()
                 cube = env.cube_pos()
@@ -227,18 +251,27 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
                     writer.log_step(base_ns + rec * record_dt_ns, imgs, pos, vel, eff, None,
                                     ee_pose=ee, gripper_norm=env.gripper_norm())
                     rec += 1
+            # unrecorded settle: let the cube land for the success evaluation
+            for _ in range(cfg.hold_steps):
+                cmd = policy.step()
+                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+                env.step()
 
     cube_end = env.cube_pos()
-    drop = np.asarray(env.cfg.drop_zone)
-    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop[:2]))
+    drop = np.asarray(env.current_drop_xy)
+    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
+    on_table = float(cube_end[2]) < 0.05
     lifted = max_rise >= cfg.lift_threshold
-    delivered = deliver_dist <= cfg.deliver_radius
+    delivered = deliver_dist <= cfg.deliver_radius and on_table
     return {
         "episode": episode_idx, "frames": rec, "max_rise": max_rise,
         "deliver_dist": deliver_dist, "lifted": lifted, "delivered": delivered,
         "success": lifted and delivered,
+        "drop_target": [float(drop[0]), float(drop[1])],
+        "cube_yaw": float(env.cube_yaw()),
         # actual (jittered) camera poses this episode: c2w OpenCV for low/side, plus the
-        # link_tcp->camera(optical) wrist mount; lands in manifest.json for training use
+        # link_tcp->camera(optical) wrist mount; also written into the MCAP itself
+        # (camera_info + /tf) via log_calibration
         "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
     }
 

@@ -297,7 +297,10 @@ class LiftEnvCfg:
     record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
     rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
-    drop_zone: tuple[float, float, float] = (0.46, 0.0, 0.09)  # central zone, low like the real demos
+    # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
+    # The release happens at the transport height (no lowering); the cube free-falls.
+    drop_x_range: tuple[float, float] = (0.30, 0.40)
+    drop_y: float = 0.0
     table: TableCfg = field(default_factory=TableCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     table_transparent: bool = False        # hide the visual table slab while keeping table collision
@@ -395,6 +398,10 @@ class LiftBlockEnv:
 
         self.scene.build(n_envs=1)
         self.robot.set_pd_gains()
+        self._tcp_link = self.robot._robot_entity.get_link("link_tcp")
+        self._grasp_welded = False
+        self._cube_yaw = 0.0
+        self.current_drop_xy = (float(np.mean(self.cfg.drop_x_range)), self.cfg.drop_y)
 
         # place static cams + attach wrist cam; keep the nominal poses that per-episode
         # jitter centers on, and the attach machinery so reset() can re-pose everything
@@ -480,10 +487,34 @@ class LiftBlockEnv:
         quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]], device=self.device, dtype=gs.tc_float)
         self.cube.set_pos(pos, skip_forward=True)
         self.cube.set_quat(quat, skip_forward=False)
-        # after the cube draws, so a given seed reproduces the same cube placement as
-        # jitter-free runs
+        self._cube_yaw = yaw
+        self.grasp_release()  # clear any weld left from a previous episode
+        # draw order matters for seed reproducibility: cube first, then cameras, then drop
         self._randomize_cameras(rng)
+        self.current_drop_xy = (float(rng.uniform(*self.cfg.drop_x_range)), self.cfg.drop_y)
         self._sync_attached_cams()
+
+    # -- grasp weld: while gripped, the cube must not be able to slip (grifflee) --
+    def grasp_lock(self) -> None:
+        """Weld the cube to link_tcp at its current pose. Call once the close completes."""
+        if self._grasp_welded:
+            return
+        solver = self.scene.rigid_solver
+        solver.add_weld_constraint(self.cube.links[0].idx, self._tcp_link.idx)
+        self._grasp_welded = True
+
+    def grasp_release(self) -> None:
+        """Delete the grasp weld (cube free-falls). Call at the open command."""
+        if not getattr(self, "_grasp_welded", False):
+            self._grasp_welded = False
+            return
+        solver = self.scene.rigid_solver
+        solver.delete_weld_constraint(self.cube.links[0].idx, self._tcp_link.idx)
+        self._grasp_welded = False
+
+    def cube_yaw(self) -> float:
+        """Cube yaw (rad) sampled at reset; used to align the grasp to the cube faces."""
+        return self._cube_yaw
 
     def _randomize_cameras(self, rng: np.random.Generator) -> None:
         """Per-episode camera jitter around the nominal poses; records actual extrinsics.

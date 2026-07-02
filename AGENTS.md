@@ -5,6 +5,61 @@ episodes as Foxglove MCAP for training (crossformer). Everything through pilot
 verification is DONE and committed on branch `synthetic-lift-mcap`. Your job is the
 scale-up and its verification. Read this whole file before running anything.
 
+## 0. IN PROGRESS (2026-07-02 evening) — new demonstration protocol, UNVERIFIED
+
+The commit "New demo protocol (WIP)" implements grifflee's directive but ran out of
+session; NOTHING below has been run yet. Full design: ~/.claude/plans/serene-rolling-knuth.md.
+
+New protocol: above cube (high, yaw-aligned, straight-down) -> vertical plunge -> close
+-> weld cube to link_tcp (no slip possible) -> lift FAST -> transport to drop target
+(x~U[0.30,0.40], y=0, sampled per episode in env.reset) -> open + delete weld -> cube
+drops -> RECORDING ENDS ~0.3s after the open command (fingers opening are recorded; the
+robot moving away from a dropped cube must NEVER be in the data). Unrecorded settle
+steps follow for the success eval. MCAPs now also carry ground-truth calibration:
+foxglove.CameraCalibration on /cam/{low,side}/camera_info + /camera/camera/color/camera_info
+and FrameTransforms on /tf (base->cam_*_optical with the episode's jittered extrinsics,
+link_tcp->cam_wrist_optical for the mount), logged once at episode start.
+
+### Done (code written, compiles, imports — NOT run)
+- src/xsim/scripted_lift_policy.py: new 6-waypoint sequence, SEGMENT_WEIGHTS=(2.6,.8,.8,.4,1.0),
+  approach_height 0.12, canonical top-down grasp quat yawed to cube faces (mod-90 fold),
+  antipode-safe quat nlerp, release_step/grasp_lock_step exposed.
+- src/xsim/lift_task.py: drop_zone REPLACED by drop_x_range/drop_y (breaks --env.drop-zone);
+  current_drop_xy sampled in reset (after cube+camera draws); cube_yaw(); grasp_lock()/
+  grasp_release() via rigid_solver.add/delete_weld_constraint (Genesis 1.2.0).
+- src/xsim/mcap_writer.py: log_calibration() (CameraCalibration D/K/R/P uppercase kwargs;
+  FrameTransform on /tf; _quat_wxyz_from_rot helper).
+- scripts/generate_lift_dataset.py: release_tail_s=0.3 cfg; run_episode/run_video/run_preview
+  end recording at release_step+tail, call grasp_lock/release, settle unrecorded, deliver
+  eval vs current_drop_xy + on_table check; stats gain drop_target/cube_yaw.
+
+### TODO, in order
+1. compare_batches.py + validate_mcap.py: format gate currently requires EXACT topic match
+   -> will FAIL with the 4 new calibration topics + /tf. Change to: 6 core topics exact
+   AND calibration topics present (allowlist). Also recalibrate the frame gate (old
+   150-320 for base 229 frames; new base ~ (1+5.6*sps)/4 + 9tail ~ 165 -> roughly [115,240],
+   recompute properly).
+2. Slip trace verification (protocol in plan): seed 6542 raster, TCP-z minus cube-z through
+   grasp->release; drift must be 0.0 while welded, clean drop after. Pre-fix measurement
+   was ~6mm drift (that is the bug grifflee saw).
+3. Raster video + preview: check yaw-aligned vertical approach reads right, fast lift,
+   episode ends right after fingers open, no retreat frames. Genesis quirk to watch: the
+   env was rebuilt per episode in the same process; weld constraints must not leak across
+   resets (reset() calls grasp_release() defensively — verify).
+4. 3-ep raster gen -> decode last frames (TCP stationary at drop through tail, gripper
+   norm rising, cube falling/on table) + manifest check.
+5. 10-ep nyx pilot (fresh seeds 8000+) -> compare_batches -> SHOW GRIFFLEE video+report
+   (checkpoint) -> then sharded batch_v3 (4 x 25, protocol from batch_v2: shard dirs,
+   staggered launch, merge manifests; batch_v2 took ~13 min total that way).
+6. AGENTS.md flag docs: --env.drop-zone is gone (drop-x-range/drop-y); demonstration-style
+   section is stale vs the new protocol.
+
+### Open items decided by me, grifflee has NOT reviewed
+- Release at lift height (grasp_z+0.09), no lowering before open.
+- 0.3 s recorded opening tail after the open command.
+- Weights (2.6,.8,.8,.4,1.0) -> episodes ~5-7 s (shorter than real 6.5-10 s tail-less
+  protocol; expected, flag in the checkpoint).
+
 ## 1. Non-negotiable constraints (from grifflee)
 
 1. **Table rendering: `table_mode="slab"` (the default). NEVER pass
