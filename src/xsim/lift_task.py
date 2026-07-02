@@ -269,6 +269,7 @@ class LiftEnvCfg:
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
     drop_zone: tuple[float, float, float] = (0.46, 0.0, 0.12)  # central zone (a few in above center)
     table: TableCfg = field(default_factory=TableCfg)
+    table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     show_viewer: bool = False
     render_backend: Literal["raster", "nyx"] = "raster"
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
@@ -301,27 +302,37 @@ class LiftBlockEnv:
             show_viewer=self.cfg.show_viewer,
         )
 
-        # flat table plane: invisible collision at the aligned table-top height (z=0)
+        # flat table plane: always provides collision at the aligned table-top height
+        # (z=0). In plane mode it is also the visible infinite tabletop.
         t = self.cfg.table
+        table_surface = gs.surfaces.Plastic(color=t.color, roughness=0.8)
         self.table = self.scene.add_entity(
-            gs.morphs.Plane(pos=(0.0, 0.0, t.top_z), visualization=False, collision=True),
-        )
-        # visual-only cart body with the real cart's measured footprint: the real dark
-        # metal cart scans as sparse see-through mush in the splat (scripts/clean_splat.py
-        # crops that region out), so this box stands in for it — full depth down to the
-        # floor so it occludes the under-table region from every camera angle, exactly
-        # like the real cart does
-        slab_h = 0.72
-        self.scene.add_entity(
-            gs.morphs.Box(
-                size=(t.size_xy[0], t.size_xy[1], slab_h),
-                pos=(t.center_xy[0], t.center_xy[1], t.top_z - slab_h / 2.0),
-                fixed=True,
-                visualization=True,
-                collision=False,
+            gs.morphs.Plane(
+                pos=(0.0, 0.0, t.top_z),
+                visualization=self.cfg.table_mode == "plane",
+                collision=True,
             ),
-            surface=gs.surfaces.Plastic(color=t.color, roughness=0.8),
+            surface=table_surface,
         )
+        if self.cfg.table_mode == "slab":
+            # visual-only cart body with the real cart's measured footprint: the real dark
+            # metal cart scans as sparse see-through mush in the splat (scripts/clean_splat.py
+            # crops that region out), so this box stands in for it — full depth down to the
+            # floor so it occludes the under-table region from every camera angle, exactly
+            # like the real cart does
+            slab_h = 0.72
+            self.scene.add_entity(
+                gs.morphs.Box(
+                    size=(t.size_xy[0], t.size_xy[1], slab_h),
+                    pos=(t.center_xy[0], t.center_xy[1], t.top_z - slab_h / 2.0),
+                    fixed=True,
+                    visualization=True,
+                    collision=False,
+                ),
+                surface=table_surface,
+            )
+        elif self.cfg.table_mode != "plane":
+            raise ValueError(f"unknown table_mode: {self.cfg.table_mode!r}")
 
         # robot (base at world origin, on the table top)
         self.robot = Manipulator(num_envs=1, scene=self.scene, args=self.robot_cfg, device=gs.device)
