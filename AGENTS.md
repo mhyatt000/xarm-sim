@@ -92,7 +92,7 @@ If grifflee wants better coverage:
    (e.g., y ±0.15 → ±0.22; keep everything on the real table: world x ∈ [−0.09, 0.84],
    y ∈ [−0.30, 0.32] minus margins for the gripper).
 2. Run a 10-episode RASTER pilot first (fast): success rate must stay high — spawns too
-   близко to the table edge or robot base will fail IK/grasps.
+   close to the table edge or robot base will fail IK/grasps.
 3. Then a 10-episode nyx pilot + `compare_batches.py` + grifflee's read, THEN a batch.
 
 ### Task D — Publish
