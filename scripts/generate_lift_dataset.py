@@ -10,7 +10,6 @@ computed per episode; by default only successful episodes are kept.
     uv run python scripts/generate_lift_dataset.py --mode preview --backend cpu
     uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx
     uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx --env.table-transparent
-    uv run python scripts/generate_lift_dataset.py --mode video --env.table-mode plane
 """
 
 from __future__ import annotations
@@ -133,8 +132,10 @@ def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
 
     waypoint_names = policy.waypoint_names or ["home"]
     milestone_steps = {0: waypoint_names[0]}
-    for waypoint_idx, name in enumerate(waypoint_names[1:], start=1):
-        milestone_steps[waypoint_idx * cfg.steps_per_segment] = name
+    cumulative = 0
+    for seg_steps, name in zip(policy._segment_steps, waypoint_names[1:], strict=True):
+        cumulative += seg_steps
+        milestone_steps[cumulative] = name
 
     release_tail = max(1, int(round(cfg.release_tail_s / env.cfg.physics_dt)))
     total = policy.release_step + release_tail
@@ -215,7 +216,7 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
 
 def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
     env.reset(seed=cfg.seed + episode_idx)
-    # vary episode tempo per seed (the real demos range roughly 6.5-10 s)
+    # vary episode tempo per seed; the new release-at-drop protocol runs roughly 5-7 s
     tempo_rng = np.random.default_rng((cfg.seed + episode_idx) * 7919 + 1)
     sps = int(round(cfg.steps_per_segment * tempo_rng.uniform(0.85, 1.30)))
     policy = ScriptedLiftPolicy(env, steps_per_segment=sps, grasp_tcp_offset=cfg.grasp_tcp_offset)

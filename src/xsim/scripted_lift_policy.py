@@ -1,14 +1,16 @@
 """Scripted waypoint policy for the block lift task.
 
-Sequence (grifflee's 2026-07-02 protocol): home → above the cube (high, yaw-aligned to
-the cube faces, gripper straight down) → vertical plunge → close → lift quickly →
-transport to the drop target on the table centerline → open (cube drops). The episode
-ends at the release; there is no lowering-to-place and no retreat — the robot must never
-be recorded moving away from a cube that is on the table.
+Sequence (grifflee's 2026-07-02 protocol): home -> above the cube (high, yaw-aligned to
+the cube faces, gripper straight down) -> vertical plunge -> close -> lift quickly ->
+transport to the drop target on the table centerline -> brief closed hold at the target ->
+open (cube drops). The episode ends at the release; there is no lowering-to-place and no
+retreat, so the robot is never recorded moving away from a cube that is on the table.
 
 Drives the env's ``Manipulator`` via ``go_to_goal`` with straight-line lerp per segment.
 Waypoint quats differ (yaw alignment happens over the approach segment), so the lerped
-quat is renormalized each step (nlerp; twist is ≤45° so this is fine).
+quat is renormalized each step. The square block has 90-degree rotational symmetry, so
+side-grasp yaw selection picks the equivalent face-aligned yaw closest to the current
+wrist orientation instead of forcing a needless quarter-turn.
 """
 
 from __future__ import annotations
@@ -25,10 +27,11 @@ class LiftCommand:
     open_gripper: bool
 
 
-# Per-segment duration weights (× steps_per_segment): approach, plunge, close, lift,
-# transport. Approach keeps the real demos' slow start; lift is deliberately fast
-# ("lift quickly up"); the plunge is short so it reads as a vertical drop.
-SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.0)
+# Per-segment duration weights (x steps_per_segment): approach, plunge, close, lift,
+# transport, closed hold over the drop target. Approach keeps the real demos' slow start;
+# lift is deliberately fast ("lift quickly up"); the hold lets the controller settle so
+# the recorded opening tail is stationary instead of still drifting to the target.
+SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.0, 0.6)
 
 # Gripper pointing straight down (180° about world x from identity), so the approach and
 # grasp are exactly vertical instead of inheriting the ready pose's slight tilt.
@@ -37,10 +40,32 @@ TOP_DOWN_QUAT_WXYZ = (0.0, 1.0, 0.0, 0.0)
 
 def _yawed_top_down_quat(yaw: float) -> tuple[float, float, float, float]:
     """Top-down grasp quat twisted about world z by ``yaw`` (w,x,y,z)."""
-    # q = qz(yaw) ⊗ q_topdown, with q_topdown = (0,1,0,0):
-    # (cos·0 - 0, cos·1 + sin·0, ... ) → (0, cos(yaw/2), sin(yaw/2), 0)
+    # q = qz(yaw) * q_topdown, with q_topdown = (0,1,0,0):
+    # (cos*0 - 0, cos*1 + sin*0, ... ) -> (0, cos(yaw/2), sin(yaw/2), 0)
     h = yaw / 2.0
     return (0.0, math.cos(h), math.sin(h), 0.0)
+
+
+def _nearest_side_grasp_quat(cube_yaw: float, reference_quat) -> tuple[float, float, float, float]:
+    """Face-aligned top-down grasp requiring minimal rotation from ``reference_quat``.
+
+    The cube is square in the table plane. Grasping either opposite face pair is valid,
+    so ``cube_yaw + k*pi/2`` are equivalent side grasps. Choose the equivalent top-down
+    quaternion closest to the current wrist orientation to avoid unnecessary 90-degree
+    spins while still closing on faces instead of edges.
+    """
+    if hasattr(reference_quat, "detach"):
+        reference_quat = reference_quat.detach().cpu().tolist()
+    ref = tuple(float(v) for v in reference_quat)
+    best_q = _yawed_top_down_quat(cube_yaw)
+    best_score = -1.0
+    for k in range(-4, 5):
+        q = _yawed_top_down_quat(cube_yaw + k * math.pi / 2.0)
+        score = abs(sum(a * b for a, b in zip(q, ref, strict=True)))
+        if score > best_score:
+            best_score = score
+            best_q = q
+    return best_q
 
 
 class ScriptedLiftPolicy:
@@ -68,11 +93,14 @@ class ScriptedLiftPolicy:
         drop_x, drop_y = env.current_drop_xy
         top_z = env.cfg.table.top_z
 
-        # align the fingers with the cube faces: twist the top-down grasp about z by the
-        # cube yaw folded into (-45°, 45°] so the wrist never turns more than a quarter face
-        yaw = float(env.cube_yaw())
-        yaw = (yaw + math.pi / 4) % (math.pi / 2) - math.pi / 4
-        grasp_quat = torch.as_tensor(_yawed_top_down_quat(yaw), device=device, dtype=ee.dtype)
+        # Align the fingers with cube faces, but choose the 90-degree-equivalent side
+        # grasp closest to the current wrist orientation. This avoids unnecessary quarter
+        # turns while still closing on side faces instead of cube edges.
+        grasp_quat = torch.as_tensor(
+            _nearest_side_grasp_quat(float(env.cube_yaw()), home_quat),
+            device=device,
+            dtype=ee.dtype,
+        )
         if torch.dot(home_quat, grasp_quat) < 0:  # avoid lerping across the antipode
             grasp_quat = -grasp_quat
 
@@ -96,6 +124,7 @@ class ScriptedLiftPolicy:
             "at_block_closed",
             "lift",
             "over_drop",
+            "over_drop_settled",
         ]
 
         # (target_pose, open_gripper) waypoints
@@ -106,6 +135,7 @@ class ScriptedLiftPolicy:
             (at, False),                # close (grasp)
             (lift, False),              # lift quickly
             (over_drop, False),         # transport to the drop target
+            (over_drop, False),         # settle at the target before release
         ]
         n_seg = len(self._waypoints) - 1
         weights = self.segment_weights if len(self.segment_weights) == n_seg else (1.0,) * n_seg

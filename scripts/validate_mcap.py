@@ -15,6 +15,53 @@ import cv2
 import numpy as np
 from numcodecs import Zstd
 
+CORE_TOPICS = {
+    "/cam/low/image_raw",
+    "/cam/side/image_raw",
+    "/camera/camera/color/image_raw/compressed",
+    "/xarm/joint_states",
+    "/xarm/robot_states",
+    "/xgym/gripper",
+}
+
+CALIBRATION_TOPIC_SCHEMAS = {
+    "/cam/low/camera_info": "foxglove.CameraCalibration",
+    "/cam/side/camera_info": "foxglove.CameraCalibration",
+    "/camera/camera/color/camera_info": "foxglove.CameraCalibration",
+    "/tf": "foxglove.FrameTransform",
+}
+
+CALIBRATION_TOPIC_COUNTS = {
+    "/cam/low/camera_info": 1,
+    "/cam/side/camera_info": 1,
+    "/camera/camera/color/camera_info": 1,
+    "/tf": 3,
+}
+
+# New 2026-07-02 protocol: release_step = 1 + sum(round(weight * sps)); MCAP
+# records until release_step + 0.3 s tail, decimated from 120 Hz to 30 Hz. The exact
+# default tempo-jitter envelope is 152..227 frames; keep a truncation/runaway margin.
+SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.0, 0.6)
+DEFAULT_STEPS_PER_SEGMENT = 108
+TEMPO_RANGE = (0.85, 1.30)
+DEFAULT_RELEASE_TAIL_S = 0.3
+DEFAULT_PHYSICS_DT = 1.0 / 120.0
+DEFAULT_RECORD_EVERY = 4
+
+
+def _recorded_frames(steps_per_segment: int) -> int:
+    segment_steps = [max(2, round(w * steps_per_segment)) for w in SEGMENT_WEIGHTS]
+    release_step = 1 + sum(segment_steps)
+    release_tail = max(1, round(DEFAULT_RELEASE_TAIL_S / DEFAULT_PHYSICS_DT))
+    record_until = release_step + release_tail
+    return (record_until - 1) // DEFAULT_RECORD_EVERY + 1
+
+
+DESIGN_CORE_FRAME_MIN = _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[0]))
+DESIGN_CORE_FRAME_MAX = _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[1]))
+CORE_FRAME_COUNT_MIN = 115
+CORE_FRAME_COUNT_MAX = 240
+
 
 def _str(b: bytes, o: int) -> tuple[str, int]:
     (n,) = struct.unpack_from("<I", b, o)
@@ -70,6 +117,74 @@ def scan(path: str):
             counts[cid] = counts.get(cid, 0) + 1
             first_msg.setdefault(cid, body[22:])
     return chans, schemas, counts, first_msg
+
+
+def schema_by_topic(chans: dict[int, tuple[str, int]], schemas: dict[int, str]) -> dict[str, str]:
+    return {topic: schemas.get(sid, "?") for _, (topic, sid) in chans.items()}
+
+
+def counts_by_topic(chans: dict[int, tuple[str, int]], counts: dict[int, int]) -> dict[str, int]:
+    return {topic: counts.get(cid, 0) for cid, (topic, _) in chans.items()}
+
+
+def compare_topic_layout(
+    chans: dict[int, tuple[str, int]],
+    schemas: dict[int, str],
+    counts: dict[int, int],
+    ref_chans: dict[int, tuple[str, int]],
+    ref_schemas: dict[int, str],
+) -> list[str]:
+    """Format gate for sim MCAPs vs real lift MCAPs.
+
+    The six training streams must match the real reference topics/schemas. Sim files
+    are also expected to carry four ground-truth calibration topics written once at
+    episode start;
+    those are allowlisted extras, not a free pass for arbitrary new topics.
+    """
+    ref_topics = schema_by_topic(ref_chans, ref_schemas)
+    have_topics = schema_by_topic(chans, schemas)
+    have_counts = counts_by_topic(chans, counts)
+    problems: list[str] = []
+
+    missing_ref_core = sorted(CORE_TOPICS - set(ref_topics))
+    if missing_ref_core:
+        problems.append(f"reference missing core topics: {missing_ref_core}")
+
+    missing_core = sorted(CORE_TOPICS - set(have_topics))
+    if missing_core:
+        problems.append(f"missing core topics: {missing_core}")
+
+    extra_unallowed = sorted(set(have_topics) - CORE_TOPICS - set(CALIBRATION_TOPIC_SCHEMAS))
+    if extra_unallowed:
+        problems.append(f"unallowlisted extra topics: {extra_unallowed}")
+
+    for topic in sorted(CORE_TOPICS & set(have_topics) & set(ref_topics)):
+        if have_topics[topic] != ref_topics[topic]:
+            problems.append(f"schema mismatch on {topic}: {have_topics[topic]} != {ref_topics[topic]}")
+
+    missing_cal = sorted(set(CALIBRATION_TOPIC_SCHEMAS) - set(have_topics))
+    if missing_cal:
+        problems.append(f"missing calibration topics: {missing_cal}")
+
+    for topic, expected_schema in sorted(CALIBRATION_TOPIC_SCHEMAS.items()):
+        if topic in have_topics and have_topics[topic] != expected_schema:
+            problems.append(f"schema mismatch on {topic}: {have_topics[topic]} != {expected_schema}")
+
+    for topic, expected_count in sorted(CALIBRATION_TOPIC_COUNTS.items()):
+        if topic in have_counts and have_counts[topic] != expected_count:
+            problems.append(f"{topic}: expected {expected_count} message(s), got {have_counts[topic]}")
+
+    if not missing_core:
+        core_counts = {topic: have_counts.get(topic, 0) for topic in sorted(CORE_TOPICS)}
+        lo, hi = min(core_counts.values()), max(core_counts.values())
+        if lo < CORE_FRAME_COUNT_MIN or hi > CORE_FRAME_COUNT_MAX:
+            problems.append(
+                f"core message count out of range: {lo}..{hi} "
+                f"(expected {CORE_FRAME_COUNT_MIN}..{CORE_FRAME_COUNT_MAX}; "
+                f"design envelope {DESIGN_CORE_FRAME_MIN}..{DESIGN_CORE_FRAME_MAX})"
+            )
+
+    return problems
 
 
 def _varint(b: bytes, o: int) -> tuple[int, int]:
@@ -243,20 +358,27 @@ def main() -> None:
         elif schema == "xclients.Gripper":
             print(f"  {topic}: {parse_gripper(first[cid])}")
 
+    print()
+    print("-- Calibration topics --")
+    topic_counts = counts_by_topic(chans, counts)
+    for topic, expected_schema in sorted(CALIBRATION_TOPIC_SCHEMAS.items()):
+        if topic not in by_topic:
+            print(f"  [missing] {topic}")
+            continue
+        _, sid = by_topic[topic]
+        print(f"  {topic}: schema={schemas.get(sid, '?')} count={topic_counts.get(topic, 0)}")
+
     if args.reference and args.reference.exists():
         ref_chans, ref_schemas, _, _ = scan(str(args.reference))
-        ref_topics = {t: ref_schemas.get(sid, "?") for _, (t, sid) in ref_chans.items()}
-        have_topics = {t: schemas.get(sid, "?") for _, (t, sid) in chans.items()}
-        missing = sorted(set(ref_topics) - set(have_topics))
-        extra = sorted(set(have_topics) - set(ref_topics))
-        schema_diff = sorted(
-            topic for topic in set(ref_topics) & set(have_topics) if ref_topics[topic] != have_topics[topic]
-        )
+        problems = compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas)
         print()
         print(f"-- vs reference {args.reference.name} --")
-        print(f"  missing topics: {missing or 'none'}")
-        print(f"  extra topics: {extra or 'none'}")
-        print(f"  schema mismatches: {schema_diff or 'none'}")
+        if problems:
+            print("  layout: FAIL")
+            for problem in problems:
+                print(f"  - {problem}")
+            raise SystemExit(1)
+        print("  layout: PASS (core topics match reference; calibration topics present)")
 
 
 if __name__ == "__main__":

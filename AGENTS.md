@@ -5,60 +5,71 @@ episodes as Foxglove MCAP for training (crossformer). Everything through pilot
 verification is DONE and committed on branch `synthetic-lift-mcap`. Your job is the
 scale-up and its verification. Read this whole file before running anything.
 
-## 0. IN PROGRESS (2026-07-02 evening) — new demonstration protocol, UNVERIFIED
+## 0. IN PROGRESS (2026-07-02 evening) -- new demonstration protocol verified through pilot
 
-The commit "New demo protocol (WIP)" implements grifflee's directive but ran out of
-session; NOTHING below has been run yet. Full design: ~/.claude/plans/serene-rolling-knuth.md.
+Commit `660d33b` introduced grifflee's new protocol; this follow-up made the validation
+and timing fixes and ran the gates through a 10-episode Nyx pilot. Do not start batch_v3
+until grifflee reviews the checkpoint artifacts below.
 
-New protocol: above cube (high, yaw-aligned, straight-down) -> vertical plunge -> close
--> weld cube to link_tcp (no slip possible) -> lift FAST -> transport to drop target
-(x~U[0.30,0.40], y=0, sampled per episode in env.reset) -> open + delete weld -> cube
-drops -> RECORDING ENDS ~0.3s after the open command (fingers opening are recorded; the
-robot moving away from a dropped cube must NEVER be in the data). Unrecorded settle
-steps follow for the success eval. MCAPs now also carry ground-truth calibration:
-foxglove.CameraCalibration on /cam/{low,side}/camera_info + /camera/camera/color/camera_info
-and FrameTransforms on /tf (base->cam_*_optical with the episode's jittered extrinsics,
-link_tcp->cam_wrist_optical for the mount), logged once at episode start.
+Current protocol: above cube (high, straight-down, side-grasp yaw chosen as the nearest
+90-degree-equivalent cube-face alignment) -> vertical plunge -> close -> weld cube to
+`link_tcp` -> fast lift -> transport to sampled drop target (x~U[0.30,0.40], y=0) ->
+brief closed hold at the target -> open + delete weld -> cube drops -> recording ends
+after the ~0.3 s opening tail. Unrecorded settle steps still run for the success check.
+MCAPs carry ground-truth calibration: `foxglove.CameraCalibration`
+on `/cam/{low,side}/camera_info` + `/camera/camera/color/camera_info`, and
+`foxglove.FrameTransform` on `/tf`.
 
-### Done (code written, compiles, imports — NOT run)
-- src/xsim/scripted_lift_policy.py: new 6-waypoint sequence, SEGMENT_WEIGHTS=(2.6,.8,.8,.4,1.0),
-  approach_height 0.12, canonical top-down grasp quat yawed to cube faces (mod-90 fold),
-  antipode-safe quat nlerp, release_step/grasp_lock_step exposed.
-- src/xsim/lift_task.py: drop_zone REPLACED by drop_x_range/drop_y (breaks --env.drop-zone);
-  current_drop_xy sampled in reset (after cube+camera draws); cube_yaw(); grasp_lock()/
-  grasp_release() via rigid_solver.add/delete_weld_constraint (Genesis 1.2.0).
-- src/xsim/mcap_writer.py: log_calibration() (CameraCalibration D/K/R/P uppercase kwargs;
-  FrameTransform on /tf; _quat_wxyz_from_rot helper).
-- scripts/generate_lift_dataset.py: release_tail_s=0.3 cfg; run_episode/run_video/run_preview
-  end recording at release_step+tail, call grasp_lock/release, settle unrecorded, deliver
-  eval vs current_drop_xy + on_table check; stats gain drop_target/cube_yaw.
+### Verified/fixed after `660d33b`
 
-### TODO, in order
-1. compare_batches.py + validate_mcap.py: format gate currently requires EXACT topic match
-   -> will FAIL with the 4 new calibration topics + /tf. Change to: 6 core topics exact
-   AND calibration topics present (allowlist). Also recalibrate the frame gate (old
-   150-320 for base 229 frames; new base ~ (1+5.6*sps)/4 + 9tail ~ 165 -> roughly [115,240],
-   recompute properly).
-2. Slip trace verification (protocol in plan): seed 6542 raster, TCP-z minus cube-z through
-   grasp->release; drift must be 0.0 while welded, clean drop after. Pre-fix measurement
-   was ~6mm drift (that is the bug grifflee saw).
-3. Raster video + preview: check yaw-aligned vertical approach reads right, fast lift,
-   episode ends right after fingers open, no retreat frames. Genesis quirk to watch: the
-   env was rebuilt per episode in the same process; weld constraints must not leak across
-   resets (reset() calls grasp_release() defensively — verify).
-4. 3-ep raster gen -> decode last frames (TCP stationary at drop through tail, gripper
-   norm rising, cube falling/on table) + manifest check.
-5. 10-ep nyx pilot (fresh seeds 8000+) -> compare_batches -> SHOW GRIFFLEE video+report
-   (checkpoint) -> then sharded batch_v3 (4 x 25, protocol from batch_v2: shard dirs,
-   staggered launch, merge manifests; batch_v2 took ~13 min total that way).
-6. AGENTS.md flag docs: --env.drop-zone is gone (drop-x-range/drop-y); demonstration-style
-   section is stale vs the new protocol.
+- `scripts/compare_batches.py` and `scripts/validate_mcap.py` now gate the six core real
+  topics/schemas, allowlist/require the three `CameraCalibration` topics plus `/tf`, and
+  use the new core frame-count gate 115-240. The default design envelope is 152-227
+  frames after the added pre-release hold.
+- `src/xsim/scripted_lift_policy.py` now has `SEGMENT_WEIGHTS=(2.6,.8,.8,.4,1.0,.6)`.
+  The final `.6` segment is a closed hold at `over_drop`; it was added because MCAP tail
+  decoding showed 10-20 mm TCP drift during the recorded opening tail without it.
+- Gripper yaw now chooses the nearest equivalent side grasp (`cube_yaw + k*pi/2`) to the
+  current wrist orientation. The old world-zero fold caused avoidable ~90-degree spins;
+  diagnostic seeds 8000-8009 now select face-aligned yaws with ~15-41 degree wrist
+  reorientation instead of ~95-129 degrees.
+- Seed 6542 raster slip trace: welded TCP-z/cube-z drift was 0.013 mm while welded; cube
+  dropped cleanly after release; `reset()` cleared the weld.
+- Seed 6542 raster video/preview generated:
+  - `outputs/sim_preview/protocol_v3_seed6542_raster_hold.mp4`
+  - `outputs/sim_preview/protocol_v3_seed6542_preview_hold/`
+  - preview milestones include `over_drop_settled` before `release`.
+- 3-episode raster smoke after the side-grasp yaw fix
+  (`outputs/sim_mcap/raster_v3_sides_smoke_7200`, seed 7200): 3/3 success;
+  `validate_mcap.py` PASS; `compare_batches.py` FORMAT PASS; report at
+  `outputs/batch_report/report_raster_v3_sides_smoke_7200.png`. MCAP tail decode: final
+  10-frame TCP motion 0.05-0.17 mm, gripper norm opens ~0.318 -> 0.96+.
+- 10-episode Nyx pilot after the side-grasp yaw fix
+  (`outputs/sim_mcap/nyx_pilot_v3_sides_8100`, seeds 8100-8109): 10/10 success; frame
+  counts 152-221; `validate_mcap.py` PASS; `compare_batches.py` FORMAT PASS; rate
+  30.00 Hz; duration 6.16+/-0.72 s; report at
+  `outputs/batch_report/report_nyx_pilot_v3_sides_8100.png`.
+- Nyx checkpoint video generated at `outputs/sim_preview/nyx_pilot_v3_sides_seed8100.mp4`.
 
-### Open items decided by me, grifflee has NOT reviewed
-- Release at lift height (grasp_z+0.09), no lowering before open.
-- 0.3 s recorded opening tail after the open command.
-- Weights (2.6,.8,.8,.4,1.0) -> episodes ~5-7 s (shorter than real 6.5-10 s tail-less
-  protocol; expected, flag in the checkpoint).
+### Next step
+
+Show grifflee the Nyx checkpoint video and report before generating batch_v3:
+
+```bash
+cd ~/repo/xarm-sim
+ls outputs/sim_preview/nyx_pilot_v3_sides_seed8100.mp4 \
+   outputs/batch_report/report_nyx_pilot_v3_sides_8100.png
+```
+
+If grifflee approves, generate sharded `batch_v3` (same pattern as batch_v2: shard dirs,
+staggered launch, merge manifests). If he rejects the checkpoint, do not batch; adjust the
+policy/visuals and rerun the raster smoke + 10-episode Nyx pilot first.
+
+### Open items still needing grifflee's read
+
+- Release is at lift height; there is no lowering before open.
+- The dataset includes the ~0.3 s recorded opening tail.
+- Segment timing is now `(2.6,.8,.8,.4,1.0,.6)`, giving ~5-7 s episodes.
 
 ## 1. Non-negotiable constraints (from grifflee)
 
@@ -89,13 +100,15 @@ link_tcp->cam_wrist_optical for the mount), logged once at episode start.
   artifacts in `outputs/blink_test/`, incl. sim↔real flip GIFs).
 - **Wrist camera**: uncalibrated by nature (robot never sees itself); mount is a guess
   validated against real May episode frames at matched joints (~40 px mid-grasp).
-- **Demonstration style**: scripted policy tuned to the real demos — low IK-solved ready
-  pose (TCP ≈ (0.34, 0, 0.10)), lift 0.09 m, grasp completing ~55–60% of episode,
-  release ~85%, tempo jitter 0.85–1.30× → 6.6–9.8 s episodes.
-  Verified: `outputs/batch_report/report_pilot_v2.png` — sim tracks the real median TCP
-  and gripper profiles inside the real 10–90% band.
-- **Pilot v2**: `outputs/sim_mcap/pilot_v2/` — 10/10 success, format gate PASS,
-  `manifest.json` records git SHA, config, splat md5, per-episode seeds/stats.
+- **Old pilot v2 protocol (verified, now superseded)**: low IK-solved ready pose,
+  lift 0.09 m, release near 85%, tempo jitter 0.85–1.30× → 6.6–9.8 s episodes.
+  `outputs/sim_mcap/pilot_v2/` was 10/10 success and format PASS; its report showed
+  TCP/gripper profiles inside the real 10–90% band.
+- **New protocol after commit `660d33b` (pilot-verified, awaiting grifflee review)**:
+  straight-down approach with nearest side-grasp yaw, vertical plunge, close, weld to
+  `link_tcp`, fast lift, transport to sampled drop target, brief closed hold,
+  open/unweld, and end recording after the short opening tail. Section 0 has the current
+  checkpoint artifacts.
 - **Docs**: `docs/TRAINING_HANDOFF.md` = consumer-facing (calibrated-vs-guessed
   inventory, eval caveats). Read it once.
 
@@ -196,7 +209,8 @@ Simulation and toggle notes:
   checkpoint workflow in section 1.
 - `--env.rectangle-x LO HI` / `--env.rectangle-y LO HI`: cube spawn rectangle. Any
   widening needs a raster pilot, a Nyx pilot, `compare_batches.py`, and grifflee's read.
-- `--env.drop-zone X Y Z`: final delivery target; changing this changes label dynamics.
+- `--env.drop-x-range LO HI` / `--env.drop-y Y`: sampled release target. Changing
+  these changes label dynamics and success evaluation.
 - `--steps-per-segment`, `--hold-steps`, `--grasp-tcp-offset`: policy/tempo/contact
   controls. These affect the real-vs-sim distribution report.
 - `--save-failures`: keeps failed MCAP rollouts instead of deleting them. Use only for
@@ -244,9 +258,10 @@ uv run python scripts/compare_batches.py --sim-dir outputs/sim_mcap/batch_v1
 ```
 
 Pass criteria:
-- prints `FORMAT: PASS` (topic/schema/count match vs a real reference; frame counts
-  150–320; exits non-zero on failure — treat any failure as a hard stop).
-- rate ≈ 30.00 Hz, durations spread roughly 6.5–10 s.
+- prints `FORMAT: PASS` (six core topics/schemas match a real reference; the three
+  `CameraCalibration` topics plus `/tf` are present; core frame counts 115–240;
+  exits non-zero on failure — treat any failure as a hard stop).
+- rate ≈ 30.00 Hz, durations spread roughly 5–7 s for the new protocol.
 - In `outputs/batch_report/report_batch_v1.png`: sim TCP/gripper median inside the real
   band (like report_pilot_v2); joint histograms overlapping the real support.
 - Also eyeball ~3 episodes visually: `--mode video` on the generator config renders an

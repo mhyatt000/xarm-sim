@@ -3,8 +3,9 @@
 Two layers, matching what is actually meaningful to compare (the real episodes were
 recorded on the old static-camera rig, so pixels are not comparable — labels are):
 
-1. **Format (hard gate)** — every sim file must match the real reference exactly in
-   topics/schemas, record at ~30 Hz, and carry a sane frame count.
+1. **Format (hard gate)** — every sim file must match the real reference on the six
+   core topics/schemas, include the sim-only calibration topics, record at ~30 Hz, and
+   carry a sane frame count.
 2. **Label distributions** — joint positions, TCP height profile, gripper timing and
    episode length, sim batch vs a stratified sample of the 409 real episodes. Rendered
    to one report PNG; printed summary alongside.
@@ -32,6 +33,7 @@ from validate_mcap import (  # noqa: E402
     parse_pose,
     read_records,
     scan,
+    compare_topic_layout,
 )
 
 REAL_DIR = Path("/data/store/mcaps/single/lift")
@@ -96,21 +98,11 @@ def sample_real(real_dir: Path, k: int) -> list[Path]:
 
 def check_format(sim_files: list[Path], reference: Path) -> list[str]:
     ref_chans, ref_schemas, _, _ = scan(str(reference))
-    ref = {t: ref_schemas.get(sid, "?") for _, (t, sid) in ref_chans.items()}
     problems = []
     for f in sim_files:
         chans, schemas, counts, _ = scan(str(f))
-        have = {t: schemas.get(sid, "?") for _, (t, sid) in chans.items()}
-        if set(have) != set(ref):
-            problems.append(f"{f.name}: topic set differs: -{set(ref)-set(have)} +{set(have)-set(ref)}")
-        for t in set(have) & set(ref):
-            if have[t] != ref[t]:
-                problems.append(f"{f.name}: schema mismatch on {t}: {have[t]} != {ref[t]}")
-        n = list(counts.values())
-        # generator design range: base 229 frames x tempo jitter 0.85-1.30, plus margin;
-        # this gate exists to catch truncated or runaway files, not tempo variation
-        if n and (min(n) < 150 or max(n) > 320):
-            problems.append(f"{f.name}: message count out of range: {min(n)}..{max(n)}")
+        for problem in compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas):
+            problems.append(f"{f.name}: {problem}")
     return problems
 
 
@@ -148,7 +140,7 @@ def main(cfg: Cfg) -> None:
         for p in problems:
             print("  " + p)
     else:
-        print("FORMAT: PASS (topics, schemas, message counts match the real layout)")
+        print("FORMAT: PASS (core topics match the real layout; calibration topics present; frame counts sane)")
 
     sim = [e for f in sim_files if (e := parse_episode(f))]
     real = [e for f in real_files if (e := parse_episode(f))]
