@@ -1,13 +1,14 @@
 """Generate synthetic block-lift episodes as Foxglove MCAP.
 
-Drives ``LiftBlockEnv`` with ``ScriptedLiftPolicy``, records at a fixed rate (decimated
-from the physics step), and writes one ``<episode>.mcap`` per rollout via
-``EpisodeMcapWriter`` — matching the reference `_base.mcap` schema plus camera
-intrinsics/extrinsics and joint states. Grasp success is computed per episode; by default
-only successful episodes are kept.
+Drives ``LiftBlockEnv`` with ``ScriptedLiftPolicy``. In generate mode it records at a
+fixed rate and writes one ``<episode>.mcap`` per rollout via ``EpisodeMcapWriter``,
+matching the real lift MCAP topic/schema layout under ``/data/store/mcaps/single/lift``.
+Preview/video modes render inspection artifacts without writing MCAP. Grasp success is
+computed per episode; by default only successful episodes are kept.
 
     uv run python scripts/generate_lift_dataset.py --n-episodes 3 --backend gpu
     uv run python scripts/generate_lift_dataset.py --mode preview --backend cpu
+    uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx
 """
 
 from __future__ import annotations
@@ -34,9 +35,11 @@ from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
 
 @dataclass
 class Config:
-    mode: Literal["generate", "preview"] = "generate"
+    mode: Literal["generate", "preview", "video"] = "generate"
     out_dir: Path = PROJECT_ROOT / "outputs" / "sim_mcap" / "lift"
     preview_dir: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_env"
+    video_path: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_task_current.mp4"
+    video_fps: float = 30.0
     n_episodes: int = 1
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
@@ -44,6 +47,7 @@ class Config:
     hold_steps: int = 48            # extra settle steps after the sequence
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
     deliver_radius: float = 0.12    # max xy dist (m) from drop zone at episode end
+    grasp_tcp_offset: float = 0.016 # TCP target height above table while closing (m)
     save_failures: bool = False
     env: LiftEnvCfg = field(default_factory=LiftEnvCfg)
 
@@ -98,10 +102,28 @@ def save_preview_frame(env: LiftBlockEnv, preview_dir: Path, step_idx: int, labe
     _save_rgb_png(preview_dir / f"{step_idx:04d}_{safe}_contact.png", np.concatenate(annotated, axis=1))
 
 
+def contact_sheet(images: dict[str, np.ndarray], label: str) -> np.ndarray:
+    frames = []
+    for name in _preview_camera_names(images):
+        frame = images[name].copy()
+        cv2.putText(
+            frame,
+            f"{label} {name}",
+            (16, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        frames.append(frame)
+    return np.concatenate(frames, axis=1)
+
+
 def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
     cfg.preview_dir.mkdir(parents=True, exist_ok=True)
     env.reset(seed=cfg.seed)
-    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
+    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
     policy.reset()
 
     save_preview_frame(env, cfg.preview_dir, 0, "reset")
@@ -124,9 +146,58 @@ def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
     print(f"wrote preview frames to {cfg.preview_dir}")
 
 
+def run_video(env: LiftBlockEnv, cfg: Config) -> None:
+    cfg.video_path.parent.mkdir(parents=True, exist_ok=True)
+    env.reset(seed=cfg.seed)
+    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
+    policy.reset()
+    cube_start = env.cube_pos().copy()
+    max_rise = 0.0
+
+    first = contact_sheet(env.render(), "0000 reset")
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(
+        str(cfg.video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        cfg.video_fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise OSError(f"failed to open video writer for {cfg.video_path}")
+
+    total = policy.n_steps + cfg.hold_steps
+    frame_idx = 0
+    try:
+        writer.write(cv2.cvtColor(first, cv2.COLOR_RGB2BGR))
+        with torch.no_grad():
+            for step_idx in range(total):
+                cmd = policy.step()
+                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+                env.step()
+                cube = env.cube_pos()
+                max_rise = max(max_rise, float(cube[2] - cube_start[2]))
+                if step_idx % env.cfg.record_every == 0:
+                    sheet = contact_sheet(env.render(), f"{frame_idx:04d}")
+                    writer.write(cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
+                    frame_idx += 1
+    finally:
+        writer.release()
+
+    cube_end = env.cube_pos()
+    drop = np.asarray(env.cfg.drop_zone)
+    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop[:2]))
+    lifted = max_rise >= cfg.lift_threshold
+    delivered = deliver_dist <= cfg.deliver_radius
+    print(f"wrote video ({frame_idx + 1} frames @ {cfg.video_fps:g} fps) to {cfg.video_path}")
+    print(
+        f"video stats: rise={max_rise:.3f} deliver={deliver_dist:.3f} "
+        f"lifted={lifted} delivered={delivered} success={lifted and delivered}"
+    )
+
+
 def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
     env.reset(seed=cfg.seed + episode_idx)
-    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
+    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
     policy.reset()
 
     cube_start = env.cube_pos().copy()
@@ -171,6 +242,9 @@ def main(cfg: Config) -> None:
     env = LiftBlockEnv(cfg.env)
     if cfg.mode == "preview":
         run_preview(env, cfg)
+        return
+    if cfg.mode == "video":
+        run_video(env, cfg)
         return
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)

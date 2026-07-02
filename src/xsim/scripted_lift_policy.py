@@ -21,7 +21,7 @@ class LiftCommand:
 
 
 class ScriptedLiftPolicy:
-    def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.005,
+    def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.016,
                  approach_height: float = 0.14, lift_height: float = 0.22):
         self.env = env
         self.steps_per_segment = steps_per_segment
@@ -44,6 +44,8 @@ class ScriptedLiftPolicy:
         def pose(xyz):
             return torch.cat([torch.as_tensor(xyz, device=device, dtype=ee.dtype), quat]).reshape(1, 7)
 
+        # The cube is 31.75 mm tall. Keep the TCP near the upper half of the cube;
+        # driving it near the table plane makes the gripper visibly clip through the block.
         grasp_z = top_z + self.grasp_tcp_offset
         above = pose([cube[0], cube[1], grasp_z + self.approach_height])
         at = pose([cube[0], cube[1], grasp_z])
