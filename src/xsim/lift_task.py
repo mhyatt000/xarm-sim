@@ -125,10 +125,13 @@ XARM7_ROBOT_CFG: dict = {
     "gripper_dof_dim": 6,
     "default_arm_dof": [math.radians(v) for v in [0.0, -45.0, 0.0, 35.0, 0.0, 65.0, 90.0]],
     # xArm gripper joint convention (verified by finger separation): 0.0 = open (fingers
-    # apart), 0.85 = closed (fingers together).
+    # apart), 0.85 = hard fully closed. For a 31.75 mm cube, command a tighter
+    # task grasp target instead of the hard stop; this holds the block without
+    # driving as deeply through it as full closure.
     "default_gripper_dof": [0.0] * 6,
     "gripper_open_dof": 0.0,
     "gripper_close_dof": 0.85,
+    "gripper_grasp_dof": 0.58,
     "dofs_kp": [4500, 4500, 3500, 3500, 2000, 2000, 2000, 350, 350, 350, 350, 350, 350],
     "dofs_kv": [450, 450, 350, 350, 200, 200, 200, 35, 35, 35, 35, 35, 35],
     "dofs_force_lower": [-50] * 13,

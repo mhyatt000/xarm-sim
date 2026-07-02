@@ -47,7 +47,7 @@ class Config:
     hold_steps: int = 48            # extra settle steps after the sequence
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
     deliver_radius: float = 0.12    # max xy dist (m) from drop zone at episode end
-    grasp_tcp_offset: float = 0.016 # TCP target height above table while closing (m)
+    grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
     save_failures: bool = False
     env: LiftEnvCfg = field(default_factory=LiftEnvCfg)
 

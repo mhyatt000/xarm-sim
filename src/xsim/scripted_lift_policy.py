@@ -21,7 +21,7 @@ class LiftCommand:
 
 
 class ScriptedLiftPolicy:
-    def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.016,
+    def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.018,
                  approach_height: float = 0.14, lift_height: float = 0.22):
         self.env = env
         self.steps_per_segment = steps_per_segment

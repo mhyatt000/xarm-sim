@@ -595,6 +595,7 @@ class Manipulator:
         apply_robot_visual_surfaces(self._robot_entity, robot_visual_materials)
         self._gripper_open_dof = args.get("gripper_open_dof", 0.04)
         self._gripper_close_dof = args.get("gripper_close_dof", 0.00)
+        self._gripper_grasp_dof = args.get("gripper_grasp_dof", self._gripper_close_dof)
 
         self._ik_method: Literal["gs_ik", "dls_ik"] = args["ik_method"]
 
@@ -662,7 +663,7 @@ class Manipulator:
         if open_gripper:
             q_pos[:, self._fingers_dof] = self._gripper_open_dof
         else:
-            q_pos[:, self._fingers_dof] = self._gripper_close_dof
+            q_pos[:, self._fingers_dof] = self._gripper_grasp_dof
         self._robot_entity.control_dofs_position(position=q_pos)
 
     def _gs_ik(self, action: torch.Tensor) -> torch.Tensor:
@@ -719,7 +720,7 @@ class Manipulator:
         if open_gripper:
             q_pos[:, self._fingers_dof] = self._gripper_open_dof
         else:
-            q_pos[:, self._fingers_dof] = self._gripper_close_dof
+            q_pos[:, self._fingers_dof] = self._gripper_grasp_dof
         self._robot_entity.control_dofs_position(position=q_pos)
 
     @property
