@@ -65,9 +65,13 @@ def _make_light_field(
     light_field = nps.LightFieldAsset()
     light_field.type = nps.ELightFieldType.GaussianField
     light_field.uri = str(uri.expanduser())
+    # The nyx scene exporter converts every mesh instance from Genesis z-up to Nyx y-up
+    # (float3_z_up_to_y_up_a / quaternion_z_up_to_y_up_a, see nyx_scene_exporter.py) but
+    # passes LightFieldAssets through raw — so we must apply the same world conversion
+    # here or the splat lands in a different frame than the cameras and meshes.
     if position is not None:
-        light_field.position = nps.float3(*position)
-    light_field.rotation = nps.quaternion(*rotation_xyzw)
+        light_field.position = nps.float3_z_up_to_y_up_a(nps.float3(*position))
+    light_field.rotation = nps.quaternion_z_up_to_y_up_a(nps.quaternion(*rotation_xyzw))
     if scale is not None:
         if isinstance(scale, (int, float)):
             scale = (float(scale), float(scale), float(scale))
@@ -217,31 +221,29 @@ DEFAULT_CAMERAS: tuple[CameraView, ...] = (
 )
 
 
-# Splat (lab.ply) → world alignment, solved 2026-07-01. The splat frame is y-down; yaw
-# and horizontal offsets were fitted photometrically (projecting the splat points through
-# the calibrated cameras from /data/store/opencv_calibrated and matching the cap.npz
-# photos), cross-checked against the camera poles located in the scan (agreement ≈ 3 cm).
-# The height pins the scan's table-top plane (y_s = 0.19) exactly to z = 0.
-# Semantics: p_world = R p_splat + t.
-SPLAT_YAW_DEG = 5.0
-SPLAT_ROBOT_BASE = (0.775, 0.19, 0.195)  # robot base point in splat coords (y = cart top)
+# Splat (lab.ply) → world alignment, solved 2026-07-01 by scripts/align_ransac.py:
+# RANSAC geometry on the ZED fused point cloud (human-verified table/robot landmarks,
+# checkpoint CP1), closed-form fused→robot solve (table rect center agrees with the
+# calibrated-camera IPM measurement to 5 cm, CP2 human-verified), photometric refine,
+# then scaled ICP splat→fused (1.1 cm RMS; scale 0.9966 — the splat is metric).
+# Semantics: p_world = scale · R(quat) · p_splat + pos.
+DEFAULT_SPLAT_POS = (-0.2237, 0.7717, 0.1711)
+DEFAULT_SPLAT_QUAT = (-0.501119, 0.487918, -0.50087, 0.509849)  # xyzw
+DEFAULT_SPLAT_SCALE = 0.9966
 
 
-def splat_world_transform(yaw_deg: float = SPLAT_YAW_DEG, base=SPLAT_ROBOT_BASE):
-    """(position, quaternion xyzw) placing lab.ply in the world (robot-base) frame."""
-    th = math.radians(yaw_deg)
-    R0 = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float64)  # y-down → z-up, z_s → +x_w
-    Rz = np.array(
-        [[math.cos(th), -math.sin(th), 0], [math.sin(th), math.cos(th), 0], [0, 0, 1]], dtype=np.float64
-    )
-    R = Rz @ R0
-    t = -R @ np.asarray(base, dtype=np.float64)
-    w = math.sqrt(1.0 + R[0, 0] + R[1, 1] + R[2, 2]) / 2.0
-    quat = ((R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w), w)
-    return tuple(float(v) for v in t), tuple(float(v) for v in quat)
-
-
-DEFAULT_SPLAT_POS, DEFAULT_SPLAT_QUAT = splat_world_transform()
+def splat_world_transform(pos=DEFAULT_SPLAT_POS, quat=DEFAULT_SPLAT_QUAT, scale=DEFAULT_SPLAT_SCALE):
+    """(4x4 world-from-splat transform incl. scale) for cropping/analysis tooling."""
+    x, y, z, w = quat
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    T = np.eye(4)
+    T[:3, :3] = scale * R
+    T[:3, 3] = pos
+    return T
 
 
 @dataclass
@@ -270,7 +272,7 @@ class LiftEnvCfg:
     splat_pos: tuple[float, float, float] | None = DEFAULT_SPLAT_POS
     splat_rot_rpy_deg: tuple[float, float, float] | None = None
     splat_quat: tuple[float, float, float, float] = DEFAULT_SPLAT_QUAT
-    splat_scale: float | None = None
+    splat_scale: float | None = DEFAULT_SPLAT_SCALE
     nyx_spp: int = 8
     nyx_light_intensity: float = 2.0  # 5.0 washed out the mesh entities vs the dim splat
 

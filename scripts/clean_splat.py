@@ -51,14 +51,8 @@ def main(c: Cfg) -> None:
     props = sum(1 for ln in header.splitlines() if ln.startswith("property "))
     data = np.frombuffer(raw[end:], dtype=np.float32).reshape(n, props)
 
-    pos, quat = splat_world_transform()
-    x, y, z, w = quat
-    R = np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-    pw = data[:, :3].astype(np.float64) @ R.T + np.asarray(pos)
+    T = splat_world_transform()
+    pw = data[:, :3].astype(np.float64) @ T[:3, :3].T + T[:3, 3]
 
     lo, hi = np.asarray(c.box_min), np.asarray(c.box_max)
     inside = np.all((pw >= lo) & (pw <= hi), axis=1)
