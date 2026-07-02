@@ -44,7 +44,124 @@ scale-up and its verification. Read this whole file before running anything.
 - **Docs**: `docs/TRAINING_HANDOFF.md` = consumer-facing (calibrated-vs-guessed
   inventory, eval caveats). Read it once.
 
-## 3. Your tasks, in order
+## 3. Repo navigation and daily operations
+
+Prefer the source over the README when in doubt; the README still describes the older
+generic grasp demo in places. The current lift-data path is:
+
+- `src/xsim/lift_task.py` -- the active xArm7 lift environment: robot config, calibrated
+  `low`/`side` cameras, guessed wrist camera, table/slab rendering, Nyx splat setup,
+  spawn/drop ranges, and camera-jitter toggles.
+- `src/xsim/scripted_lift_policy.py` -- scripted waypoint policy used for these demos.
+- `src/xsim/mcap_writer.py` -- Foxglove MCAP topic/schema writer matching the real lift
+  logs.
+- `scripts/generate_lift_dataset.py` -- main entrypoint for simulation. `generate`
+  writes MCAP; `preview` writes milestone PNGs; `video` writes an MP4 contact sheet.
+- `scripts/compare_batches.py` -- batch format gate plus label-distribution report
+  against `/data/store/mcaps/single/lift`.
+- `scripts/validate_mcap.py` -- inspect one MCAP and optionally compare its topic/schema
+  set against a reference real episode.
+- `scripts/blink_test.py` and `scripts/verify_splat_alignment.py` -- calibration and
+  alignment diagnostics. Use these before trusting visual/camera changes.
+- `scripts/align_ransac.py` and `scripts/clean_splat.py` -- only for rescan/recalibration
+  workflows.
+- `scripts/scripted_grasp_policy_room.py`, `src/xsim/grasp_env.py`, and
+  `src/xsim/scripted_grasp_policy.py` -- older/generic grasp environment, not the current
+  lift MCAP production path.
+- `outputs/` -- generated artifacts, gitignored. Do not commit MCAPs, videos, reports, or
+  large assets.
+
+Common starting point:
+
+```bash
+cd ~/repo/xarm-sim
+uv sync
+```
+
+Fast local sanity checks:
+
+```bash
+# Fast raster video, no MCAP, useful for policy/physics checks.
+uv run python scripts/generate_lift_dataset.py \
+    --mode video --backend gpu \
+    --video-path outputs/sim_preview/raster_check.mp4 --seed 0
+
+# Photoreal Nyx video, no MCAP, useful before/after a batch.
+uv run python scripts/generate_lift_dataset.py \
+    --mode video --backend gpu --env.render-backend nyx \
+    --video-path outputs/sim_preview/nyx_check.mp4 --seed 0
+
+# Milestone PNGs at reset/waypoints/settled.
+uv run python scripts/generate_lift_dataset.py \
+    --mode preview --backend gpu \
+    --preview-dir outputs/sim_preview/lift_env --seed 0
+```
+
+Small MCAP smoke test:
+
+```bash
+uv run python scripts/generate_lift_dataset.py \
+    --n-episodes 3 --backend gpu --env.render-backend nyx \
+    --out-dir outputs/sim_mcap/smoke --seed 300
+
+uv run python scripts/compare_batches.py --sim-dir outputs/sim_mcap/smoke
+uv run python scripts/validate_mcap.py \
+    outputs/sim_mcap/smoke/episode_000000.mcap \
+    --reference /data/store/mcaps/single/lift/2026-05-25_1457_episode_000002.mcap
+```
+
+Diagnostic commands:
+
+```bash
+# Robot/camera calibration blink checks against cap.npz.
+uv run python scripts/blink_test.py --mode cap --configs 0 5 10
+
+# Wrist sanity panels against a real May episode.
+uv run python scripts/blink_test.py --mode wrist
+
+# Splat-room alignment panels: real | sim | blend plus an oblique overview.
+uv run python scripts/verify_splat_alignment.py --tag check
+```
+
+Simulation and toggle notes:
+
+- `--mode generate|preview|video`: `generate` writes one `episode_*.mcap` per rollout and
+  `manifest.json`; `preview` writes PNGs; `video` writes an MP4 contact sheet. Preview
+  and video do not write MCAP.
+- `--backend gpu|cpu`: Genesis backend. Use `gpu` on mayo/RTX for normal work.
+- `--env.render-backend raster|nyx`: `raster` is fast and has no photoreal splat room;
+  `nyx` is the production photoreal path and reads the splat. Deliverable MCAPs should
+  use `nyx` unless grifflee explicitly asks for a raster-only physics pilot.
+- `--env.nyx-spp N`: Nyx samples per pixel. Default is 8; increasing it costs time.
+- `--env.splat-uri PATH`: defaults to `assets/lab_clean.ply` if present, else
+  `/data/store/lab.ply`. Do not swap splats for production without rerunning alignment
+  checks.
+- `--env.splat-pos`, `--env.splat-quat`, `--env.splat-rot-rpy-deg`, `--env.splat-scale`:
+  experiment-only alignment overrides. Do not bake changes without the RANSAC/human
+  checkpoint workflow in section 1.
+- `--env.rectangle-x LO HI` / `--env.rectangle-y LO HI`: cube spawn rectangle. Any
+  widening needs a raster pilot, a Nyx pilot, `compare_batches.py`, and grifflee's read.
+- `--env.drop-zone X Y Z`: final delivery target; changing this changes label dynamics.
+- `--steps-per-segment`, `--hold-steps`, `--grasp-tcp-offset`: policy/tempo/contact
+  controls. These affect the real-vs-sim distribution report.
+- `--save-failures`: keeps failed MCAP rollouts instead of deleting them. Use only for
+  debugging; production batches should be success-gated.
+- `--env.cam-jitter-deg`, `--env.cam-jitter-cm`, `--env.wrist-jitter-deg`,
+  `--env.wrist-jitter-cm`: per-episode camera jitter, recorded in `manifest.json`.
+  Defaults are 0. Do not use for the verified baseline unless requested.
+- `--env.table-transparent`: hides the visual table slab but keeps table collision.
+  Debugging only.
+- `--env.table-mode plane`: the CLI exposes it, but section 1 prohibits it for this
+  pipeline. Keep the default `slab`.
+- `--env.show-viewer`: opens the Genesis viewer and requires a GUI-capable session.
+- `--env.res WIDTH HEIGHT`, `--env.physics-dt`, `--env.record-every`: low-level capture
+  shape/rate knobs. The baseline is 640x480, 1/120 s physics, `record_every=4` -> 30 Hz.
+
+Tyro maps dataclass fields to CLI flags with hyphens and nested dataclasses with dots,
+for example `LiftEnvCfg.render_backend` becomes `--env.render-backend` and
+`cam_jitter_cm` becomes `--env.cam-jitter-cm`.
+
+## 4. Your tasks, in order
 
 ### Task A — Scale-up batch
 
@@ -102,7 +219,7 @@ is" (shared location `/data/store/mcaps/sim/lift` pending mhyatt's confirmation)
 Commit any code changes with clear messages on `synthetic-lift-mcap` and push to origin
 (grifflee's fork). Do not commit `outputs/` (gitignored) or the `.ply` assets.
 
-## 4. Tool map
+## 5. Tool map
 
 | Tool | Purpose |
 | --- | --- |
@@ -114,7 +231,7 @@ Commit any code changes with clear messages on `synthetic-lift-mcap` and push to
 | `scripts/clean_splat.py` | regenerate `assets/lab_clean.ply` (crop baked robot/table, cull floaters, flatten SH) |
 | `scripts/validate_mcap.py` | single-file MCAP inspector/differ |
 
-## 5. Environment gotchas (will bite you otherwise)
+## 6. Environment gotchas (will bite you otherwise)
 
 - Renders only refresh on `scene.step()` — `set_qpos` + render without stepping shows
   stale frames. (See `pose_robot` in blink_test.py for the correct pattern.)
