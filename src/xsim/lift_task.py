@@ -304,8 +304,12 @@ class BaseDecorCfg:
     """
 
     enabled: bool = True
-    # flat metal rectangle under the base, top flush with the robot-base origin (z=0)
-    plate_size_xy: tuple[float, float] = (0.18, 0.26)
+    # flat metal rectangle under the base, top flush with the robot-base origin (z=0),
+    # centered on the base (grifflee): along x (away from the table edge) it is only as
+    # long as the base's outer ring (~13 cm); along y (toward the cameras/wall) it
+    # sticks out ~1 inch past the ring on each side, just enough for the blue clamps.
+    plate_size_xy: tuple[float, float] = (0.13, 0.18)
+    plate_center_xy: tuple[float, float] = (0.0, 0.0)
     plate_color: tuple[float, float, float] = (0.55, 0.55, 0.58)
 
 
@@ -412,7 +416,7 @@ class LiftBlockEnv:
             self.scene.add_entity(
                 gs.morphs.Box(
                     size=(*d.plate_size_xy, plate_h),
-                    pos=(0.0, 0.0, t.top_z + plate_h / 2.0),
+                    pos=(*d.plate_center_xy, t.top_z + plate_h / 2.0),
                     fixed=True,
                     visualization=True,
                     collision=False,

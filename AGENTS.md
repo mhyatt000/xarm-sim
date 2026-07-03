@@ -28,10 +28,15 @@ Two changes on top of the v3 protocol, from grifflee's remaining-adjustments lis
   `arm_qpos_offset` argument for this.
 
 - **Base decor (visual-only)**: `BaseDecorCfg` adds the flat light-metal mounting plate
-  under the base (18 x 26 cm rectangle, top flush with the base origin, filling the
-  1 cm table-top gap; grifflee still needs to confirm the footprint —
-  `outputs/sim_preview/base_plate_compare.png` has the real/sim/blend zoom).
+  under the base: 13 x 18 cm rectangle centered on the base origin, top flush with it,
+  filling the 1 cm table-top gap. Per grifflee: along x it is only as long as the
+  base's outer ring; along y it sticks out ~1 inch past the ring on each side for the
+  blue clamps. APPROVED by grifflee against the cap photos
+  (`outputs/sim_preview/base_plate_compare_v6.png`, blink_test blend).
   `collision=False`; no rng draws added, so seed streams are unchanged.
+  IMPORTANT: May-episode frames CANNOT be used to check the low/side cameras — those
+  Logitechs were moved and recalibrated after May (only the wrist mount is unchanged).
+  Use the cap.npz photos / blink_test for any real-vs-sim comparison.
   TRAP, do not repeat: an earlier revision modeled a red "E-stop" next to the base.
   That red blob in the real frames was the CUBE sitting near the plate — there is no
   E-stop on the table. grifflee caught it.
