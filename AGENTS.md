@@ -11,6 +11,28 @@ Commit `660d33b` introduced grifflee's new protocol; this follow-up made the val
 and timing fixes and ran the gates through a 10-episode Nyx pilot. Do not start batch_v3
 until grifflee reviews the checkpoint artifacts below.
 
+### 2026-07-02 late: table corrected + per-episode start-joint jitter (v4)
+
+Two changes on top of the v3 protocol, from grifflee's remaining-adjustments list:
+
+- **Table geometry corrected to his measurements**: the robot base sits on a 1 cm
+  mounting plate, so `TableCfg.top_z = -0.01` (was 0.0), and the slab footprint is the
+  real 3 ft x 2 ft top: `size_xy = (0.9144, 0.6096)` (was the IPM-estimated 0.93 x 0.62).
+  Cube spawn/rest heights and all policy z-waypoints derive from `top_z`, so they
+  follow automatically.
+- **Random-ish start joints**: `LiftEnvCfg.arm_start_jitter_deg = 3.0` (new field; 0
+  disables). Each arm joint gets a uniform +-3 deg offset from the IK-solved home at
+  reset, drawn AFTER the cube/camera/drop draws so those streams stay per-seed stable.
+  The scripted policy already reads the live TCP at reset, so trajectories adapt. TCP
+  start spread is ~1-3 cm. `Manipulator.reset` in `grasp_env.py` gained an
+  `arm_qpos_offset` argument for this.
+
+Verified: 3-episode raster smoke (`outputs/sim_mcap/raster_v4_jitter_smoke_7300`,
+seed 7300): 3/3 success, `compare_batches.py` FORMAT PASS, `validate_mcap.py` PASS,
+first-frame joint_states show distinct jittered starts, cube rest z = top_z + half cube.
+A fresh 10-episode Nyx pilot for grifflee's visual checkpoint is the next gate before
+any batch; the older `nyx_pilot_v3_sides_8100` artifacts predate these changes.
+
 Current protocol: above cube (high, straight-down, side-grasp yaw chosen as the nearest
 90-degree-equivalent cube-face alignment) -> vertical plunge -> close -> weld cube to
 `link_tcp` -> fast lift -> transport to sampled drop target (x~U[0.30,0.40], y=0) ->

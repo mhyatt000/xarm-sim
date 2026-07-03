@@ -281,11 +281,14 @@ def splat_world_transform(pos=DEFAULT_SPLAT_POS, quat=DEFAULT_SPLAT_QUAT, scale=
 
 @dataclass
 class TableCfg:
-    top_z: float = 0.0                                  # table-top height (robot base sits here)
-    # real cart footprint, measured by inverse-perspective-mapping the calibrated
-    # cap.npz photos onto the z=0 plane (robot base at one end of the table)
+    # the robot base sits on a 1 cm mounting plate, so the table top is 1 cm below the
+    # robot-base origin (grifflee, 2026-07-02)
+    top_z: float = -0.01
+    # center measured by inverse-perspective-mapping the calibrated cap.npz photos onto
+    # the table plane (robot base at one end of the table); size is the real cart's
+    # 3 ft x 2 ft top (grifflee) — the IPM estimate read (0.93, 0.62)
     center_xy: tuple[float, float] = (0.375, 0.01)
-    size_xy: tuple[float, float] = (0.93, 0.62)
+    size_xy: tuple[float, float] = (0.9144, 0.6096)
     color: tuple[float, float, float] = (0.13, 0.14, 0.17)  # dark slate like the real cart
 
 
@@ -301,6 +304,10 @@ class LiftEnvCfg:
     # The release happens at the transport height (no lowering); the cube free-falls.
     drop_x_range: tuple[float, float] = (0.30, 0.40)
     drop_y: float = 0.0
+    # per-episode start-pose jitter: each arm joint gets a uniform ±deg offset from the
+    # fixed IK-solved home before the episode starts (the policy reads the actual TCP at
+    # reset, so the trajectory adapts). 0 = every episode starts from the identical pose.
+    arm_start_jitter_deg: float = 3.0
     table: TableCfg = field(default_factory=TableCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     table_transparent: bool = False        # hide the visual table slab while keeping table collision
@@ -478,7 +485,6 @@ class LiftBlockEnv:
     # -- lifecycle --
     def reset(self, seed: int | None = None) -> None:
         rng = np.random.default_rng(seed)
-        self.robot.reset(envs_idx=None, skip_forward=True)
         x = float(rng.uniform(*self.cfg.rectangle_x))
         y = float(rng.uniform(*self.cfg.rectangle_y))
         z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
@@ -486,12 +492,19 @@ class LiftBlockEnv:
         pos = torch.tensor([[x, y, z]], device=self.device, dtype=gs.tc_float)
         quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]], device=self.device, dtype=gs.tc_float)
         self.cube.set_pos(pos, skip_forward=True)
-        self.cube.set_quat(quat, skip_forward=False)
+        self.cube.set_quat(quat, skip_forward=True)
         self._cube_yaw = yaw
         self.grasp_release()  # clear any weld left from a previous episode
-        # draw order matters for seed reproducibility: cube first, then cameras, then drop
+        # draw order matters for seed reproducibility: cube first, then cameras, then
+        # drop, then start joints (new draws go last so earlier streams stay stable)
         self._randomize_cameras(rng)
         self.current_drop_xy = (float(rng.uniform(*self.cfg.drop_x_range)), self.cfg.drop_y)
+        arm_offset = None
+        if self.cfg.arm_start_jitter_deg > 0.0:
+            arm_offset = rng.uniform(-1.0, 1.0, 7) * math.radians(self.cfg.arm_start_jitter_deg)
+        # skip_forward=False: this is the episode's one FK pass, so the wrist-cam sync
+        # below sees the jittered pose
+        self.robot.reset(envs_idx=None, skip_forward=False, arm_qpos_offset=arm_offset)
         self._sync_attached_cams()
 
     # -- grasp weld: while gripped, the cube must not be able to slip (grifflee) --
