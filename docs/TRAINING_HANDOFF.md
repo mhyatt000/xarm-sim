@@ -10,15 +10,16 @@ Intended consumer: crossformer (`mhyatt000/crossformer`; its loader derives
 | Batch | Path | Notes |
 | --- | --- | --- |
 | pilot_v2 | `outputs/sim_mcap/pilot_v2/` | 10 episodes, style-matched policy |
-| full batch | `outputs/sim_mcap/batch_v1/` | generated after CP-B sign-off |
+| current generation root | `/data/store/griffen_sim_mcaps/` | large-disk destination for new sim MCAP batches |
+| full batch | `outputs/sim_mcap/batch_v1/` | historical local batch, generated after CP-B sign-off |
 
 Every batch directory contains a `manifest.json` (git SHA, full config, splat md5,
 per-episode seeds and stats) — any episode can be regenerated bit-for-bit.
 
-Proposed shared location (pending mhyatt's OK):
+Current large-disk generation root:
 
 ```bash
-mkdir -p /data/store/mcaps/sim/lift && cp outputs/sim_mcap/batch_v1/*.mcap /data/store/mcaps/sim/lift/
+/data/store/griffen_sim_mcaps/<name>/
 ```
 
 ## What is calibrated vs what is guessed
@@ -62,9 +63,9 @@ mkdir -p /data/store/mcaps/sim/lift && cp outputs/sim_mcap/batch_v1/*.mcap /data
 ```bash
 # N episodes, photoreal, style-matched (slab table is the default; do not use table-mode plane)
 uv run python scripts/generate_lift_dataset.py --n-episodes N \
-    --env.render-backend nyx --out-dir outputs/sim_mcap/<name> --seed <fresh>
+    --env.render-backend nyx --out-dir /data/store/griffen_sim_mcaps/<name> --seed <fresh>
 # verify any batch:
-uv run python scripts/compare_batches.py --sim-dir outputs/sim_mcap/<name>
+uv run python scripts/compare_batches.py --sim-dir /data/store/griffen_sim_mcaps/<name>
 # re-check camera/scene accuracy after any recalibration or rescan:
 uv run python scripts/blink_test.py            # then re-solve with align_ransac.py if needed
 ```

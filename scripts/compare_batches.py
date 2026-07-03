@@ -173,9 +173,10 @@ def main(cfg: Cfg) -> None:
         ax.hist(sim_j[:, j], bins=40, range=rng_, density=True, histtype="stepfilled",
                 color=C_SIM, alpha=0.30, edgecolor=C_SIM, linewidth=1.2)
         ax.set_title(JOINT_NAMES[j], fontsize=9, color=INK)
-        ax.set_yticks([])
+        ax.set_xlabel("joint position (rad)")
+        ax.set_ylabel("probability density (1/rad)")
     ax = fig.add_subplot(gs[1, 3]); ax.axis("off")
-    ax.text(0.05, 0.75, "joint position densities (rad)", fontsize=10, color=INK, weight="bold")
+    ax.text(0.05, 0.75, "joint position probability densities (x: rad, y: 1/rad)", fontsize=10, color=INK, weight="bold")
     ax.text(0.05, 0.55, "real (sampled episodes)", fontsize=10, color=C_REAL, weight="bold")
     ax.text(0.05, 0.40, "sim (this batch)", fontsize=10, color=C_SIM, weight="bold")
     ax.text(0.05, 0.12, "sim inside the real support =\nplausible label coverage", fontsize=8.5, color=MUTED)
@@ -184,14 +185,14 @@ def main(cfg: Cfg) -> None:
     band(ax, [e["tcp_z"] for e in real], C_REAL, "real")
     band(ax, [e["tcp_z"] for e in sim], C_SIM, "sim")
     ax.set_title("TCP height over normalized episode time", fontsize=10, color=INK)
-    ax.set_xlabel("episode progress"); ax.set_ylabel("z (m)")
+    ax.set_xlabel("normalized episode progress (unitless, 0-1)"); ax.set_ylabel("TCP z height (m)")
     ax.legend(frameon=False, loc="upper right")
 
     ax = fig.add_subplot(gs[2, 2:4])
     band(ax, [e["grip"] for e in real], C_REAL, "real")
     band(ax, [e["grip"] for e in sim], C_SIM, "sim")
     ax.set_title("gripper norm (1 = open) over normalized episode time", fontsize=10, color=INK)
-    ax.set_xlabel("episode progress"); ax.set_ylabel("norm")
+    ax.set_xlabel("normalized episode progress (unitless, 0-1)"); ax.set_ylabel("gripper opening norm (unitless)")
     ax.legend(frameon=False, loc="lower left")
 
     fig.suptitle(f"sim batch '{cfg.sim_dir.name}' ({len(sim)} eps) vs real lift sample ({len(real)} of 409 eps) — "
@@ -199,6 +200,29 @@ def main(cfg: Cfg) -> None:
     out = cfg.out_dir / f"report_{cfg.sim_dir.name}.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")
     print(f"\nreport -> {out}")
+
+    fig2 = plt.figure(figsize=(13, 7.8))
+    gs2 = fig2.add_gridspec(2, 4, hspace=0.42, wspace=0.28)
+    for j in range(7):
+        ax = fig2.add_subplot(gs2[j // 4, j % 4])
+        band(ax, [e["joints"][:, j] for e in real], C_REAL, "real")
+        band(ax, [e["joints"][:, j] for e in sim], C_SIM, "sim")
+        ax.set_title(f"{JOINT_NAMES[j]} position over normalized episode time", fontsize=9, color=INK)
+        ax.set_xlabel("normalized episode progress (unitless, 0-1)")
+        ax.set_ylabel("joint position (rad)")
+        if j == 0:
+            ax.legend(frameon=False, loc="best")
+    ax = fig2.add_subplot(gs2[1, 3]); ax.axis("off")
+    ax.text(0.05, 0.75, "joint trajectories", fontsize=10, color=INK, weight="bold")
+    ax.text(0.05, 0.55, "solid line = median episode", fontsize=9, color=MUTED)
+    ax.text(0.05, 0.40, "shaded band = 10-90 pct", fontsize=9, color=MUTED)
+    ax.text(0.05, 0.22, "x-axis is normalized episode progress (unitless, 0-1),\nso different-duration demos align\nfrom start (0) to end (1).", fontsize=8.5, color=MUTED)
+    fig2.suptitle(f"joint trajectories for sim batch {cfg.sim_dir.name} vs real lift sample",
+                  fontsize=11, color=INK, y=0.995)
+    joint_out = cfg.out_dir / f"report_{cfg.sim_dir.name}_joint_time.png"
+    fig2.savefig(joint_out, dpi=130, bbox_inches="tight")
+    print(f"joint-time report -> {joint_out}")
+
     if problems:
         raise SystemExit(1)
 

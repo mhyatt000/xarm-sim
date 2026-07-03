@@ -25,6 +25,7 @@ import torch
 import tyro
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SIM_MCAP_ROOT = Path("/data/store/griffen_sim_mcaps")
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import genesis as gs  # noqa: E402
@@ -37,7 +38,7 @@ from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
 @dataclass
 class Config:
     mode: Literal["generate", "preview", "video"] = "generate"
-    out_dir: Path = PROJECT_ROOT / "outputs" / "sim_mcap" / "lift"
+    out_dir: Path = SIM_MCAP_ROOT / "lift"
     preview_dir: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_env"
     video_path: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_task_current.mp4"
     video_fps: float = 30.0

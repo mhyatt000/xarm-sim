@@ -224,11 +224,11 @@ Small MCAP smoke test:
 ```bash
 uv run python scripts/generate_lift_dataset.py \
     --n-episodes 3 --backend gpu --env.render-backend nyx \
-    --out-dir outputs/sim_mcap/smoke --seed 300
+    --out-dir /data/store/griffen_sim_mcaps/smoke --seed 300
 
-uv run python scripts/compare_batches.py --sim-dir outputs/sim_mcap/smoke
+uv run python scripts/compare_batches.py --sim-dir /data/store/griffen_sim_mcaps/smoke
 uv run python scripts/validate_mcap.py \
-    outputs/sim_mcap/smoke/episode_000000.mcap \
+    /data/store/griffen_sim_mcaps/smoke/episode_000000.mcap \
     --reference /data/store/mcaps/single/lift/2026-05-25_1457_episode_000002.mcap
 ```
 
@@ -295,7 +295,7 @@ the RTX 5090; run in background / overnight):
 cd ~/repo/xarm-sim
 uv run python scripts/generate_lift_dataset.py \
     --n-episodes N --env.render-backend nyx \
-    --out-dir outputs/sim_mcap/batch_v1 --seed 1000
+    --out-dir /data/store/griffen_sim_mcaps/<name> --seed 1000
 ```
 
 - Seed 1000 avoids overlap with pilot seeds (100–109, 200–209). Any fresh range works;
@@ -303,12 +303,12 @@ uv run python scripts/generate_lift_dataset.py \
 - Success-gated: failed grasps are dropped automatically. Expect ≥ 90% kept (pilots ran
   10/10). If the success rate drops noticeably below that, STOP and investigate before
   burning GPU time — nothing about a bigger batch should change the physics.
-- Episodes are ~100 MB each; check disk headroom for N > 200.
+- Episodes are ~100 MB each. Generate under /data/store/griffen_sim_mcaps so the small root disk is not the limiter.
 
 ### Task B — Verify the batch
 
 ```bash
-uv run python scripts/compare_batches.py --sim-dir outputs/sim_mcap/batch_v1
+uv run python scripts/compare_batches.py --sim-dir /data/store/griffen_sim_mcaps/<name>
 ```
 
 Pass criteria:
@@ -316,7 +316,7 @@ Pass criteria:
   `CameraCalibration` topics plus `/tf` are present; core frame counts 115–240;
   exits non-zero on failure — treat any failure as a hard stop).
 - rate ≈ 30.00 Hz, durations spread roughly 5–7 s for the new protocol.
-- In `outputs/batch_report/report_batch_v1.png`: sim TCP/gripper median inside the real
+- In `outputs/batch_report/report_<name>.png`: sim TCP/gripper median inside the real
   band (like report_pilot_v2); joint histograms overlapping the real support.
 - Also eyeball ~3 episodes visually: `--mode video` on the generator config renders an
   mp4 contact sheet without writing MCAP. Confirm the cube reads RED (not salmon — the

@@ -70,7 +70,7 @@ def _nearest_side_grasp_quat(cube_yaw: float, reference_quat) -> tuple[float, fl
 
 class ScriptedLiftPolicy:
     def __init__(self, env, steps_per_segment: int = 40, grasp_tcp_offset: float = 0.018,
-                 approach_height: float = 0.12, lift_height: float = 0.09,
+                 approach_height: float = 0.06, lift_height: float = 0.09,
                  segment_weights: tuple[float, ...] = SEGMENT_WEIGHTS):
         self.env = env
         self.steps_per_segment = steps_per_segment
@@ -93,16 +93,11 @@ class ScriptedLiftPolicy:
         drop_x, drop_y = env.current_drop_xy
         top_z = env.cfg.table.top_z
 
-        # Align the fingers with cube faces, but choose the 90-degree-equivalent side
-        # grasp closest to the current wrist orientation. This avoids unnecessary quarter
-        # turns while still closing on side faces instead of cube edges.
-        grasp_quat = torch.as_tensor(
-            _nearest_side_grasp_quat(float(env.cube_yaw()), home_quat),
-            device=device,
-            dtype=ee.dtype,
-        )
-        if torch.dot(home_quat, grasp_quat) < 0:  # avoid lerping across the antipode
-            grasp_quat = -grasp_quat
+        # Match the real demonstration posture family: keep the reset wrist
+        # orientation instead of forcing a strict top-down/yaw-aligned grasp.
+        # The cube is welded after close, so exact face-yaw alignment is less
+        # important than keeping joint labels on the real IK branch.
+        grasp_quat = home_quat
 
         def pose(xyz, quat):
             return torch.cat([torch.as_tensor(xyz, device=device, dtype=ee.dtype), quat]).reshape(1, 7)
