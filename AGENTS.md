@@ -27,6 +27,19 @@ Two changes on top of the v3 protocol, from grifflee's remaining-adjustments lis
   start spread is ~1-3 cm. `Manipulator.reset` in `grasp_env.py` gained an
   `arm_qpos_offset` argument for this.
 
+- **Base decor (visual-only)**: `BaseDecorCfg` adds the dark square mounting plate under
+  the base (fills the table-top..base-origin 1 cm gap) and the red E-stop beside it
+  (box + button cylinder at world (0.12, 0.11), position projected from its median
+  pixel location in the real side camera across two May episodes). Both are
+  `collision=False`; no rng draws added, so seed streams are unchanged. The E-stop is
+  deliberately much darker than `BLOCK_COLOR` so it never reads as a second cube.
+  NEGATIVE RESULT, do not retry: restoring the base area from the raw splat
+  (keep-region in clean_splat.py) looks like smoke/smudges — ~80% of the scanned
+  gaussians around the base have opacity <0.4 (dark reflective table = mush), and even
+  opaque-only looks like dirt. Panels: `outputs/sim_preview/base_fill_compare.png`.
+  Decor smoke: `raster_v4_decor_smoke_7400` 3/3, both gates PASS. Checkpoint panel:
+  `outputs/sim_preview/base_decor_compare.png`.
+
 Verified: 3-episode raster smoke (`outputs/sim_mcap/raster_v4_jitter_smoke_7300`,
 seed 7300): 3/3 success, `compare_batches.py` FORMAT PASS, `validate_mcap.py` PASS,
 first-frame joint_states show distinct jittered starts, cube rest z = top_z + half cube.
