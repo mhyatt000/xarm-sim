@@ -294,28 +294,19 @@ class TableCfg:
 
 @dataclass
 class BaseDecorCfg:
-    """Visual-only stand-ins for the static hardware around the robot base.
+    """Visual-only stand-in for the robot's mounting plate.
 
-    The real base area (mounting plate, E-stop) scans as translucent mush in the splat,
-    so model it with simple geometry like the cart slab. Nothing here collides.
+    The real base sits on a flat light-metal rectangle (the plate is why the table top
+    is 1 cm below the base origin). The scanned splat renders that area as translucent
+    mush, so model it with simple geometry like the cart slab. Nothing here collides.
+    NOTE: an earlier revision also modeled an "E-stop" next to the base — that red blob
+    in the real frames was the cube itself sitting near the plate. Do not re-add it.
     """
 
     enabled: bool = True
-    # dark square mounting plate: fills the 1 cm gap between the table top and the
-    # robot-base origin (the plate is why the table sits at z = -0.01)
-    plate_size_xy: float = 0.25
-    plate_color: tuple[float, float, float] = (0.05, 0.05, 0.06)
-    # red E-stop beside the base. Position from projecting its median pixel location in
-    # the real side camera (23 detections over two May episodes, spread +-3 px vertical)
-    # onto the table plane. Deliberately much darker than BLOCK_COLOR and topped with a
-    # button cylinder so the policy never sees a second cube-like distractor: the real
-    # E-stop reads dark red (median R ~55/255) in the training frames.
-    estop_center_xy: tuple[float, float] = (0.12, 0.11)
-    estop_size: tuple[float, float, float] = (0.06, 0.06, 0.045)
-    estop_color: tuple[float, float, float] = (0.14, 0.02, 0.02)
-    estop_button_radius: float = 0.02
-    estop_button_height: float = 0.018
-    estop_button_color: tuple[float, float, float] = (0.30, 0.03, 0.03)
+    # flat metal rectangle under the base, top flush with the robot-base origin (z=0)
+    plate_size_xy: tuple[float, float] = (0.18, 0.26)
+    plate_color: tuple[float, float, float] = (0.55, 0.55, 0.58)
 
 
 @dataclass
@@ -420,34 +411,13 @@ class LiftBlockEnv:
             plate_h = max(-t.top_z, 0.004)  # plate top flush with the robot-base origin
             self.scene.add_entity(
                 gs.morphs.Box(
-                    size=(d.plate_size_xy, d.plate_size_xy, plate_h),
+                    size=(*d.plate_size_xy, plate_h),
                     pos=(0.0, 0.0, t.top_z + plate_h / 2.0),
                     fixed=True,
                     visualization=True,
                     collision=False,
                 ),
-                surface=gs.surfaces.Plastic(color=d.plate_color, roughness=0.6),
-            )
-            self.scene.add_entity(
-                gs.morphs.Box(
-                    size=d.estop_size,
-                    pos=(*d.estop_center_xy, t.top_z + d.estop_size[2] / 2.0),
-                    fixed=True,
-                    visualization=True,
-                    collision=False,
-                ),
-                surface=gs.surfaces.Plastic(color=d.estop_color, roughness=0.7),
-            )
-            self.scene.add_entity(
-                gs.morphs.Cylinder(
-                    radius=d.estop_button_radius,
-                    height=d.estop_button_height,
-                    pos=(*d.estop_center_xy, t.top_z + d.estop_size[2] + d.estop_button_height / 2.0),
-                    fixed=True,
-                    visualization=True,
-                    collision=False,
-                ),
-                surface=gs.surfaces.Plastic(color=d.estop_button_color, roughness=0.5),
+                surface=gs.surfaces.Plastic(color=d.plate_color, roughness=0.35),
             )
 
         # robot (base at world origin, on the table top)

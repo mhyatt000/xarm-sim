@@ -27,18 +27,19 @@ Two changes on top of the v3 protocol, from grifflee's remaining-adjustments lis
   start spread is ~1-3 cm. `Manipulator.reset` in `grasp_env.py` gained an
   `arm_qpos_offset` argument for this.
 
-- **Base decor (visual-only)**: `BaseDecorCfg` adds the dark square mounting plate under
-  the base (fills the table-top..base-origin 1 cm gap) and the red E-stop beside it
-  (box + button cylinder at world (0.12, 0.11), position projected from its median
-  pixel location in the real side camera across two May episodes). Both are
-  `collision=False`; no rng draws added, so seed streams are unchanged. The E-stop is
-  deliberately much darker than `BLOCK_COLOR` so it never reads as a second cube.
+- **Base decor (visual-only)**: `BaseDecorCfg` adds the flat light-metal mounting plate
+  under the base (18 x 26 cm rectangle, top flush with the base origin, filling the
+  1 cm table-top gap; grifflee still needs to confirm the footprint —
+  `outputs/sim_preview/base_plate_compare.png` has the real/sim/blend zoom).
+  `collision=False`; no rng draws added, so seed streams are unchanged.
+  TRAP, do not repeat: an earlier revision modeled a red "E-stop" next to the base.
+  That red blob in the real frames was the CUBE sitting near the plate — there is no
+  E-stop on the table. grifflee caught it.
   NEGATIVE RESULT, do not retry: restoring the base area from the raw splat
   (keep-region in clean_splat.py) looks like smoke/smudges — ~80% of the scanned
   gaussians around the base have opacity <0.4 (dark reflective table = mush), and even
   opaque-only looks like dirt. Panels: `outputs/sim_preview/base_fill_compare.png`.
-  Decor smoke: `raster_v4_decor_smoke_7400` 3/3, both gates PASS. Checkpoint panel:
-  `outputs/sim_preview/base_decor_compare.png`.
+  Decor smoke: `raster_v4_decor_smoke_7400` 3/3, both gates PASS.
 
 Verified: 3-episode raster smoke (`outputs/sim_mcap/raster_v4_jitter_smoke_7300`,
 seed 7300): 3/3 success, `compare_batches.py` FORMAT PASS, `validate_mcap.py` PASS,
