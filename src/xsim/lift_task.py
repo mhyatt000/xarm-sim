@@ -140,10 +140,10 @@ XARM7_ROBOT_CFG: dict = {
     "gripper_link_names": ["left_finger", "right_finger"],
     "arm_dof_dim": 7,
     "gripper_dof_dim": 6,
-    # low ready pose matching the real demos' first-frame median joint posture —
+    # low ready pose matching the real demos' start (TCP ≈ (0.34, 0, 0.10), top-down) —
     # IK-solved; the old high home (TCP z=0.29) gave episodes a different opening style
     # than the real recordings (see compare_batches report)
-    "default_arm_dof": [math.radians(v) for v in [15.3, -17.1, -19.8, 29.0, -6.1, 48.9, 91.8]],
+    "default_arm_dof": [math.radians(v) for v in [0.0, -26.2, 0.0, 13.5, 0.0, 25.0, 90.0]],
     # xArm gripper joint convention (verified by finger separation): 0.0 = open (fingers
     # apart), 0.85 = hard fully closed. For a 31.75 mm cube, command a tighter
     # task grasp target instead of the hard stop; this holds the block without
@@ -319,11 +319,11 @@ class LiftEnvCfg:
     fov_deg: float = 42.0                 # fallback vertical FOV → intrinsics
     physics_dt: float = 1.0 / 120.0       # stable sim step; ×record_every → 30 Hz like real
     record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
-    rectangle_x: tuple[float, float] = (0.27, 0.38)   # cube spawn range (m)
-    rectangle_y: tuple[float, float] = (-0.05, 0.04)
+    rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
+    rectangle_y: tuple[float, float] = (-0.15, 0.15)
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
     # The release happens at the transport height (no lowering); the cube free-falls.
-    drop_x_range: tuple[float, float] = (0.28, 0.34)
+    drop_x_range: tuple[float, float] = (0.30, 0.40)
     drop_y: float = 0.0
     # per-episode start-pose jitter: each arm joint gets a uniform ±deg offset from the
     # fixed IK-solved home before the episode starts (the policy reads the actual TCP at
