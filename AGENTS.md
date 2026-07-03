@@ -11,6 +11,19 @@ Commit `660d33b` introduced grifflee's new protocol; this follow-up made the val
 and timing fixes and ran the gates through a 10-episode Nyx pilot. Do not start batch_v3
 until grifflee reviews the checkpoint artifacts below.
 
+### 2026-07-03: batch_v3 GENERATED and gated (100 episodes)
+
+grifflee approved the v5 pilot checkpoint; `outputs/sim_mcap/batch_v3` is the
+current training batch. 4 shards x 25 episodes (seeds 9000-9099, per-episode
+seed = shard seed + idx), merged flat with `scripts/merge_shards.py`
+(hard links; shard dirs kept). Recipe = batch_v2 camera jitter
+(`--env.cam-jitter-deg 15 --env.cam-jitter-cm 5`) + all v4/v5 changes
+(table z=-0.01 3x2 ft, arm start jitter 3 deg, mounting plate).
+Gates vs the REAL robot mcaps: `compare_batches.py` FORMAT PASS
+(report_batch_v3.png), `validate_mcap.py` layout PASS on episodes 0/42/99
+vs the May reference. 100/100 success, frames 154-227, 30.00 Hz,
+100 unique per-episode camera extrinsics recorded in the manifest.
+
 ### 2026-07-02 late: table corrected + per-episode start-joint jitter (v4)
 
 Two changes on top of the v3 protocol, from grifflee's remaining-adjustments list:
