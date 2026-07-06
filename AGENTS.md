@@ -280,6 +280,14 @@ Simulation and toggle notes:
   mount offset. NOT part of the production recipe — every approved batch keeps
   these at 0 (the wrist mount is a verified guess; jittering it has never been
   reviewed).
+- Stack appearance randomization: use the dim ceiling-panel recipe that grifflee reviewed,
+  not the earlier over-bright smoke. Pass `--env.nyx-light-type ceiling_panel`,
+  `--env.nyx-light-intensity 6`, and `--env.nyx-light-intensity-jitter 0.25`; the
+  ceiling light samples x/y on the overhead panel plane and aims down at the table. Pair
+  it with `--env.robot-roughness-jitter 0.35`, `--env.cube-hue-jitter-deg 8`,
+  `--env.cube-value-jitter 0.2`, and `--env.stack.free-placement` for the first stack
+  appearance batch. Do not use intensity 120; that Nyx spot-light scale washed out the
+  scene.
 - `--env.table-transparent`: hides the visual table slab but keeps table collision.
   Debugging only.
 - `--env.table-mode plane`: the CLI exposes it, but section 1 prohibits it for this
