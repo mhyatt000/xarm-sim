@@ -269,9 +269,17 @@ Simulation and toggle notes:
   controls. These affect the real-vs-sim distribution report.
 - `--save-failures`: keeps failed MCAP rollouts instead of deleting them. Use only for
   debugging; production batches should be success-gated.
-- `--env.cam-jitter-deg`, `--env.cam-jitter-cm`, `--env.wrist-jitter-deg`,
-  `--env.wrist-jitter-cm`: per-episode camera jitter, recorded in `manifest.json`.
-  Defaults are 0. Do not use for the verified baseline unless requested.
+- `--env.cam-jitter-deg`, `--env.cam-jitter-cm`: per-episode jitter of the two
+  STATIC cams (low/side) around their calibrated nominals, recorded in
+  `manifest.json` and the MCAP calibration topics. Config defaults are 0, but the
+  PRODUCTION RECIPE for batches is `--env.cam-jitter-deg 15 --env.cam-jitter-cm 5`
+  — used by every approved batch since batch_v2 (batch_v3, the 5k batch). Pass it
+  explicitly on generation runs; leave it off only for calibration/alignment
+  diagnostics that need the exact nominal poses (blink_test-style checks).
+- `--env.wrist-jitter-deg`, `--env.wrist-jitter-cm`: same idea for the wrist-cam
+  mount offset. NOT part of the production recipe — every approved batch keeps
+  these at 0 (the wrist mount is a verified guess; jittering it has never been
+  reviewed).
 - `--env.table-transparent`: hides the visual table slab but keeps table collision.
   Debugging only.
 - `--env.table-mode plane`: the CLI exposes it, but section 1 prohibits it for this
