@@ -14,6 +14,7 @@ Frames/axes: Genesis cameras use an OpenGL convention internally.
 
 from __future__ import annotations
 
+import colorsys
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -27,7 +28,7 @@ import gs_nyx.nyx_py_renderer as npr
 import gs_nyx.nyx_py_sdk as nps
 from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
-from xsim.grasp_env import Manipulator
+from xsim.grasp_env import Manipulator, ROBOT_VISUAL_MATERIALS, _robot_material_name, _set_vgeom_surface
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
@@ -38,6 +39,13 @@ DEFAULT_SPLAT_PATH = _CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/stor
 
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
 BLOCK_COLOR = (0.48, 0.05, 0.04)  # saturated red; brighter albedos wash to salmon under the nyx light
+DEFAULT_NYX_LIGHT_DIR = (-0.4, -0.4, -0.8)
+DEFAULT_NYX_CEILING_LIGHT_X = (0.05, 0.75)
+DEFAULT_NYX_CEILING_LIGHT_Y = (-0.30, 0.30)
+DEFAULT_NYX_CEILING_LIGHT_Z = 1.85
+DEFAULT_NYX_CEILING_TARGET_X = (0.28, 0.55)
+DEFAULT_NYX_CEILING_TARGET_Y = (-0.12, 0.12)
+ROBOT_BASE_ROUGHNESS = {"White": 0.28, "Black": 0.35, "Aluminum": 0.22}
 
 # OpenGL camera (x right, y up, -z forward) → OpenCV optical (x right, y down, +z forward).
 _T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
@@ -46,6 +54,43 @@ _T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]
 def _rot_from_rpy_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
     x, y, z, w = quat_xyzw_from_rpy_deg(roll, pitch, yaw)
     return _quat_wxyz_to_rot((w, x, y, z))
+
+
+def _unit(v) -> np.ndarray:
+    arr = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(arr)
+    return arr if n == 0.0 else arr / n
+
+
+def _jitter_direction(base, jitter_deg: float, rng: np.random.Generator | None) -> tuple[float, float, float]:
+    if jitter_deg <= 0.0 or rng is None:
+        return tuple(float(v) for v in base)
+    base = _unit(base)
+    axis = rng.normal(size=3)
+    axis = axis - float(np.dot(axis, base)) * base
+    axis = _unit(axis)
+    if np.linalg.norm(axis) == 0.0:
+        return tuple(float(v) for v in base)
+    angle = math.radians(float(rng.uniform(-jitter_deg, jitter_deg)))
+    c, s = math.cos(angle), math.sin(angle)
+    rotated = base * c + np.cross(axis, base) * s + axis * float(np.dot(axis, base)) * (1.0 - c)
+    return tuple(float(v) for v in _unit(rotated))
+
+
+def _jitter_color_hsv(
+    base: tuple[float, float, float],
+    hue_jitter_deg: float,
+    value_jitter: float,
+    rng: np.random.Generator | None,
+) -> tuple[float, float, float]:
+    if rng is None or (hue_jitter_deg <= 0.0 and value_jitter <= 0.0):
+        return tuple(float(v) for v in base)
+    h, s, v = colorsys.rgb_to_hsv(*base)
+    if hue_jitter_deg > 0.0:
+        h = (h + float(rng.uniform(-hue_jitter_deg, hue_jitter_deg)) / 360.0) % 1.0
+    if value_jitter > 0.0:
+        v *= float(rng.uniform(max(0.0, 1.0 - value_jitter), 1.0 + value_jitter))
+    return tuple(float(np.clip(c, 0.0, 1.0)) for c in colorsys.hsv_to_rgb(h, s, np.clip(v, 0.0, 1.0)))
 
 
 def _c2w_gl_from_view(pos, lookat, up) -> np.ndarray:
@@ -279,6 +324,22 @@ def splat_world_transform(pos=DEFAULT_SPLAT_POS, quat=DEFAULT_SPLAT_QUAT, scale=
     return T
 
 
+def _apply_robot_shine(robot_entity, roughness_scale: float) -> None:
+    """Rebind robot visual surfaces with scaled roughness; lower roughness = shinier."""
+    roughness_scale = float(np.clip(roughness_scale, 0.2, 3.0))
+    surfaces = {
+        name: gs.surfaces.BSDF(
+            color=ROBOT_VISUAL_MATERIALS[name][:3],
+            metallic=1.0 if name == "Aluminum" else 0.0,
+            roughness=float(np.clip(ROBOT_BASE_ROUGHNESS[name] * roughness_scale, 0.02, 0.95)),
+        )
+        for name in ROBOT_BASE_ROUGHNESS
+    }
+    for vgeom in robot_entity.vgeoms:
+        material_name = _robot_material_name(vgeom.link.name)
+        _set_vgeom_surface(vgeom, surfaces[material_name], ROBOT_VISUAL_MATERIALS[material_name])
+
+
 @dataclass
 class TableCfg:
     # the robot base sits on a 1 cm mounting plate, so the table top is 1 cm below the
@@ -327,6 +388,17 @@ class StackCfg:
     green_y: tuple[float, float] = (-0.08, 0.10)
     red_dx: tuple[float, float] = (-0.20, -0.12)   # red = green + Δ, Δx < 0 = image-right
     red_dy: tuple[float, float] = (-0.04, 0.04)
+    # Opt-in broader stack placement: red and green are sampled independently, then
+    # rejection-sampled so they are not overlapping and not so far apart that transport
+    # becomes a different task. Defaults keep the verified real-demo-like layout above.
+    free_placement: bool = False
+    free_green_x: tuple[float, float] = (0.34, 0.62)
+    free_green_y: tuple[float, float] = (-0.18, 0.18)
+    free_red_x: tuple[float, float] = (0.26, 0.62)
+    free_red_y: tuple[float, float] = (-0.18, 0.18)
+    free_min_dist: float = 0.10
+    free_max_dist: float = 0.34
+    free_max_tries: int = 100
     green_color: tuple[float, float, float] = (0.05, 0.30, 0.06)  # darkened like BLOCK_COLOR
     # clearance between the red cube's bottom and the green cube's top at release
     place_clearance: float = 0.003
@@ -362,7 +434,27 @@ class LiftEnvCfg:
     splat_quat: tuple[float, float, float, float] = DEFAULT_SPLAT_QUAT
     splat_scale: float | None = DEFAULT_SPLAT_SCALE
     nyx_spp: int = 8
+    nyx_light_type: Literal["directional", "ceiling_panel"] = "directional"
+    nyx_light_dir: tuple[float, float, float] = DEFAULT_NYX_LIGHT_DIR
+    # Realistic randomized lighting: a broad overhead spot sampled from the ceiling
+    # panel area and aimed at the work surface. The production default stays directional.
+    nyx_ceiling_light_x: tuple[float, float] = DEFAULT_NYX_CEILING_LIGHT_X
+    nyx_ceiling_light_y: tuple[float, float] = DEFAULT_NYX_CEILING_LIGHT_Y
+    nyx_ceiling_light_z: float = DEFAULT_NYX_CEILING_LIGHT_Z
+    nyx_ceiling_target_x: tuple[float, float] = DEFAULT_NYX_CEILING_TARGET_X
+    nyx_ceiling_target_y: tuple[float, float] = DEFAULT_NYX_CEILING_TARGET_Y
+    nyx_ceiling_inner_angle_deg: float = 55.0
+    nyx_ceiling_outer_angle_deg: float = 85.0
+    nyx_light_range: float = 5.0
     nyx_light_intensity: float = 2.0  # 5.0 washed out the mesh entities vs the dim splat
+    # Per-episode appearance jitter. In Nyx these are baked into the exported scene, so
+    # generate_lift_dataset.py rebuilds the env per episode when any of these are nonzero.
+    nyx_light_dir_jitter_deg: float = 0.0
+    nyx_light_intensity_jitter: float = 0.0  # multiplicative +/- fraction around nyx_light_intensity
+    robot_roughness_jitter: float = 0.0      # multiplicative +/- fraction; lower roughness = shinier
+    cube_hue_jitter_deg: float = 0.0
+    cube_value_jitter: float = 0.0           # multiplicative +/- fraction in HSV value
+    appearance_seed: int | None = None       # set by the generator for reproducible appearance samples
     # per-episode camera jitter, applied in reset() around the calibrated nominal poses
     # (the nominals themselves never move); the actual sampled poses are exposed via
     # episode_extrinsics so batch manifests can record them. 0 = off.
@@ -380,6 +472,7 @@ class LiftBlockEnv:
         self.device = gs.device
         self.res = self.cfg.res
         self.record_dt = self.cfg.physics_dt * self.cfg.record_every
+        self.episode_appearance = self._sample_appearance(self.cfg.appearance_seed)
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.cfg.physics_dt, substeps=4),
@@ -447,12 +540,13 @@ class LiftBlockEnv:
 
         # robot (base at world origin, on the table top)
         self.robot = Manipulator(num_envs=1, scene=self.scene, args=self.robot_cfg, device=gs.device)
+        _apply_robot_shine(self.robot._robot_entity, self.episode_appearance["robot_roughness_scale"])
 
         # red cube (high friction so the gripper can hold it)
         self.cube = self.scene.add_entity(
             gs.morphs.Box(size=(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), fixed=False),
             material=gs.materials.Rigid(friction=2.0),
-            surface=gs.surfaces.Plastic(color=BLOCK_COLOR, roughness=0.6),
+            surface=gs.surfaces.Plastic(color=self.episode_appearance["cube_color"], roughness=0.6),
         )
 
         # stack task: green target cube the red cube gets placed onto (same size;
@@ -462,7 +556,7 @@ class LiftBlockEnv:
             self.cube2 = self.scene.add_entity(
                 gs.morphs.Box(size=(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), fixed=False),
                 material=gs.materials.Rigid(friction=2.0),
-                surface=gs.surfaces.Plastic(color=self.cfg.stack.green_color, roughness=0.6),
+                surface=gs.surfaces.Plastic(color=self.episode_appearance["green_color"], roughness=0.6),
             )
 
         self.cams = {}
@@ -501,6 +595,56 @@ class LiftBlockEnv:
 
         self.reset()
 
+    def _sample_appearance(self, seed: int | None) -> dict:
+        rng = np.random.default_rng(seed) if seed is not None else None
+        intensity = self.cfg.nyx_light_intensity
+        if rng is not None and self.cfg.nyx_light_intensity_jitter > 0.0:
+            lo = max(0.0, 1.0 - self.cfg.nyx_light_intensity_jitter)
+            hi = 1.0 + self.cfg.nyx_light_intensity_jitter
+            intensity *= float(rng.uniform(lo, hi))
+        roughness_scale = 1.0
+        if rng is not None and self.cfg.robot_roughness_jitter > 0.0:
+            lo = max(0.05, 1.0 - self.cfg.robot_roughness_jitter)
+            hi = 1.0 + self.cfg.robot_roughness_jitter
+            roughness_scale = float(rng.uniform(lo, hi))
+
+        light_dir = tuple(float(v) for v in self.cfg.nyx_light_dir)
+        light_pos = None
+        light_target = None
+        if self.cfg.nyx_light_type == "ceiling_panel":
+            if rng is None:
+                lx = float(np.mean(self.cfg.nyx_ceiling_light_x))
+                ly = float(np.mean(self.cfg.nyx_ceiling_light_y))
+                tx = float(np.mean(self.cfg.nyx_ceiling_target_x))
+                ty = float(np.mean(self.cfg.nyx_ceiling_target_y))
+            else:
+                lx = float(rng.uniform(*self.cfg.nyx_ceiling_light_x))
+                ly = float(rng.uniform(*self.cfg.nyx_ceiling_light_y))
+                tx = float(rng.uniform(*self.cfg.nyx_ceiling_target_x))
+                ty = float(rng.uniform(*self.cfg.nyx_ceiling_target_y))
+            light_pos = (lx, ly, float(self.cfg.nyx_ceiling_light_z))
+            light_target = (tx, ty, float(self.cfg.table.top_z))
+            light_dir = tuple(float(v) for v in _unit(np.asarray(light_target) - np.asarray(light_pos)))
+        else:
+            light_dir = _jitter_direction(self.cfg.nyx_light_dir, self.cfg.nyx_light_dir_jitter_deg, rng)
+
+        return {
+            "seed": seed,
+            "light_type": self.cfg.nyx_light_type,
+            "light_dir": light_dir,
+            "light_pos": light_pos,
+            "light_target": light_target,
+            "light_range": float(self.cfg.nyx_light_range),
+            "ceiling_inner_angle_deg": float(self.cfg.nyx_ceiling_inner_angle_deg),
+            "ceiling_outer_angle_deg": float(self.cfg.nyx_ceiling_outer_angle_deg),
+            "light_intensity": float(intensity),
+            "robot_roughness_scale": float(roughness_scale),
+            "cube_color": _jitter_color_hsv(BLOCK_COLOR, self.cfg.cube_hue_jitter_deg, self.cfg.cube_value_jitter, rng),
+            "green_color": _jitter_color_hsv(
+                self.cfg.stack.green_color, self.cfg.cube_hue_jitter_deg, self.cfg.cube_value_jitter, rng
+            ),
+        }
+
     def _splat_light_fields(self):
         if self.cfg.splat_uri is None:
             return ()
@@ -514,15 +658,23 @@ class LiftBlockEnv:
 
     def _add_cameras(self) -> None:
         if self.cfg.render_backend == "nyx":
-            lights = [
-                {
-                    "type": "directional",
-                    "dir": (-0.4, -0.4, -0.8),
-                    "color": (1.0, 1.0, 1.0),
-                    "intensity": self.cfg.nyx_light_intensity,
-                    "shadow": True,
-                }
-            ]
+            light = {
+                "color": (1.0, 1.0, 1.0),
+                "intensity": self.episode_appearance["light_intensity"],
+                "shadow": True,
+            }
+            if self.episode_appearance["light_type"] == "ceiling_panel":
+                light.update({
+                    "type": "spot",
+                    "pos": self.episode_appearance["light_pos"],
+                    "dir": self.episode_appearance["light_dir"],
+                    "range": self.episode_appearance["light_range"],
+                    "inner_angle": self.episode_appearance["ceiling_inner_angle_deg"],
+                    "outer_angle": self.episode_appearance["ceiling_outer_angle_deg"],
+                })
+            else:
+                light.update({"type": "directional", "dir": self.episode_appearance["light_dir"]})
+            lights = [light]
             light_fields = self._splat_light_fields()
             for view in self.camera_views:
                 self.cams[view.name] = self.scene.add_sensor(
@@ -556,23 +708,46 @@ class LiftBlockEnv:
         cube.set_pos(pos, skip_forward=True)
         cube.set_quat(quat, skip_forward=True)
 
+    def _sample_free_stack_xy(self, rng: np.random.Generator) -> tuple[float, float, float, float]:
+        s = self.cfg.stack
+        gx = gy = x = y = 0.0
+        for _ in range(max(1, s.free_max_tries)):
+            gx = float(rng.uniform(*s.free_green_x))
+            gy = float(rng.uniform(*s.free_green_y))
+            x = float(rng.uniform(*s.free_red_x))
+            y = float(rng.uniform(*s.free_red_y))
+            dist = math.hypot(x - gx, y - gy)
+            if s.free_min_dist <= dist <= s.free_max_dist:
+                return gx, gy, x, y
+        return gx, gy, x, y
+
     # -- lifecycle --
     def reset(self, seed: int | None = None) -> None:
         rng = np.random.default_rng(seed)
         if self.cfg.task == "stack":
             s = self.cfg.stack
-            gx = float(rng.uniform(*s.green_x))
-            gy = float(rng.uniform(*s.green_y))
+            if s.free_placement:
+                gx, gy, x, y = self._sample_free_stack_xy(rng)
+            else:
+                gx = float(rng.uniform(*s.green_x))
+                gy = float(rng.uniform(*s.green_y))
+                x = gx + float(rng.uniform(*s.red_dx))
+                y = gy + float(rng.uniform(*s.red_dy))
             gyaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
-            x = gx + float(rng.uniform(*s.red_dx))
-            y = gy + float(rng.uniform(*s.red_dy))
             yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
             self._place_cube(self.cube2, gx, gy, gyaw)
             self._green_yaw = gyaw
+            self.episode_spawn = {
+                "free_placement": bool(s.free_placement),
+                "red_xy": [float(x), float(y)],
+                "green_xy": [float(gx), float(gy)],
+                "red_green_dist": float(math.hypot(x - gx, y - gy)),
+            }
         else:
             x = float(rng.uniform(*self.cfg.rectangle_x))
             y = float(rng.uniform(*self.cfg.rectangle_y))
             yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
+            self.episode_spawn = {"red_xy": [float(x), float(y)]}
         self._place_cube(self.cube, x, y, yaw)
         self._cube_yaw = yaw
         self.grasp_release()  # clear any weld left from a previous episode

@@ -14,7 +14,7 @@ computed per episode; by default only successful episodes are kept.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path
 import sys
@@ -31,7 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import genesis as gs  # noqa: E402
 
-from xsim.lift_task import BLOCK_SIZE, LiftBlockEnv, LiftEnvCfg  # noqa: E402
+from xsim.lift_task import BLOCK_SIZE, BaseDecorCfg, LiftBlockEnv, LiftEnvCfg, StackCfg, TableCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
 from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
 from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
@@ -46,6 +46,8 @@ class Config:
     video_path: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_task_current.mp4"
     video_fps: float = 30.0
     n_episodes: int = 1
+    episode_offset: int = 0  # output episode numbering offset for subprocess/sharded generation
+    appearance_child: bool = False  # internal: one-episode subprocess for Nyx appearance randomization
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
     steps_per_segment: int = 108    # 5 weighted segments at 120 Hz → ~6 s episodes
@@ -64,6 +66,101 @@ def _make_policy(env: LiftBlockEnv, cfg: Config, steps_per_segment: int | None =
     cls = ScriptedStackPolicy if cfg.task == "stack" else ScriptedLiftPolicy
     return cls(env, steps_per_segment=steps_per_segment or cfg.steps_per_segment,
                grasp_tcp_offset=cfg.grasp_tcp_offset)
+
+
+APPEARANCE_JITTER_FIELDS = (
+    "nyx_light_dir_jitter_deg",
+    "nyx_light_intensity_jitter",
+    "robot_roughness_jitter",
+    "cube_hue_jitter_deg",
+    "cube_value_jitter",
+)
+
+
+def _appearance_randomization_enabled(env_cfg: LiftEnvCfg) -> bool:
+    return (
+        env_cfg.nyx_light_type == "ceiling_panel"
+        or any(abs(float(getattr(env_cfg, name))) > 0.0 for name in APPEARANCE_JITTER_FIELDS)
+    )
+
+
+def _env_cfg_for_episode(env_cfg: LiftEnvCfg, episode_seed: int) -> LiftEnvCfg:
+    return replace(env_cfg, appearance_seed=episode_seed)
+
+
+def _config_to_jsonable(obj):
+    import dataclasses
+
+    if dataclasses.is_dataclass(obj):
+        return {k: _config_to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (list, tuple)):
+        return [_config_to_jsonable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _config_to_jsonable(v) for k, v in obj.items()}
+    return obj
+
+
+def _config_from_jsonable(raw: dict) -> Config:
+    raw = dict(raw)
+    env_raw = dict(raw.pop("env"))
+    env_raw["stack"] = StackCfg(**env_raw["stack"])
+    env_raw["table"] = TableCfg(**env_raw["table"])
+    env_raw["base_decor"] = BaseDecorCfg(**env_raw["base_decor"])
+    if env_raw.get("splat_uri") is not None:
+        env_raw["splat_uri"] = Path(env_raw["splat_uri"])
+    raw["out_dir"] = Path(raw["out_dir"])
+    raw["preview_dir"] = Path(raw["preview_dir"])
+    raw["video_path"] = Path(raw["video_path"])
+    return Config(env=LiftEnvCfg(**env_raw), **raw)
+
+
+def _run_config_subprocess(child_cfg: Config) -> None:
+    import json
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(_config_to_jsonable(child_cfg), f)
+        config_path = Path(f.name)
+    try:
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--config-json", str(config_path)],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+
+
+def _run_appearance_subprocess_batch(cfg: Config) -> None:
+    import json
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    all_stats = []
+    n_success = 0
+    print("appearance randomization enabled: running one Nyx subprocess per episode for fresh lights/materials")
+    for ep in range(cfg.n_episodes):
+        episode_seed = cfg.seed + ep
+        child_cfg = replace(
+            cfg,
+            n_episodes=1,
+            episode_offset=cfg.episode_offset + ep,
+            seed=episode_seed,
+            appearance_child=True,
+            env=_env_cfg_for_episode(cfg.env, episode_seed),
+        )
+        _run_config_subprocess(child_cfg)
+        manifest = json.loads((cfg.out_dir / "manifest.json").read_text())
+        if not manifest.get("episodes"):
+            raise RuntimeError(f"child episode {ep} wrote no manifest episode stats")
+        stats = manifest["episodes"][0]
+        all_stats.append(stats)
+        n_success += int(bool(stats.get("success")))
+
+    _write_manifest(cfg, None, all_stats, n_success)
+    print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
 
 
 def _yaw_from_quat_wxyz(quat) -> float:
@@ -256,6 +353,7 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
 
 
 def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
+    global_episode = cfg.episode_offset + episode_idx
     env.reset(seed=cfg.seed + episode_idx)
     # vary episode tempo per seed; the new release-at-drop protocol runs roughly 5-7 s
     tempo_rng = np.random.default_rng((cfg.seed + episode_idx) * 7919 + 1)
@@ -300,22 +398,30 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
                 env.step()
 
     stats = {
-        "episode": episode_idx, "frames": rec, "cube_yaw": float(env.cube_yaw()),
+        "episode": global_episode, "frames": rec, "cube_yaw": float(env.cube_yaw()),
         # actual (jittered) camera poses this episode: c2w OpenCV for low/side, plus the
         # link_tcp->camera(optical) wrist mount; also written into the MCAP itself
         # (camera_info + /tf) via log_calibration
         "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
+        "appearance": env.episode_appearance,
+        "spawn": env.episode_spawn,
     }
     stats.update(_episode_result(env, cfg, max_rise))
     return stats
 
 
 def main(cfg: Config) -> None:
+    cfg.env.task = cfg.task  # single --task flag drives both the env and the policy
+    appearance_randomized = _appearance_randomization_enabled(cfg.env)
+    if cfg.mode == "generate" and appearance_randomized and not cfg.appearance_child and cfg.n_episodes > 1:
+        _run_appearance_subprocess_batch(cfg)
+        return
+
     backend = gs.gpu if cfg.backend == "gpu" else gs.cpu
     gs.init(backend=backend, precision="32", logging_level="warning")
 
-    cfg.env.task = cfg.task  # single --task flag drives both the env and the policy
-    env = LiftBlockEnv(cfg.env)
+    initial_env_cfg = _env_cfg_for_episode(cfg.env, cfg.seed) if appearance_randomized else cfg.env
+    env = LiftBlockEnv(initial_env_cfg)
     if cfg.mode == "preview":
         run_preview(env, cfg)
         return
@@ -326,8 +432,10 @@ def main(cfg: Config) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     n_success = 0
     all_stats = []
+    manifest_env = env
+
     for ep in range(cfg.n_episodes):
-        path = cfg.out_dir / f"episode_{ep:06d}.mcap"
+        path = cfg.out_dir / f"episode_{cfg.episode_offset + ep:06d}.mcap"
         stats = run_episode(env, cfg, ep, path)
         keep = stats["success"] or cfg.save_failures
         if not keep:
@@ -343,11 +451,11 @@ def main(cfg: Config) -> None:
         print(f"[{flag}] ep{ep}: frames={stats['frames']} rise={stats['max_rise']:.3f} "
               f"lifted={stats['lifted']} {detail}")
 
-    _write_manifest(cfg, env, all_stats, n_success)
+    _write_manifest(cfg, manifest_env, all_stats, n_success)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
 
 
-def _write_manifest(cfg: Config, env: LiftBlockEnv, all_stats: list[dict], n_success: int) -> None:
+def _write_manifest(cfg: Config, env: LiftBlockEnv | None, all_stats: list[dict], n_success: int) -> None:
     """Provenance sidecar: enough to regenerate any episode bit-for-bit."""
     import dataclasses
     import hashlib
@@ -373,9 +481,10 @@ def _write_manifest(cfg: Config, env: LiftBlockEnv, all_stats: list[dict], n_suc
     except OSError:
         sha, dirty = "unknown", True
 
-    splat = Path(env.cfg.splat_uri).expanduser() if env.cfg.splat_uri else None
+    env_cfg = env.cfg if env is not None else cfg.env
+    splat = Path(env_cfg.splat_uri).expanduser() if env_cfg.splat_uri else None
     splat_md5 = None
-    if splat is not None and splat.exists() and env.cfg.render_backend == "nyx":
+    if splat is not None and splat.exists() and env_cfg.render_backend == "nyx":
         h = hashlib.md5()
         with open(splat, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 22), b""):
@@ -395,4 +504,9 @@ def _write_manifest(cfg: Config, env: LiftBlockEnv, all_stats: list[dict], n_suc
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    if len(sys.argv) == 3 and sys.argv[1] == "--config-json":
+        import json
+
+        main(_config_from_jsonable(json.loads(Path(sys.argv[2]).read_text())))
+    else:
+        main(tyro.cli(Config))
