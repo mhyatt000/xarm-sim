@@ -40,27 +40,43 @@ CALIBRATION_TOPIC_COUNTS = {
 
 # New 2026-07-02 protocol: release_step = 1 + sum(round(weight * sps)); MCAP
 # records until release_step + 0.3 s tail, decimated from 120 Hz to 30 Hz. The exact
-# default tempo-jitter envelope is 152..227 frames; keep a truncation/runaway margin.
-SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.0, 0.6)
+# default tempo-jitter envelope is 152..227 frames (lift); keep a truncation/runaway
+# margin. The gate is task-aware because the stack protocol has an extra
+# lower-to-place segment and therefore a longer envelope.
+TASK_SEGMENT_WEIGHTS = {
+    "lift": (2.6, 0.8, 0.8, 0.4, 1.0, 0.6),
+    "stack": (2.6, 0.8, 0.8, 0.4, 1.0, 0.8, 0.6),  # xsim.scripted_stack_policy
+}
 DEFAULT_STEPS_PER_SEGMENT = 108
 TEMPO_RANGE = (0.85, 1.30)
 DEFAULT_RELEASE_TAIL_S = 0.3
 DEFAULT_PHYSICS_DT = 1.0 / 120.0
 DEFAULT_RECORD_EVERY = 4
+# margins below/above the design envelope; chosen so the lift gate stays exactly the
+# verified 115..240 from the approved batches (design 152..227)
+FRAME_MARGIN_LOW = 37
+FRAME_MARGIN_HIGH = 13
 
 
-def _recorded_frames(steps_per_segment: int) -> int:
-    segment_steps = [max(2, round(w * steps_per_segment)) for w in SEGMENT_WEIGHTS]
+def _recorded_frames(steps_per_segment: int, weights: tuple[float, ...]) -> int:
+    segment_steps = [max(2, round(w * steps_per_segment)) for w in weights]
     release_step = 1 + sum(segment_steps)
     release_tail = max(1, round(DEFAULT_RELEASE_TAIL_S / DEFAULT_PHYSICS_DT))
     record_until = release_step + release_tail
     return (record_until - 1) // DEFAULT_RECORD_EVERY + 1
 
 
-DESIGN_CORE_FRAME_MIN = _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[0]))
-DESIGN_CORE_FRAME_MAX = _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[1]))
-CORE_FRAME_COUNT_MIN = 115
-CORE_FRAME_COUNT_MAX = 240
+def design_frame_envelope(task: str = "lift") -> tuple[int, int]:
+    weights = TASK_SEGMENT_WEIGHTS[task]
+    return (
+        _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[0]), weights),
+        _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[1]), weights),
+    )
+
+
+def core_frame_gate(task: str = "lift") -> tuple[int, int]:
+    lo, hi = design_frame_envelope(task)
+    return lo - FRAME_MARGIN_LOW, hi + FRAME_MARGIN_HIGH
 
 
 def _str(b: bytes, o: int) -> tuple[str, int]:
@@ -133,6 +149,7 @@ def compare_topic_layout(
     counts: dict[int, int],
     ref_chans: dict[int, tuple[str, int]],
     ref_schemas: dict[int, str],
+    task: str = "lift",
 ) -> list[str]:
     """Format gate for sim MCAPs vs real lift MCAPs.
 
@@ -177,11 +194,13 @@ def compare_topic_layout(
     if not missing_core:
         core_counts = {topic: have_counts.get(topic, 0) for topic in sorted(CORE_TOPICS)}
         lo, hi = min(core_counts.values()), max(core_counts.values())
-        if lo < CORE_FRAME_COUNT_MIN or hi > CORE_FRAME_COUNT_MAX:
+        gate_lo, gate_hi = core_frame_gate(task)
+        design_lo, design_hi = design_frame_envelope(task)
+        if lo < gate_lo or hi > gate_hi:
             problems.append(
                 f"core message count out of range: {lo}..{hi} "
-                f"(expected {CORE_FRAME_COUNT_MIN}..{CORE_FRAME_COUNT_MAX}; "
-                f"design envelope {DESIGN_CORE_FRAME_MIN}..{DESIGN_CORE_FRAME_MAX})"
+                f"(expected {gate_lo}..{gate_hi} for task {task!r}; "
+                f"design envelope {design_lo}..{design_hi})"
             )
 
     return problems
@@ -324,6 +343,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("mcap", type=Path)
     ap.add_argument("--reference", type=Path, default=None)
+    ap.add_argument("--task", choices=sorted(TASK_SEGMENT_WEIGHTS), default="lift",
+                    help="protocol whose frame-count gate applies (default: lift)")
     args = ap.parse_args()
 
     chans, schemas, counts, first = scan(str(args.mcap))
@@ -370,7 +391,7 @@ def main() -> None:
 
     if args.reference and args.reference.exists():
         ref_chans, ref_schemas, _, _ = scan(str(args.reference))
-        problems = compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas)
+        problems = compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas, task=args.task)
         print()
         print(f"-- vs reference {args.reference.name} --")
         if problems:

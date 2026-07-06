@@ -51,6 +51,7 @@ class Cfg:
     max_real: int = 60          # stratified sample across recording sessions
     out_dir: Path = PROJECT_ROOT / "outputs" / "batch_report"
     reference: Path | None = None  # defaults to first sampled real file
+    task: str = "lift"          # protocol whose frame-count gate applies (lift|stack)
 
 
 def parse_episode(path: Path) -> dict | None:
@@ -96,12 +97,12 @@ def sample_real(real_dir: Path, k: int) -> list[Path]:
     return picked
 
 
-def check_format(sim_files: list[Path], reference: Path) -> list[str]:
+def check_format(sim_files: list[Path], reference: Path, task: str = "lift") -> list[str]:
     ref_chans, ref_schemas, _, _ = scan(str(reference))
     problems = []
     for f in sim_files:
         chans, schemas, counts, _ = scan(str(f))
-        for problem in compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas):
+        for problem in compare_topic_layout(chans, schemas, counts, ref_chans, ref_schemas, task=task):
             problems.append(f"{f.name}: {problem}")
     return problems
 
@@ -134,7 +135,7 @@ def main(cfg: Cfg) -> None:
     print(f"sim: {len(sim_files)} files, real sample: {len(real_files)} of "
           f"{len(list(cfg.real_dir.glob('*.mcap')))}, reference: {reference.name}")
 
-    problems = check_format(sim_files, reference)
+    problems = check_format(sim_files, reference, task=cfg.task)
     if problems:
         print("\nFORMAT: FAIL")
         for p in problems:
