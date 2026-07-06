@@ -15,6 +15,7 @@ computed per episode; by default only successful episodes are kept.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import sys
 from typing import Literal
@@ -65,6 +66,11 @@ def _make_policy(env: LiftBlockEnv, cfg: Config, steps_per_segment: int | None =
                grasp_tcp_offset=cfg.grasp_tcp_offset)
 
 
+def _yaw_from_quat_wxyz(quat) -> float:
+    w, x, y, z = np.asarray(quat, dtype=np.float64).reshape(-1)[:4]
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
 def _episode_result(env: LiftBlockEnv, cfg: Config, max_rise: float) -> dict:
     """Task-specific success stats, computed after the unrecorded settle."""
     cube_end = env.cube_pos()
@@ -74,10 +80,16 @@ def _episode_result(env: LiftBlockEnv, cfg: Config, max_rise: float) -> dict:
         stack_z = env.cfg.table.top_z + 1.5 * BLOCK_SIZE
         xy_err = float(np.linalg.norm(cube_end[:2] - green[:2]))
         z_err = float(cube_end[2] - stack_z)
+        # face alignment of the settled pair, wrapped to the cube's 90-degree symmetry
+        yaw_err = (_yaw_from_quat_wxyz(env.cube.get_quat().cpu())
+                   - _yaw_from_quat_wxyz(env.cube2.get_quat().cpu())) % (math.pi / 2.0)
+        if yaw_err >= math.pi / 4.0:
+            yaw_err -= math.pi / 2.0
         stacked = xy_err <= cfg.stack_xy_tol and abs(z_err) <= cfg.stack_z_tol
         return {
             "max_rise": max_rise, "lifted": lifted, "stack_xy_err": xy_err,
-            "stack_z_err": z_err, "stacked": stacked, "success": lifted and stacked,
+            "stack_z_err": z_err, "stack_yaw_err_deg": abs(math.degrees(yaw_err)),
+            "stacked": stacked, "success": lifted and stacked,
             "green_pos": [float(v) for v in green],
         }
     drop = np.asarray(env.current_drop_xy)

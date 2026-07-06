@@ -568,6 +568,7 @@ class LiftBlockEnv:
             y = gy + float(rng.uniform(*s.red_dy))
             yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
             self._place_cube(self.cube2, gx, gy, gyaw)
+            self._green_yaw = gyaw
         else:
             x = float(rng.uniform(*self.cfg.rectangle_x))
             y = float(rng.uniform(*self.cfg.rectangle_y))
@@ -726,6 +727,12 @@ class LiftBlockEnv:
         if self.cube2 is None:
             raise RuntimeError("green cube only exists when cfg.task == 'stack'")
         return np.asarray(self.cube2.get_pos().cpu()).reshape(-1)
+
+    def green_yaw(self) -> float:
+        """Green cube yaw (rad) sampled at reset; used to align the placed cube's faces."""
+        if self.cube2 is None:
+            raise RuntimeError("green cube only exists when cfg.task == 'stack'")
+        return self._green_yaw
 
     def camera_specs(self):
         """Return {name: (width, height, fx, fy, cx, cy)} for the MCAP CameraSpecs."""

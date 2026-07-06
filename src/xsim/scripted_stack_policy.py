@@ -10,12 +10,12 @@ Recording ends shortly after the open, matching the lift protocol.
 
 from __future__ import annotations
 
-from dataclasses import dataclass  # noqa: F401  (kept for parity with the lift module)
+import math
 
 import torch
 
 from xsim.lift_task import BLOCK_SIZE
-from xsim.scripted_lift_policy import ScriptedLiftPolicy, _nearest_side_grasp_quat
+from xsim.scripted_lift_policy import ScriptedLiftPolicy, _nearest_side_grasp_quat, _yawed_top_down_quat
 
 # Per-segment duration weights (x steps_per_segment): approach, plunge, close, lift,
 # transport, lower-to-place, settled hold before release. Approach/plunge/close/lift
@@ -60,11 +60,26 @@ class ScriptedStackPolicy(ScriptedLiftPolicy):
         # where the cube bottom meets the surface, exactly as it did at the grasp.
         place_z = top_z + BLOCK_SIZE + env.cfg.stack.place_clearance + self.grasp_tcp_offset
 
+        # Face alignment of the stacked pair: the red cube is welded to the TCP, so
+        # twisting the wrist by the nearest 90-degree-equivalent yaw difference between
+        # the two cubes squares red's faces with green's. The twist happens over the
+        # transport segment (the lerp renormalizes quats), never exceeding 45 degrees.
+        delta = (float(env.green_yaw()) - float(env.cube_yaw())) % (math.pi / 2.0)
+        if delta >= math.pi / 4.0:
+            delta -= math.pi / 2.0
+        # recover the chosen grasp yaw from the (0, cos(h), sin(h), 0) top-down quat
+        grasp_yaw = 2.0 * math.atan2(float(grasp_quat[2]), float(grasp_quat[1]))
+        place_quat = torch.as_tensor(
+            _yawed_top_down_quat(grasp_yaw + delta), device=device, dtype=ee.dtype
+        )
+        if torch.dot(grasp_quat, place_quat) < 0:  # avoid lerping across the antipode
+            place_quat = -place_quat
+
         above = pose([cube[0], cube[1], grasp_z + self.approach_height], grasp_quat)
         at = pose([cube[0], cube[1], grasp_z], grasp_quat)
         lift = pose([cube[0], cube[1], lift_z], grasp_quat)
-        over_green = pose([green[0], green[1], lift_z], grasp_quat)
-        place = pose([green[0], green[1], place_z], grasp_quat)
+        over_green = pose([green[0], green[1], lift_z], place_quat)
+        place = pose([green[0], green[1], place_z], place_quat)
 
         self.waypoint_names = [
             "home",
