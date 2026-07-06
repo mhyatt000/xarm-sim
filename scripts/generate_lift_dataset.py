@@ -30,13 +30,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import genesis as gs  # noqa: E402
 
-from xsim.lift_task import LiftBlockEnv, LiftEnvCfg  # noqa: E402
+from xsim.lift_task import BLOCK_SIZE, LiftBlockEnv, LiftEnvCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
 from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
+from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
 
 
 @dataclass
 class Config:
+    task: Literal["lift", "stack"] = "lift"
     mode: Literal["generate", "preview", "video"] = "generate"
     out_dir: Path = SIM_MCAP_ROOT / "lift"
     preview_dir: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_env"
@@ -52,7 +54,40 @@ class Config:
     deliver_radius: float = 0.12    # max xy dist (m) from the drop target after settling
     grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
     save_failures: bool = False
+    stack_xy_tol: float = 0.02      # max xy offset (m) red-vs-green center for a stack
+    stack_z_tol: float = 0.008      # max |z error| (m) from the ideal stacked height
     env: LiftEnvCfg = field(default_factory=LiftEnvCfg)
+
+
+def _make_policy(env: LiftBlockEnv, cfg: Config, steps_per_segment: int | None = None):
+    cls = ScriptedStackPolicy if cfg.task == "stack" else ScriptedLiftPolicy
+    return cls(env, steps_per_segment=steps_per_segment or cfg.steps_per_segment,
+               grasp_tcp_offset=cfg.grasp_tcp_offset)
+
+
+def _episode_result(env: LiftBlockEnv, cfg: Config, max_rise: float) -> dict:
+    """Task-specific success stats, computed after the unrecorded settle."""
+    cube_end = env.cube_pos()
+    lifted = max_rise >= cfg.lift_threshold
+    if cfg.task == "stack":
+        green = env.green_pos()
+        stack_z = env.cfg.table.top_z + 1.5 * BLOCK_SIZE
+        xy_err = float(np.linalg.norm(cube_end[:2] - green[:2]))
+        z_err = float(cube_end[2] - stack_z)
+        stacked = xy_err <= cfg.stack_xy_tol and abs(z_err) <= cfg.stack_z_tol
+        return {
+            "max_rise": max_rise, "lifted": lifted, "stack_xy_err": xy_err,
+            "stack_z_err": z_err, "stacked": stacked, "success": lifted and stacked,
+            "green_pos": [float(v) for v in green],
+        }
+    drop = np.asarray(env.current_drop_xy)
+    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
+    delivered = deliver_dist <= cfg.deliver_radius and float(cube_end[2]) < 0.05
+    return {
+        "max_rise": max_rise, "lifted": lifted, "deliver_dist": deliver_dist,
+        "delivered": delivered, "success": lifted and delivered,
+        "drop_target": [float(drop[0]), float(drop[1])],
+    }
 
 
 def _spec_dict(env: LiftBlockEnv) -> dict[str, CameraSpec]:
@@ -126,7 +161,7 @@ def contact_sheet(images: dict[str, np.ndarray], label: str) -> np.ndarray:
 def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
     cfg.preview_dir.mkdir(parents=True, exist_ok=True)
     env.reset(seed=cfg.seed)
-    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
+    policy = _make_policy(env, cfg)
     policy.reset()
 
     save_preview_frame(env, cfg.preview_dir, 0, "reset")
@@ -159,7 +194,7 @@ def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
 def run_video(env: LiftBlockEnv, cfg: Config) -> None:
     cfg.video_path.parent.mkdir(parents=True, exist_ok=True)
     env.reset(seed=cfg.seed)
-    policy = ScriptedLiftPolicy(env, steps_per_segment=cfg.steps_per_segment, grasp_tcp_offset=cfg.grasp_tcp_offset)
+    policy = _make_policy(env, cfg)
     policy.reset()
     cube_start = env.cube_pos().copy()
     max_rise = 0.0
@@ -203,16 +238,9 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
     finally:
         writer.release()
 
-    cube_end = env.cube_pos()
-    drop = np.asarray(env.current_drop_xy)
-    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
-    lifted = max_rise >= cfg.lift_threshold
-    delivered = deliver_dist <= cfg.deliver_radius and float(cube_end[2]) < 0.05
+    res = _episode_result(env, cfg, max_rise)
     print(f"wrote video ({frame_idx + 1} frames @ {cfg.video_fps:g} fps) to {cfg.video_path}")
-    print(
-        f"video stats: rise={max_rise:.3f} deliver={deliver_dist:.3f} "
-        f"lifted={lifted} delivered={delivered} success={lifted and delivered}"
-    )
+    print("video stats: " + " ".join(f"{k}={v}" for k, v in res.items() if k != "green_pos"))
 
 
 def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
@@ -220,7 +248,7 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
     # vary episode tempo per seed; the new release-at-drop protocol runs roughly 5-7 s
     tempo_rng = np.random.default_rng((cfg.seed + episode_idx) * 7919 + 1)
     sps = int(round(cfg.steps_per_segment * tempo_rng.uniform(0.85, 1.30)))
-    policy = ScriptedLiftPolicy(env, steps_per_segment=sps, grasp_tcp_offset=cfg.grasp_tcp_offset)
+    policy = _make_policy(env, cfg, steps_per_segment=sps)
     policy.reset()
 
     cube_start = env.cube_pos().copy()
@@ -259,29 +287,22 @@ def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) ->
                 env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
                 env.step()
 
-    cube_end = env.cube_pos()
-    drop = np.asarray(env.current_drop_xy)
-    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
-    on_table = float(cube_end[2]) < 0.05
-    lifted = max_rise >= cfg.lift_threshold
-    delivered = deliver_dist <= cfg.deliver_radius and on_table
-    return {
-        "episode": episode_idx, "frames": rec, "max_rise": max_rise,
-        "deliver_dist": deliver_dist, "lifted": lifted, "delivered": delivered,
-        "success": lifted and delivered,
-        "drop_target": [float(drop[0]), float(drop[1])],
-        "cube_yaw": float(env.cube_yaw()),
+    stats = {
+        "episode": episode_idx, "frames": rec, "cube_yaw": float(env.cube_yaw()),
         # actual (jittered) camera poses this episode: c2w OpenCV for low/side, plus the
         # link_tcp->camera(optical) wrist mount; also written into the MCAP itself
         # (camera_info + /tf) via log_calibration
         "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
     }
+    stats.update(_episode_result(env, cfg, max_rise))
+    return stats
 
 
 def main(cfg: Config) -> None:
     backend = gs.gpu if cfg.backend == "gpu" else gs.cpu
     gs.init(backend=backend, precision="32", logging_level="warning")
 
+    cfg.env.task = cfg.task  # single --task flag drives both the env and the policy
     env = LiftBlockEnv(cfg.env)
     if cfg.mode == "preview":
         run_preview(env, cfg)
@@ -304,8 +325,11 @@ def main(cfg: Config) -> None:
         all_stats.append(stats)
         n_success += int(stats["success"])
         flag = "OK " if stats["success"] else ("kept" if keep else "drop")
+        detail = (f"xy_err={stats['stack_xy_err']:.3f} z_err={stats['stack_z_err']:+.3f} stacked={stats['stacked']}"
+                  if cfg.task == "stack" else
+                  f"deliver={stats['deliver_dist']:.3f} delivered={stats['delivered']}")
         print(f"[{flag}] ep{ep}: frames={stats['frames']} rise={stats['max_rise']:.3f} "
-              f"deliver={stats['deliver_dist']:.3f} lifted={stats['lifted']} delivered={stats['delivered']}")
+              f"lifted={stats['lifted']} {detail}")
 
     _write_manifest(cfg, env, all_stats, n_success)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")

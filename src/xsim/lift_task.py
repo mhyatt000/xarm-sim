@@ -314,7 +314,28 @@ class BaseDecorCfg:
 
 
 @dataclass
+class StackCfg:
+    """Second (green) cube + spawn geometry for the stack task (red stacks onto green).
+
+    Protocol reference: /data/store/griffen/stack_right human demos — the green cube
+    stays fixed, the red cube starts to its right (viewer = the main cameras) and is
+    placed on top. Image-right of the calibrated low/side cameras is roughly world −x
+    (toward the robot base), so the red offset is sampled with negative Δx.
+    """
+
+    green_x: tuple[float, float] = (0.47, 0.56)
+    green_y: tuple[float, float] = (-0.08, 0.10)
+    red_dx: tuple[float, float] = (-0.20, -0.12)   # red = green + Δ, Δx < 0 = image-right
+    red_dy: tuple[float, float] = (-0.04, 0.04)
+    green_color: tuple[float, float, float] = (0.05, 0.30, 0.06)  # darkened like BLOCK_COLOR
+    # clearance between the red cube's bottom and the green cube's top at release
+    place_clearance: float = 0.003
+
+
+@dataclass
 class LiftEnvCfg:
+    task: Literal["lift", "stack"] = "lift"
+    stack: StackCfg = field(default_factory=StackCfg)
     res: tuple[int, int] = (640, 480)
     fov_deg: float = 42.0                 # fallback vertical FOV → intrinsics
     physics_dt: float = 1.0 / 120.0       # stable sim step; ×record_every → 30 Hz like real
@@ -434,6 +455,16 @@ class LiftBlockEnv:
             surface=gs.surfaces.Plastic(color=BLOCK_COLOR, roughness=0.6),
         )
 
+        # stack task: green target cube the red cube gets placed onto (same size;
+        # same friction so the stacked pair doesn't slide apart during the settle)
+        self.cube2 = None
+        if self.cfg.task == "stack":
+            self.cube2 = self.scene.add_entity(
+                gs.morphs.Box(size=(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE), fixed=False),
+                material=gs.materials.Rigid(friction=2.0),
+                surface=gs.surfaces.Plastic(color=self.cfg.stack.green_color, roughness=0.6),
+            )
+
         self.cams = {}
         self._manual_attached_cams = []
         self._rig_attached_camera_names = set()
@@ -518,23 +549,41 @@ class LiftBlockEnv:
                 near=0.02, far=50.0,  # default near=0.1 clips the wrist cam's own gripper
             )
 
+    def _place_cube(self, cube, x: float, y: float, yaw: float) -> None:
+        z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
+        pos = torch.tensor([[x, y, z]], device=self.device, dtype=gs.tc_float)
+        quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]], device=self.device, dtype=gs.tc_float)
+        cube.set_pos(pos, skip_forward=True)
+        cube.set_quat(quat, skip_forward=True)
+
     # -- lifecycle --
     def reset(self, seed: int | None = None) -> None:
         rng = np.random.default_rng(seed)
-        x = float(rng.uniform(*self.cfg.rectangle_x))
-        y = float(rng.uniform(*self.cfg.rectangle_y))
-        z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
-        yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
-        pos = torch.tensor([[x, y, z]], device=self.device, dtype=gs.tc_float)
-        quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]], device=self.device, dtype=gs.tc_float)
-        self.cube.set_pos(pos, skip_forward=True)
-        self.cube.set_quat(quat, skip_forward=True)
+        if self.cfg.task == "stack":
+            s = self.cfg.stack
+            gx = float(rng.uniform(*s.green_x))
+            gy = float(rng.uniform(*s.green_y))
+            gyaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
+            x = gx + float(rng.uniform(*s.red_dx))
+            y = gy + float(rng.uniform(*s.red_dy))
+            yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
+            self._place_cube(self.cube2, gx, gy, gyaw)
+        else:
+            x = float(rng.uniform(*self.cfg.rectangle_x))
+            y = float(rng.uniform(*self.cfg.rectangle_y))
+            yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
+        self._place_cube(self.cube, x, y, yaw)
         self._cube_yaw = yaw
         self.grasp_release()  # clear any weld left from a previous episode
         # draw order matters for seed reproducibility: cube first, then cameras, then
         # drop, then start joints (new draws go last so earlier streams stay stable)
         self._randomize_cameras(rng)
-        self.current_drop_xy = (float(rng.uniform(*self.cfg.drop_x_range)), self.cfg.drop_y)
+        if self.cfg.task == "stack":
+            # the "drop" target is the green cube; no rng draw so camera/joint streams
+            # stay aligned with the cube draws above
+            self.current_drop_xy = (gx, gy)
+        else:
+            self.current_drop_xy = (float(rng.uniform(*self.cfg.drop_x_range)), self.cfg.drop_y)
         arm_offset = None
         if self.cfg.arm_start_jitter_deg > 0.0:
             arm_offset = rng.uniform(-1.0, 1.0, 7) * math.radians(self.cfg.arm_start_jitter_deg)
@@ -671,6 +720,12 @@ class LiftBlockEnv:
 
     def cube_pos(self) -> np.ndarray:
         return np.asarray(self.cube.get_pos().cpu()).reshape(-1)
+
+    def green_pos(self) -> np.ndarray:
+        """Green target cube position (stack task only)."""
+        if self.cube2 is None:
+            raise RuntimeError("green cube only exists when cfg.task == 'stack'")
+        return np.asarray(self.cube2.get_pos().cpu()).reshape(-1)
 
     def camera_specs(self):
         """Return {name: (width, height, fx, fy, cx, cy)} for the MCAP CameraSpecs."""
