@@ -392,10 +392,13 @@ class StackCfg:
     # rejection-sampled so they are not overlapping and not so far apart that transport
     # becomes a different task. Defaults keep the verified real-demo-like layout above.
     free_placement: bool = False
+    # y ceiling 0.14 (not 0.18): under the production 15deg/5cm camera jitter a cube
+    # at y=+0.18 can leave the side camera's frame (occlusion audit, 3 jitter draws
+    # per cell); the wedge behind the arm is rejected in _sample_free_stack_xy
     free_green_x: tuple[float, float] = (0.34, 0.62)
-    free_green_y: tuple[float, float] = (-0.18, 0.18)
+    free_green_y: tuple[float, float] = (-0.18, 0.14)
     free_red_x: tuple[float, float] = (0.26, 0.62)
-    free_red_y: tuple[float, float] = (-0.18, 0.18)
+    free_red_y: tuple[float, float] = (-0.18, 0.14)
     free_min_dist: float = 0.10
     free_max_dist: float = 0.34
     free_max_tries: int = 100
@@ -717,8 +720,14 @@ class LiftBlockEnv:
             x = float(rng.uniform(*s.free_red_x))
             y = float(rng.uniform(*s.free_red_y))
             dist = math.hypot(x - gx, y - gy)
-            if s.free_min_dist <= dist <= s.free_max_dist:
-                return gx, gy, x, y
+            if not (s.free_min_dist <= dist <= s.free_max_dist):
+                continue
+            # side-camera keep-out: cubes behind/under the arm's home pose (low x,
+            # negative y) are occluded or in deep shadow from the side view, so the
+            # "visible in both static cams at spawn" guarantee would break
+            if (x < 0.38 and y < -0.10) or (gx < 0.38 and gy < -0.10):
+                continue
+            return gx, gy, x, y
         return gx, gy, x, y
 
     # -- lifecycle --
@@ -754,6 +763,16 @@ class LiftBlockEnv:
         # draw order matters for seed reproducibility: cube first, then cameras, then
         # drop, then start joints (new draws go last so earlier streams stay stable)
         self._randomize_cameras(rng)
+        if self.cfg.task == "stack":
+            # redraw the camera jitter until both cubes project inside both static
+            # frames: a bad +/-15 deg pitch draw can push the cube area out of the
+            # low cam's view entirely. Stack only — lift keeps the single draw so
+            # approved lift batches stay seed-stable. Redraws are deterministic per
+            # seed (extra draws simply shift the later joint-jitter stream).
+            for _ in range(50):
+                if self._spawn_visible_in_static_cams():
+                    break
+                self._randomize_cameras(rng)
         if self.cfg.task == "stack":
             # the "drop" target is the green cube; no rng draw so camera/joint streams
             # stay aligned with the cube draws above
@@ -861,6 +880,31 @@ class LiftBlockEnv:
                 rgb = rgb[0]
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
+
+    STATIC_CAM_MARGIN_PX = 30.0  # ~1.5 cube widths inside the frame edge
+
+    def _spawn_visible_in_static_cams(self) -> bool:
+        """Both cubes' centers project inside the low AND side frames with margin.
+
+        Uses the episode's actual (jittered) extrinsics, validated against rendered
+        frames (projection error < 10 px). Occlusion by the arm is handled separately
+        by the spawn keep-out in _sample_free_stack_xy.
+        """
+        z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
+        points = [(*self.episode_spawn["red_xy"], z), (*self.episode_spawn["green_xy"], z)]
+        w, h = self.res
+        m = self.STATIC_CAM_MARGIN_PX
+        for name in ("low", "side"):
+            K = self.intrinsics(name)
+            w2c = np.linalg.inv(np.asarray(self.episode_extrinsics[name]))
+            for p in points:
+                pc = w2c[:3, :3] @ np.asarray(p, dtype=np.float64) + w2c[:3, 3]
+                if pc[2] <= 0.05:
+                    return False
+                uv = K @ (pc / pc[2])
+                if not (m <= uv[0] <= w - m and m <= uv[1] <= h - m):
+                    return False
+        return True
 
     def intrinsics(self, name: str) -> np.ndarray:
         cam = self.cams[name]
