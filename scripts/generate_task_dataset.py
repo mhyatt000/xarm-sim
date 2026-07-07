@@ -79,6 +79,9 @@ class Config:
     # episode's wall time (the rest is CPU scene setup), so 2-3 children overlap well
     pool_workers: int = 1
     manifest_name: str = "manifest.json"  # internal: children write private manifests
+    # Use completed child manifests to skip episodes after an interrupted pooled run.
+    # Child manifests are removed only after the parent writes the final manifest.
+    resume: bool = False
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
     steps_per_segment: int = 108    # 5 weighted segments at 120 Hz → ~6 s episodes
@@ -106,6 +109,26 @@ APPEARANCE_JITTER_FIELDS = (
     "cube_hue_jitter_deg",
     "cube_value_jitter",
 )
+
+SOURCE_FINGERPRINT_FILES = (
+    "scripts/generate_task_dataset.py",
+    "src/xsim/task_env.py",
+    "src/xsim/scripted_lift_policy.py",
+    "src/xsim/scripted_stack_policy.py",
+    "src/xsim/mcap_writer.py",
+)
+
+
+def _source_fingerprint() -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for rel in SOURCE_FINGERPRINT_FILES:
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update((PROJECT_ROOT / rel).read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _appearance_randomization_enabled(env_cfg: TaskEnvCfg) -> bool:
@@ -137,8 +160,12 @@ def _config_to_jsonable(obj):
 
 
 def _config_from_jsonable(raw: dict) -> Config:
+    import dataclasses
+
     raw = dict(raw)
     env_raw = dict(raw.pop("env"))
+    env_fields = {f.name for f in dataclasses.fields(TaskEnvCfg)}
+    env_raw = {k: v for k, v in env_raw.items() if k in env_fields}
     env_raw["stack"] = StackCfg(**env_raw["stack"])
     env_raw["table"] = TableCfg(**env_raw["table"])
     env_raw["base_decor"] = BaseDecorCfg(**env_raw["base_decor"])
@@ -168,46 +195,125 @@ def _run_config_subprocess(child_cfg: Config) -> None:
         config_path.unlink(missing_ok=True)
 
 
-def _run_episode_subprocess(cfg: Config, ep: int) -> dict:
-    """One appearance child: private manifest so concurrent children can't clobber."""
-    import json
+def _episode_manifest_name(global_ep: int) -> str:
+    return f".manifest_ep{global_ep:06d}.json"
 
+
+def _episode_mcap_path(cfg: Config, global_ep: int) -> Path:
+    return cfg.out_dir / f"episode_{global_ep:06d}.mcap"
+
+
+def _child_config_for_episode(cfg: Config, ep: int) -> Config:
     episode_seed = cfg.seed + ep
     global_ep = cfg.episode_offset + ep
-    child_cfg = replace(
+    return replace(
         cfg,
         n_episodes=1,
         episode_offset=global_ep,
         seed=episode_seed,
         appearance_child=True,
         pool_workers=1,
-        manifest_name=f".manifest_ep{global_ep:06d}.json",
+        manifest_name=_episode_manifest_name(global_ep),
+        resume=False,
         env=_env_cfg_for_episode(cfg.env, episode_seed),
     )
+
+
+def _load_completed_child(cfg: Config, ep: int) -> dict | None:
+    """Recover one already-finished child only if code and config still match."""
+    import json
+
+    episode_seed = cfg.seed + ep
+    global_ep = cfg.episode_offset + ep
+    manifest_path = cfg.out_dir / _episode_manifest_name(global_ep)
+    if not manifest_path.exists() or not _episode_mcap_path(cfg, global_ep).exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    expected_cfg = _child_config_for_episode(cfg, ep)
+    if manifest.get("source_fingerprint") != _source_fingerprint():
+        return None
+    if manifest.get("config") != _config_to_jsonable(expected_cfg):
+        return None
+    episodes = manifest.get("episodes") or []
+    if len(episodes) != 1:
+        return None
+    stats = episodes[0]
+    if stats.get("episode") != global_ep or stats.get("seed") != episode_seed:
+        return None
+    return stats
+
+
+def _run_episode_subprocess(cfg: Config, ep: int) -> dict:
+    """One appearance child: private manifest so concurrent children can't clobber."""
+    import json
+
+    global_ep = cfg.episode_offset + ep
+    if cfg.resume and (stats := _load_completed_child(cfg, ep)) is not None:
+        print(f"[resume] ep{global_ep}: using matching child manifest + MCAP", flush=True)
+        return stats
+
+    child_cfg = _child_config_for_episode(cfg, ep)
     _run_config_subprocess(child_cfg)
     manifest_path = cfg.out_dir / child_cfg.manifest_name
     manifest = json.loads(manifest_path.read_text())
-    manifest_path.unlink(missing_ok=True)
     if not manifest.get("episodes"):
         raise RuntimeError(f"child episode {ep} wrote no manifest episode stats")
     return manifest["episodes"][0]
 
 
+def _cleanup_child_manifests(cfg: Config) -> None:
+    for path in cfg.out_dir.glob(".manifest_ep*.json"):
+        path.unlink(missing_ok=True)
+
+
 def _run_appearance_subprocess_batch(cfg: Config) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     workers = max(1, cfg.pool_workers)
     print(f"appearance randomization enabled: one Nyx subprocess per episode "
           f"for fresh lights/materials ({workers} in flight)")
+    all_stats: list[dict | None] = [None] * cfg.n_episodes
+    completed = 0
+    next_ep = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_run_episode_subprocess, cfg, ep) for ep in range(cfg.n_episodes)]
-        all_stats = [f.result() for f in futures]  # episode order; raises on first child failure
+        in_flight = {}
 
-    n_success = sum(int(bool(s.get("success"))) for s in all_stats)
-    _write_manifest(cfg, None, all_stats, n_success)
+        def submit_more() -> None:
+            nonlocal next_ep
+            while next_ep < cfg.n_episodes and len(in_flight) < workers:
+                fut = pool.submit(_run_episode_subprocess, cfg, next_ep)
+                in_flight[fut] = next_ep
+                next_ep += 1
+
+        submit_more()
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                ep = in_flight.pop(fut)
+                try:
+                    stats = fut.result()
+                except BaseException:
+                    for pending in in_flight:
+                        pending.cancel()
+                    raise
+                all_stats[ep] = stats
+                completed += 1
+                print(
+                    f"[parent] {completed}/{cfg.n_episodes} "
+                    f"ep{stats.get('episode', cfg.episode_offset + ep)} "
+                    f"success={stats.get('success')}",
+                    flush=True,
+                )
+            submit_more()
+
+    ordered_stats = [s for s in all_stats if s is not None]
+    if len(ordered_stats) != cfg.n_episodes:
+        raise RuntimeError(f"only collected {len(ordered_stats)}/{cfg.n_episodes} episode stats")
+    n_success = sum(int(bool(s.get("success"))) for s in ordered_stats)
+    _write_manifest(cfg, None, ordered_stats, n_success)
+    _cleanup_child_manifests(cfg)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
-
 
 def _yaw_from_quat_wxyz(quat) -> float:
     w, x, y, z = np.asarray(quat, dtype=np.float64).reshape(-1)[:4]
@@ -534,6 +640,7 @@ def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_s
         sha, dirty = "unknown", True
 
     env_cfg = env.cfg if env is not None else cfg.env
+    manifest_cfg = replace(cfg, env=env_cfg)
     splat = Path(env_cfg.splat_uri).expanduser() if env_cfg.splat_uri else None
     splat_md5 = None
     if splat is not None and splat.exists() and env_cfg.render_backend == "nyx":
@@ -545,7 +652,9 @@ def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_s
 
     manifest = {
         "git_sha": sha, "git_dirty": dirty,
-        "config": _jsonable(cfg),
+        "source_fingerprint": _source_fingerprint(),
+        "source_fingerprint_files": list(SOURCE_FINGERPRINT_FILES),
+        "config": _jsonable(manifest_cfg),
         "splat_file": str(splat) if splat else None,
         "splat_md5": splat_md5,
         "success_rate": f"{n_success}/{cfg.n_episodes}",
