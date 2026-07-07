@@ -454,6 +454,12 @@ class TaskEnvCfg:
     # generate_task_dataset.py rebuilds the env per episode when any of these are nonzero.
     nyx_light_dir_jitter_deg: float = 0.0
     nyx_light_intensity_jitter: float = 0.0  # multiplicative +/- fraction around nyx_light_intensity
+    # shadow dial: fraction of the light that casts shadows (the rest becomes a
+    # coincident shadowless fill, so overall brightness is unchanged). 1.0 = the
+    # approved fully-shadowed look, 0.0 = shadowless. The range, when set, samples
+    # uniformly per episode (real lab shows little shadow -> bias low).
+    nyx_shadow_strength: float = 1.0
+    nyx_shadow_strength_range: tuple[float, float] | None = None
     robot_roughness_jitter: float = 0.0      # multiplicative +/- fraction; lower roughness = shinier
     cube_hue_jitter_deg: float = 0.0
     cube_value_jitter: float = 0.0           # multiplicative +/- fraction in HSV value
@@ -631,7 +637,7 @@ class TaskEnv:
         else:
             light_dir = _jitter_direction(self.cfg.nyx_light_dir, self.cfg.nyx_light_dir_jitter_deg, rng)
 
-        return {
+        app = {
             "seed": seed,
             "light_type": self.cfg.nyx_light_type,
             "light_dir": light_dir,
@@ -647,6 +653,12 @@ class TaskEnv:
                 self.cfg.stack.green_color, self.cfg.cube_hue_jitter_deg, self.cfg.cube_value_jitter, rng
             ),
         }
+        # drawn last so enabling the shadow dial doesn't shift the draws above
+        shadow_strength = float(self.cfg.nyx_shadow_strength)
+        if rng is not None and self.cfg.nyx_shadow_strength_range is not None:
+            shadow_strength = float(rng.uniform(*self.cfg.nyx_shadow_strength_range))
+        app["shadow_strength"] = float(np.clip(shadow_strength, 0.0, 1.0))
+        return app
 
     def _splat_light_fields(self):
         if self.cfg.splat_uri is None:
@@ -661,13 +673,14 @@ class TaskEnv:
 
     def _add_cameras(self) -> None:
         if self.cfg.render_backend == "nyx":
-            light = {
-                "color": (1.0, 1.0, 1.0),
-                "intensity": self.episode_appearance["light_intensity"],
-                "shadow": True,
-            }
+            # the exporter concatenates lights/light_fields across ALL sensors, so
+            # historically the one light was baked 3x (once per camera). Lights sum
+            # linearly (verified pixel-equivalent), hence the x3 below keeps every
+            # approved look while the assets are now attached to the first sensor only.
+            effective_intensity = self.episode_appearance["light_intensity"] * 3.0
+            base = {"color": (1.0, 1.0, 1.0)}
             if self.episode_appearance["light_type"] == "ceiling_panel":
-                light.update({
+                base.update({
                     "type": "spot",
                     "pos": self.episode_appearance["light_pos"],
                     "dir": self.episode_appearance["light_dir"],
@@ -676,10 +689,19 @@ class TaskEnv:
                     "outer_angle": self.episode_appearance["ceiling_outer_angle_deg"],
                 })
             else:
-                light.update({"type": "directional", "dir": self.episode_appearance["light_dir"]})
-            lights = [light]
+                base.update({"type": "directional", "dir": self.episode_appearance["light_dir"]})
+            # shadow dial: split the SAME light into a shadow-casting key and a
+            # shadowless fill so shadow density scales with s while total
+            # illumination stays constant. s=1 -> single shadowed light (the
+            # approved look); s=0 -> fully shadowless.
+            s = float(np.clip(self.episode_appearance.get("shadow_strength", 1.0), 0.0, 1.0))
+            lights = []
+            if s > 0.0:
+                lights.append(dict(base, intensity=effective_intensity * s, shadow=True))
+            if s < 1.0:
+                lights.append(dict(base, intensity=effective_intensity * (1.0 - s), shadow=False))
             light_fields = self._splat_light_fields()
-            for view in self.camera_views:
+            for i, view in enumerate(self.camera_views):
                 self.cams[view.name] = self.scene.add_sensor(
                     NyxCameraOptions(
                         res=self.res,
@@ -691,8 +713,8 @@ class TaskEnv:
                         far=50.0,
                         spp=self.cfg.nyx_spp,
                         render_mode=npr.ERenderMode.FastPathTracer,
-                        lights=lights,
-                        light_fields=light_fields,
+                        lights=lights if i == 0 else [],
+                        light_fields=light_fields if i == 0 else [],
                     )
                 )
             return
