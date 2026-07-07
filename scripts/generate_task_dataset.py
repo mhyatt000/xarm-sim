@@ -16,9 +16,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
+import os
 from pathlib import Path
 import sys
+import time
 from typing import Literal
+
+# phase timing for generation-architecture profiling: XSIM_TIMING=1 prints a
+# per-phase wall-clock breakdown at exit (imports happen before main, so the
+# marks must start here)
+_TIMING = bool(os.environ.get("XSIM_TIMING"))
+_MARKS: list[tuple[str, float]] = [("stdlib_imports", time.monotonic())]
+
+
+def _mark(name: str) -> None:
+    if _TIMING:
+        _MARKS.append((name, time.monotonic()))
+
+
+def _print_timing() -> None:
+    prev = _MARKS[0][1]
+    print("== XSIM_TIMING phase breakdown ==")
+    for name, t in _MARKS[1:]:
+        print(f"  {name:24s} {t - prev:7.2f} s")
+        prev = t
+    print(f"  {'TOTAL':24s} {prev - _MARKS[0][1]:7.2f} s")
+
 
 import cv2
 import numpy as np
@@ -29,7 +52,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SIM_MCAP_ROOT = Path("/data/store/griffen_sim_mcaps")
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+_mark("thirdparty_imports")
+
 import genesis as gs  # noqa: E402
+
+_mark("genesis_import")
 
 from xsim.task_env import BLOCK_SIZE, BaseDecorCfg, TaskEnv, TaskEnvCfg, StackCfg, TableCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
@@ -48,6 +75,10 @@ class Config:
     n_episodes: int = 1
     episode_offset: int = 0  # output episode numbering offset for subprocess/sharded generation
     appearance_child: bool = False  # internal: one-episode subprocess for Nyx appearance randomization
+    # concurrent appearance children: the Nyx render only holds the GPU ~36% of an
+    # episode's wall time (the rest is CPU scene setup), so 2-3 children overlap well
+    pool_workers: int = 1
+    manifest_name: str = "manifest.json"  # internal: children write private manifests
     backend: Literal["gpu", "cpu"] = "gpu"
     seed: int = 0
     steps_per_segment: int = 108    # 5 weighted segments at 120 Hz → ~6 s episodes
@@ -137,31 +168,43 @@ def _run_config_subprocess(child_cfg: Config) -> None:
         config_path.unlink(missing_ok=True)
 
 
-def _run_appearance_subprocess_batch(cfg: Config) -> None:
+def _run_episode_subprocess(cfg: Config, ep: int) -> dict:
+    """One appearance child: private manifest so concurrent children can't clobber."""
     import json
 
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    all_stats = []
-    n_success = 0
-    print("appearance randomization enabled: running one Nyx subprocess per episode for fresh lights/materials")
-    for ep in range(cfg.n_episodes):
-        episode_seed = cfg.seed + ep
-        child_cfg = replace(
-            cfg,
-            n_episodes=1,
-            episode_offset=cfg.episode_offset + ep,
-            seed=episode_seed,
-            appearance_child=True,
-            env=_env_cfg_for_episode(cfg.env, episode_seed),
-        )
-        _run_config_subprocess(child_cfg)
-        manifest = json.loads((cfg.out_dir / "manifest.json").read_text())
-        if not manifest.get("episodes"):
-            raise RuntimeError(f"child episode {ep} wrote no manifest episode stats")
-        stats = manifest["episodes"][0]
-        all_stats.append(stats)
-        n_success += int(bool(stats.get("success")))
+    episode_seed = cfg.seed + ep
+    global_ep = cfg.episode_offset + ep
+    child_cfg = replace(
+        cfg,
+        n_episodes=1,
+        episode_offset=global_ep,
+        seed=episode_seed,
+        appearance_child=True,
+        pool_workers=1,
+        manifest_name=f".manifest_ep{global_ep:06d}.json",
+        env=_env_cfg_for_episode(cfg.env, episode_seed),
+    )
+    _run_config_subprocess(child_cfg)
+    manifest_path = cfg.out_dir / child_cfg.manifest_name
+    manifest = json.loads(manifest_path.read_text())
+    manifest_path.unlink(missing_ok=True)
+    if not manifest.get("episodes"):
+        raise RuntimeError(f"child episode {ep} wrote no manifest episode stats")
+    return manifest["episodes"][0]
 
+
+def _run_appearance_subprocess_batch(cfg: Config) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    workers = max(1, cfg.pool_workers)
+    print(f"appearance randomization enabled: one Nyx subprocess per episode "
+          f"for fresh lights/materials ({workers} in flight)")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_run_episode_subprocess, cfg, ep) for ep in range(cfg.n_episodes)]
+        all_stats = [f.result() for f in futures]  # episode order; raises on first child failure
+
+    n_success = sum(int(bool(s.get("success"))) for s in all_stats)
     _write_manifest(cfg, None, all_stats, n_success)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
 
@@ -422,9 +465,11 @@ def main(cfg: Config) -> None:
 
     backend = gs.gpu if cfg.backend == "gpu" else gs.cpu
     gs.init(backend=backend, precision="32", logging_level="warning")
+    _mark("gs_init")
 
     initial_env_cfg = _env_cfg_for_episode(cfg.env, cfg.seed) if appearance_randomized else cfg.env
     env = TaskEnv(initial_env_cfg)
+    _mark("env_build")
     if cfg.mode == "preview":
         run_preview(env, cfg)
         return
@@ -440,6 +485,7 @@ def main(cfg: Config) -> None:
     for ep in range(cfg.n_episodes):
         path = cfg.out_dir / f"episode_{cfg.episode_offset + ep:06d}.mcap"
         stats = run_episode(env, cfg, ep, path)
+        _mark(f"episode_{ep}")
         keep = stats["success"] or cfg.save_failures
         if not keep:
             path.unlink(missing_ok=True)
@@ -455,6 +501,9 @@ def main(cfg: Config) -> None:
               f"lifted={stats['lifted']} {detail}")
 
     _write_manifest(cfg, manifest_env, all_stats, n_success)
+    _mark("manifest_write")
+    if _TIMING:
+        _print_timing()
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
 
 
@@ -502,8 +551,8 @@ def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_s
         "success_rate": f"{n_success}/{cfg.n_episodes}",
         "episodes": all_stats,
     }
-    (cfg.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"wrote {cfg.out_dir / 'manifest.json'}")
+    (cfg.out_dir / cfg.manifest_name).write_text(json.dumps(manifest, indent=2))
+    print(f"wrote {cfg.out_dir / cfg.manifest_name}")
 
 
 if __name__ == "__main__":
