@@ -62,7 +62,7 @@ Current large-disk generation root:
 
 ```bash
 # N episodes, photoreal, style-matched (slab table is the default; do not use table-mode plane)
-uv run python scripts/generate_lift_dataset.py --n-episodes N \
+uv run python scripts/generate_task_dataset.py --n-episodes N \
     --env.render-backend nyx --out-dir /data/store/griffen_sim_mcaps/<name> --seed <fresh>
 # verify any batch:
 uv run python scripts/compare_batches.py --sim-dir /data/store/griffen_sim_mcaps/<name>

@@ -14,7 +14,7 @@ import math
 
 import torch
 
-from xsim.lift_task import BLOCK_SIZE
+from xsim.task_env import BLOCK_SIZE
 from xsim.scripted_lift_policy import ScriptedLiftPolicy, _nearest_side_grasp_quat, _yawed_top_down_quat
 
 # Per-segment duration weights (x steps_per_segment): approach, plunge, close, lift,

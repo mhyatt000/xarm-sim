@@ -226,7 +226,7 @@ class EpisodeMcapWriter:
         /tf, ``base → cam_<name>_optical`` for static cameras (the episode's actual
         jittered camera-to-base pose, OpenCV optical convention) and
         ``link_tcp → cam_wrist_optical`` for the wrist mount. Keys in ``extrinsics``
-        follow LiftBlockEnv.episode_extrinsics: "low", "side", "wrist_mount".
+        follow TaskEnv.episode_extrinsics: "low", "side", "wrist_mount".
         """
         ts = _timestamp(stamp_ns)
         for name, spec in self.cameras.items():

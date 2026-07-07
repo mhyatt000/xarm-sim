@@ -1,4 +1,4 @@
-"""LiftBlockEnv: xArm7 red-block pickup env for synthetic MCAP data generation.
+"""TaskEnv: xArm7 red-block pickup env for synthetic MCAP data generation.
 
 A purpose-built Genesis env (reuses ``Manipulator`` from ``grasp_env`` but does not touch
 ``GraspEnv``) with:
@@ -408,7 +408,7 @@ class StackCfg:
 
 
 @dataclass
-class LiftEnvCfg:
+class TaskEnvCfg:
     task: Literal["lift", "stack"] = "lift"
     stack: StackCfg = field(default_factory=StackCfg)
     res: tuple[int, int] = (640, 480)
@@ -451,7 +451,7 @@ class LiftEnvCfg:
     nyx_light_range: float = 5.0
     nyx_light_intensity: float = 2.0  # 5.0 washed out the mesh entities vs the dim splat
     # Per-episode appearance jitter. In Nyx these are baked into the exported scene, so
-    # generate_lift_dataset.py rebuilds the env per episode when any of these are nonzero.
+    # generate_task_dataset.py rebuilds the env per episode when any of these are nonzero.
     nyx_light_dir_jitter_deg: float = 0.0
     nyx_light_intensity_jitter: float = 0.0  # multiplicative +/- fraction around nyx_light_intensity
     robot_roughness_jitter: float = 0.0      # multiplicative +/- fraction; lower roughness = shinier
@@ -467,9 +467,9 @@ class LiftEnvCfg:
     wrist_jitter_cm: float = 0.0   # wrist mount offset: ± per-axis xyz (cm)
 
 
-class LiftBlockEnv:
-    def __init__(self, cfg: LiftEnvCfg | None = None, robot_cfg: dict | None = None, cameras=DEFAULT_CAMERAS):
-        self.cfg = cfg or LiftEnvCfg()
+class TaskEnv:
+    def __init__(self, cfg: TaskEnvCfg | None = None, robot_cfg: dict | None = None, cameras=DEFAULT_CAMERAS):
+        self.cfg = cfg or TaskEnvCfg()
         self.robot_cfg = robot_cfg or XARM7_ROBOT_CFG
         self.camera_views = list(cameras)
         self.device = gs.device

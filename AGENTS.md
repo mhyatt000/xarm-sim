@@ -33,7 +33,7 @@ Two changes on top of the v3 protocol, from grifflee's remaining-adjustments lis
   real 3 ft x 2 ft top: `size_xy = (0.9144, 0.6096)` (was the IPM-estimated 0.93 x 0.62).
   Cube spawn/rest heights and all policy z-waypoints derive from `top_z`, so they
   follow automatically.
-- **Random-ish start joints**: `LiftEnvCfg.arm_start_jitter_deg = 3.0` (new field; 0
+- **Random-ish start joints**: `TaskEnvCfg.arm_start_jitter_deg = 3.0` (new field; 0
   disables). Each arm joint gets a uniform +-3 deg offset from the IK-solved home at
   reset, drawn AFTER the cube/camera/drop draws so those streams stay per-seed stable.
   The scripted policy already reads the live TCP at reset, so trajectories adapt. TCP
@@ -130,7 +130,7 @@ policy/visuals and rerun the raster smoke + 10-episode Nyx pilot first.
 1. **Table rendering: `table_mode="slab"` (the default). NEVER pass
    `--env.table-mode plane`** for testing or generation.
 2. **Never move, jitter, or "improve" the camera poses.** `low`/`side` extrinsics in
-   `src/xsim/lift_task.py` (`LOW_C2W_CV`, `SIDE_C2W_CV`, `LOGITECH_FOV_DEG`) come from
+   `src/xsim/task_env.py` (`LOW_C2W_CV`, `SIDE_C2W_CV`, `LOGITECH_FOV_DEG`) come from
    the real calibration (`/data/store/opencv_calibrated`). Label correctness depends on
    them exactly as they are.
 3. **Do not re-tune the splat alignment by eye.** `DEFAULT_SPLAT_POS/QUAT/SCALE` were
@@ -171,13 +171,13 @@ policy/visuals and rerun the raster smoke + 10-episode Nyx pilot first.
 Prefer the source over the README when in doubt; the README still describes the older
 generic grasp demo in places. The current lift-data path is:
 
-- `src/xsim/lift_task.py` -- the active xArm7 lift environment: robot config, calibrated
+- `src/xsim/task_env.py` -- the active xArm7 lift environment: robot config, calibrated
   `low`/`side` cameras, guessed wrist camera, table/slab rendering, Nyx splat setup,
   spawn/drop ranges, and camera-jitter toggles.
 - `src/xsim/scripted_lift_policy.py` -- scripted waypoint policy used for these demos.
 - `src/xsim/mcap_writer.py` -- Foxglove MCAP topic/schema writer matching the real lift
   logs.
-- `scripts/generate_lift_dataset.py` -- main entrypoint for simulation. `generate`
+- `scripts/generate_task_dataset.py` -- main entrypoint for simulation. `generate`
   writes MCAP; `preview` writes milestone PNGs; `video` writes an MP4 contact sheet.
 - `scripts/compare_batches.py` -- batch format gate plus label-distribution report
   against `/data/store/mcaps/single/lift`.
@@ -204,25 +204,25 @@ Fast local sanity checks:
 
 ```bash
 # Fast raster video, no MCAP, useful for policy/physics checks.
-uv run python scripts/generate_lift_dataset.py \
+uv run python scripts/generate_task_dataset.py \
     --mode video --backend gpu \
     --video-path outputs/sim_preview/raster_check.mp4 --seed 0
 
 # Photoreal Nyx video, no MCAP, useful before/after a batch.
-uv run python scripts/generate_lift_dataset.py \
+uv run python scripts/generate_task_dataset.py \
     --mode video --backend gpu --env.render-backend nyx \
     --video-path outputs/sim_preview/nyx_check.mp4 --seed 0
 
 # Milestone PNGs at reset/waypoints/settled.
-uv run python scripts/generate_lift_dataset.py \
+uv run python scripts/generate_task_dataset.py \
     --mode preview --backend gpu \
-    --preview-dir outputs/sim_preview/lift_env --seed 0
+    --preview-dir outputs/sim_preview/task_env --seed 0
 ```
 
 Small MCAP smoke test:
 
 ```bash
-uv run python scripts/generate_lift_dataset.py \
+uv run python scripts/generate_task_dataset.py \
     --n-episodes 3 --backend gpu --env.render-backend nyx \
     --out-dir /data/store/griffen_sim_mcaps/smoke --seed 300
 
@@ -306,7 +306,7 @@ Simulation and toggle notes:
   shape/rate knobs. The baseline is 640x480, 1/120 s physics, `record_every=4` -> 30 Hz.
 
 Tyro maps dataclass fields to CLI flags with hyphens and nested dataclasses with dots,
-for example `LiftEnvCfg.render_backend` becomes `--env.render-backend` and
+for example `TaskEnvCfg.render_backend` becomes `--env.render-backend` and
 `cam_jitter_cm` becomes `--env.cam-jitter-cm`.
 
 ## 4. Your tasks, in order
@@ -318,7 +318,7 @@ the RTX 5090; run in background / overnight):
 
 ```bash
 cd ~/repo/xarm-sim
-uv run python scripts/generate_lift_dataset.py \
+uv run python scripts/generate_task_dataset.py \
     --n-episodes N --env.render-backend nyx \
     --out-dir /data/store/griffen_sim_mcaps/<name> --seed 1000
 ```
@@ -354,7 +354,7 @@ Pass criteria:
 
 The reports show sim joint1 narrower than real (cube spawn area is small/symmetric).
 If grifflee wants better coverage:
-1. Edit `LiftEnvCfg.rectangle_x`/`rectangle_y` in `src/xsim/lift_task.py` modestly
+1. Edit `TaskEnvCfg.rectangle_x`/`rectangle_y` in `src/xsim/task_env.py` modestly
    (e.g., y ±0.15 → ±0.22; keep everything on the real table: world x ∈ [−0.09, 0.84],
    y ∈ [−0.30, 0.32] minus margins for the gripper).
 2. Run a 10-episode RASTER pilot first (fast): success rate must stay high — spawns too
@@ -372,7 +372,7 @@ Commit any code changes with clear messages on `synthetic-lift-mcap` and push to
 
 | Tool | Purpose |
 | --- | --- |
-| `scripts/generate_lift_dataset.py` | episodes → MCAP (`generate`), preview PNGs, video mp4; writes manifest.json |
+| `scripts/generate_task_dataset.py` | episodes → MCAP (`generate`), preview PNGs, video mp4; writes manifest.json |
 | `scripts/compare_batches.py` | batch format gate + label-distribution report vs real MCAPs |
 | `scripts/blink_test.py` | accuracy check: sim vs real photos at calibration configs (cap mode) and vs May wrist frames (wrist mode) |
 | `scripts/verify_splat_alignment.py` | nyx render vs calibration photos at the solved splat transform |

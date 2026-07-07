@@ -28,7 +28,7 @@ DEFAULT_CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
 DEFAULT_CLEAN_W_TABLE_SPLAT = PROJECT_ROOT / "assets" / "lab_clean_w_table.ply"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from xsim.lift_task import splat_world_transform  # noqa: E402
+from xsim.task_env import splat_world_transform  # noqa: E402
 
 
 @dataclass

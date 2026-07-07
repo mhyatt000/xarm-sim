@@ -37,7 +37,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import genesis as gs  # noqa: E402
 
 from validate_mcap import parse_gripper, parse_joint_states, parse_rawimage, read_records, _str  # noqa: E402
-from xsim.lift_task import DEFAULT_CAMERAS, LiftBlockEnv, LiftEnvCfg  # noqa: E402
+from xsim.task_env import DEFAULT_CAMERAS, TaskEnv, TaskEnvCfg  # noqa: E402
 
 CAP_NPZ = Path("/data/store/opencv_calibrated/cap.npz")
 REAL_EPISODE = Path("/data/store/mcaps/single/lift/2026-05-18_1300_episode_000003.mcap")
@@ -68,7 +68,7 @@ class Cfg:
     nyx_spp: int = 8
 
 
-def pose_robot(env: LiftBlockEnv, arm_q, gripper_dof: float = 0.0) -> None:
+def pose_robot(env: TaskEnv, arm_q, gripper_dof: float = 0.0) -> None:
     qpos = torch.zeros(13, dtype=torch.float32, device=env.device)
     qpos[:7] = torch.tensor(np.asarray(arm_q, dtype=np.float32))
     qpos[7:] = float(gripper_dof)
@@ -78,7 +78,7 @@ def pose_robot(env: LiftBlockEnv, arm_q, gripper_dof: float = 0.0) -> None:
     env.step()  # rasteriser/nyx visual state refreshes on scene.step
 
 
-def park_cube(env: LiftBlockEnv) -> None:
+def park_cube(env: TaskEnv) -> None:
     """The cap photos show a bare table; drop the cube far below the scene."""
     pos = torch.tensor([[0.45, 0.0, -5.0]], device=env.device, dtype=gs.tc_float)
     env.cube.set_pos(pos, skip_forward=True)
@@ -90,7 +90,7 @@ def project(pw: np.ndarray, cam: str) -> tuple[int, int]:
     return int(uv[0]), int(uv[1])
 
 
-def robot_roi(env: LiftBlockEnv, cam: str, margin: int = 170) -> tuple[int, int, int, int]:
+def robot_roi(env: TaskEnv, cam: str, margin: int = 170) -> tuple[int, int, int, int]:
     """Image box around the robot: projected base + TCP, padded."""
     ee = np.asarray(env.robot.ee_pose.cpu()).reshape(-1)[:3]
     pts = [project(np.zeros(3), cam), project(np.array([0.0, 0.0, 0.3]), cam), project(ee, cam)]
@@ -127,7 +127,7 @@ def flip_gif(path: Path, real: np.ndarray, sim: np.ndarray, n_cycles: int = 3) -
     imageio.mimsave(path, frames, duration=0.7, loop=0)
 
 
-def run_cap(env: LiftBlockEnv, cfg: Cfg) -> None:
+def run_cap(env: TaskEnv, cfg: Cfg) -> None:
     d = np.load(CAP_NPZ, allow_pickle=True)
     q = d["q"]
     rows = []
@@ -187,7 +187,7 @@ def load_real_wrist_frames(path: Path, fracs) -> list[dict]:
     return out
 
 
-def run_wrist(env: LiftBlockEnv, cfg: Cfg) -> None:
+def run_wrist(env: TaskEnv, cfg: Cfg) -> None:
     frames = load_real_wrist_frames(cfg.real_episode, cfg.wrist_fracs)
     for fr in frames:
         gd = (1.0 - float(fr["gripper_norm"])) * GRIPPER_CLOSE_DOF
@@ -211,7 +211,7 @@ def run_wrist(env: LiftBlockEnv, cfg: Cfg) -> None:
 def main(cfg: Cfg) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     gs.init(backend=gs.gpu, precision="32", logging_level="warning")
-    env = LiftBlockEnv(LiftEnvCfg(render_backend="nyx", nyx_spp=cfg.nyx_spp), cameras=DEFAULT_CAMERAS)
+    env = TaskEnv(TaskEnvCfg(render_backend="nyx", nyx_spp=cfg.nyx_spp), cameras=DEFAULT_CAMERAS)
     if cfg.mode in ("both", "cap"):
         park_cube(env)  # the cap photos show a bare table
         run_cap(env, cfg)

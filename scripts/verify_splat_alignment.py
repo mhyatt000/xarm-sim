@@ -4,7 +4,7 @@ Renders the Nyx-composited scene (splat room + mesh robot) through the two calib
 Logitech cameras with the robot posed at a `cap.npz` calibration joint config, and writes
 real | sim | blend panels. Re-run this whenever the room is rescanned or the cameras are
 recalibrated; re-solve with scripts/align_ransac.py and bake the result into
-`xsim.lift_task.DEFAULT_SPLAT_POS/QUAT/SCALE` (overridable here via --pos/--quat/--scale).
+`xsim.task_env.DEFAULT_SPLAT_POS/QUAT/SCALE` (overridable here via --pos/--quat/--scale).
 
     uv run python scripts/verify_splat_alignment.py --tag check
 """
@@ -25,14 +25,14 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import genesis as gs  # noqa: E402
 
-from xsim.lift_task import (  # noqa: E402
+from xsim.task_env import (  # noqa: E402
     DEFAULT_CAMERAS,
     DEFAULT_SPLAT_POS,
     DEFAULT_SPLAT_QUAT,
     DEFAULT_SPLAT_SCALE,
     CameraView,
-    LiftBlockEnv,
-    LiftEnvCfg,
+    TaskEnv,
+    TaskEnvCfg,
 )
 
 CAP_NPZ = Path("/data/store/opencv_calibrated/cap.npz")
@@ -60,10 +60,10 @@ def main(c: Cfg) -> None:
         # oblique overview: the mesh robot at the origin must sit on the splat's baked robot
         CameraView("oblique", pos=(1.6, 1.1, 1.3), lookat=(0.2, 0.0, 0.0), fov_deg=75.0),
     ]
-    env_cfg = LiftEnvCfg(render_backend="nyx", splat_pos=pos, splat_quat=quat, splat_scale=c.scale, nyx_spp=c.nyx_spp)
+    env_cfg = TaskEnvCfg(render_backend="nyx", splat_pos=pos, splat_quat=quat, splat_scale=c.scale, nyx_spp=c.nyx_spp)
     if c.splat_uri is not None:
         env_cfg.splat_uri = c.splat_uri
-    env = LiftBlockEnv(env_cfg, cameras=cams)
+    env = TaskEnv(env_cfg, cameras=cams)
 
     d = np.load(CAP_NPZ, allow_pickle=True)
     qpos = torch.zeros(13, dtype=torch.float32, device=env.device)

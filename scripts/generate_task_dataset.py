@@ -1,15 +1,15 @@
 """Generate synthetic block-lift episodes as Foxglove MCAP.
 
-Drives ``LiftBlockEnv`` with ``ScriptedLiftPolicy``. In generate mode it records at a
+Drives ``TaskEnv`` with ``ScriptedLiftPolicy``. In generate mode it records at a
 fixed rate and writes one ``<episode>.mcap`` per rollout via ``EpisodeMcapWriter``,
 matching the real lift MCAP topic/schema layout under ``/data/store/mcaps/single/lift``.
 Preview/video modes render inspection artifacts without writing MCAP. Grasp success is
 computed per episode; by default only successful episodes are kept.
 
-    uv run python scripts/generate_lift_dataset.py --n-episodes 3 --backend gpu
-    uv run python scripts/generate_lift_dataset.py --mode preview --backend cpu
-    uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx
-    uv run python scripts/generate_lift_dataset.py --mode video --backend gpu --env.render-backend nyx --env.table-transparent
+    uv run python scripts/generate_task_dataset.py --n-episodes 3 --backend gpu
+    uv run python scripts/generate_task_dataset.py --mode preview --backend cpu
+    uv run python scripts/generate_task_dataset.py --mode video --backend gpu --env.render-backend nyx
+    uv run python scripts/generate_task_dataset.py --mode video --backend gpu --env.render-backend nyx --env.table-transparent
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import genesis as gs  # noqa: E402
 
-from xsim.lift_task import BLOCK_SIZE, BaseDecorCfg, LiftBlockEnv, LiftEnvCfg, StackCfg, TableCfg  # noqa: E402
+from xsim.task_env import BLOCK_SIZE, BaseDecorCfg, TaskEnv, TaskEnvCfg, StackCfg, TableCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
 from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
 from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
@@ -42,8 +42,8 @@ class Config:
     task: Literal["lift", "stack"] = "lift"
     mode: Literal["generate", "preview", "video"] = "generate"
     out_dir: Path = SIM_MCAP_ROOT / "lift"
-    preview_dir: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_env"
-    video_path: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "lift_task_current.mp4"
+    preview_dir: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "task_env"
+    video_path: Path = PROJECT_ROOT / "outputs" / "sim_preview" / "task_current.mp4"
     video_fps: float = 30.0
     n_episodes: int = 1
     episode_offset: int = 0  # output episode numbering offset for subprocess/sharded generation
@@ -59,10 +59,10 @@ class Config:
     save_failures: bool = False
     stack_xy_tol: float = 0.02      # max xy offset (m) red-vs-green center for a stack
     stack_z_tol: float = 0.008      # max |z error| (m) from the ideal stacked height
-    env: LiftEnvCfg = field(default_factory=LiftEnvCfg)
+    env: TaskEnvCfg = field(default_factory=TaskEnvCfg)
 
 
-def _make_policy(env: LiftBlockEnv, cfg: Config, steps_per_segment: int | None = None):
+def _make_policy(env: TaskEnv, cfg: Config, steps_per_segment: int | None = None):
     cls = ScriptedStackPolicy if cfg.task == "stack" else ScriptedLiftPolicy
     return cls(env, steps_per_segment=steps_per_segment or cfg.steps_per_segment,
                grasp_tcp_offset=cfg.grasp_tcp_offset)
@@ -77,14 +77,14 @@ APPEARANCE_JITTER_FIELDS = (
 )
 
 
-def _appearance_randomization_enabled(env_cfg: LiftEnvCfg) -> bool:
+def _appearance_randomization_enabled(env_cfg: TaskEnvCfg) -> bool:
     return (
         env_cfg.nyx_light_type == "ceiling_panel"
         or any(abs(float(getattr(env_cfg, name))) > 0.0 for name in APPEARANCE_JITTER_FIELDS)
     )
 
 
-def _env_cfg_for_episode(env_cfg: LiftEnvCfg, episode_seed: int) -> LiftEnvCfg:
+def _env_cfg_for_episode(env_cfg: TaskEnvCfg, episode_seed: int) -> TaskEnvCfg:
     # decorrelate from the reset() stream: default_rng(seed) and default_rng(seed)
     # emit identical uniforms, so seeding appearance with the bare episode seed made
     # light intensity track cube placement (r=0.85 in batch 33300)
@@ -116,7 +116,7 @@ def _config_from_jsonable(raw: dict) -> Config:
     raw["out_dir"] = Path(raw["out_dir"])
     raw["preview_dir"] = Path(raw["preview_dir"])
     raw["video_path"] = Path(raw["video_path"])
-    return Config(env=LiftEnvCfg(**env_raw), **raw)
+    return Config(env=TaskEnvCfg(**env_raw), **raw)
 
 
 def _run_config_subprocess(child_cfg: Config) -> None:
@@ -171,7 +171,7 @@ def _yaw_from_quat_wxyz(quat) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
-def _episode_result(env: LiftBlockEnv, cfg: Config, max_rise: float) -> dict:
+def _episode_result(env: TaskEnv, cfg: Config, max_rise: float) -> dict:
     """Task-specific success stats, computed after the unrecorded settle."""
     cube_end = env.cube_pos()
     lifted = max_rise >= cfg.lift_threshold
@@ -202,7 +202,7 @@ def _episode_result(env: LiftBlockEnv, cfg: Config, max_rise: float) -> dict:
     }
 
 
-def _spec_dict(env: LiftBlockEnv) -> dict[str, CameraSpec]:
+def _spec_dict(env: TaskEnv) -> dict[str, CameraSpec]:
     specs = {}
     for name, (w, h, fx, fy, cx, cy) in env.camera_specs().items():
         specs[name] = CameraSpec(name=name, width=w, height=h, fx=fx, fy=fy, cx=cx, cy=cy)
@@ -228,7 +228,7 @@ def _preview_camera_names(images: dict[str, np.ndarray]) -> list[str]:
     return ordered + [name for name in images if name not in ordered]
 
 
-def save_preview_frame(env: LiftBlockEnv, preview_dir: Path, step_idx: int, label: str) -> None:
+def save_preview_frame(env: TaskEnv, preview_dir: Path, step_idx: int, label: str) -> None:
     images = env.render()
     safe = _safe_label(label)
     names = _preview_camera_names(images)
@@ -270,7 +270,7 @@ def contact_sheet(images: dict[str, np.ndarray], label: str) -> np.ndarray:
     return np.concatenate(frames, axis=1)
 
 
-def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
+def run_preview(env: TaskEnv, cfg: Config) -> None:
     cfg.preview_dir.mkdir(parents=True, exist_ok=True)
     env.reset(seed=cfg.seed)
     policy = _make_policy(env, cfg)
@@ -303,7 +303,7 @@ def run_preview(env: LiftBlockEnv, cfg: Config) -> None:
     print(f"wrote preview frames to {cfg.preview_dir}")
 
 
-def run_video(env: LiftBlockEnv, cfg: Config) -> None:
+def run_video(env: TaskEnv, cfg: Config) -> None:
     cfg.video_path.parent.mkdir(parents=True, exist_ok=True)
     env.reset(seed=cfg.seed)
     policy = _make_policy(env, cfg)
@@ -355,7 +355,7 @@ def run_video(env: LiftBlockEnv, cfg: Config) -> None:
     print("video stats: " + " ".join(f"{k}={v}" for k, v in res.items() if k != "green_pos"))
 
 
-def run_episode(env: LiftBlockEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
+def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
     global_episode = cfg.episode_offset + episode_idx
     env.reset(seed=cfg.seed + episode_idx)
     # vary episode tempo per seed; the new release-at-drop protocol runs roughly 5-7 s
@@ -424,7 +424,7 @@ def main(cfg: Config) -> None:
     gs.init(backend=backend, precision="32", logging_level="warning")
 
     initial_env_cfg = _env_cfg_for_episode(cfg.env, cfg.seed) if appearance_randomized else cfg.env
-    env = LiftBlockEnv(initial_env_cfg)
+    env = TaskEnv(initial_env_cfg)
     if cfg.mode == "preview":
         run_preview(env, cfg)
         return
@@ -458,7 +458,7 @@ def main(cfg: Config) -> None:
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
 
 
-def _write_manifest(cfg: Config, env: LiftBlockEnv | None, all_stats: list[dict], n_success: int) -> None:
+def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_success: int) -> None:
     """Provenance sidecar: enough to regenerate any episode bit-for-bit."""
     import dataclasses
     import hashlib
