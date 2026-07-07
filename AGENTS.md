@@ -280,14 +280,23 @@ Simulation and toggle notes:
   mount offset. NOT part of the production recipe — every approved batch keeps
   these at 0 (the wrist mount is a verified guess; jittering it has never been
   reviewed).
-- Stack appearance randomization: use the dim ceiling-panel recipe that grifflee reviewed,
-  not the earlier over-bright smoke. Pass `--env.nyx-light-type ceiling_panel`,
-  `--env.nyx-light-intensity 6`, and `--env.nyx-light-intensity-jitter 0.25`; the
-  ceiling light samples x/y on the overhead panel plane and aims down at the table. Pair
-  it with `--env.robot-roughness-jitter 0.35`, `--env.cube-hue-jitter-deg 8`,
-  `--env.cube-value-jitter 0.2`, and `--env.stack.free-placement` for the first stack
-  appearance batch. Do not use intensity 120; that Nyx spot-light scale washed out the
-  scene.
+- Stack appearance randomization: use the dim ceiling-panel recipe (grifflee reviewed
+  per-change panels on 2026-07-07), not the earlier over-bright smoke. Pass
+  `--env.nyx-light-type ceiling_panel`, `--env.nyx-light-intensity 6`, and
+  `--env.nyx-light-intensity-jitter 0.25`; the ceiling light samples x/y on the
+  overhead panel plane and aims down at the table. Pair it with
+  `--env.robot-roughness-jitter 0.35`, `--env.cube-hue-jitter-deg 4`,
+  `--env.cube-value-jitter 0.2`, and `--env.stack.free-placement`. Hue jitter must
+  stay at 4: at -5 deg and below the red cube reads pink (grifflee rejected that).
+  Do not use intensity 120; that Nyx spot-light scale washed out the scene.
+- Free-placement visibility guarantee: both cubes must be visible to BOTH static
+  cams at spawn under the production 15/5 camera jitter. `_sample_free_stack_xy`
+  enforces it (side-cam keep-out wedge x<0.38 & y<-0.10, y ceiling 0.14) — derived
+  from a 7x7 render audit on 2026-07-07. Don't widen the free ranges or drop the
+  wedge rejection without re-running that audit.
+- `batch_v1_33300` (stack_ceiling_appearance_dim_batch_v1_33300) is TAINTED: its
+  appearance seed equaled the reset seed, so lighting correlates with cube placement
+  (r=0.85). Regenerate; don't train on it.
 - `--env.table-transparent`: hides the visual table slab but keeps table collision.
   Debugging only.
 - `--env.table-mode plane`: the CLI exposes it, but section 1 prohibits it for this
