@@ -85,7 +85,10 @@ def _appearance_randomization_enabled(env_cfg: LiftEnvCfg) -> bool:
 
 
 def _env_cfg_for_episode(env_cfg: LiftEnvCfg, episode_seed: int) -> LiftEnvCfg:
-    return replace(env_cfg, appearance_seed=episode_seed)
+    # decorrelate from the reset() stream: default_rng(seed) and default_rng(seed)
+    # emit identical uniforms, so seeding appearance with the bare episode seed made
+    # light intensity track cube placement (r=0.85 in batch 33300)
+    return replace(env_cfg, appearance_seed=episode_seed * 9973 + 3)
 
 
 def _config_to_jsonable(obj):
