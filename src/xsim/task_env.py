@@ -420,6 +420,9 @@ class TaskEnvCfg:
     # fingers regardless of squeeze force; weld-free eval needs it on (measured in
     # scripts/test_friction_grasp.py)
     noslip_iterations: int = 0
+    # None preserves Genesis' default robot collision import. Set to 0.0 to force
+    # convex decomposition of robot meshes instead of coarse per-mesh hulls.
+    robot_decompose_robot_error_threshold: float | None = None
     rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
@@ -481,7 +484,11 @@ class TaskEnvCfg:
 class TaskEnv:
     def __init__(self, cfg: TaskEnvCfg | None = None, robot_cfg: dict | None = None, cameras=DEFAULT_CAMERAS):
         self.cfg = cfg or TaskEnvCfg()
-        self.robot_cfg = robot_cfg or XARM7_ROBOT_CFG
+        self.robot_cfg = dict(robot_cfg or XARM7_ROBOT_CFG)
+        if self.cfg.robot_decompose_robot_error_threshold is not None:
+            self.robot_cfg["decompose_robot_error_threshold"] = (
+                self.cfg.robot_decompose_robot_error_threshold
+            )
         self.camera_views = list(cameras)
         self.device = gs.device
         self.res = self.cfg.res

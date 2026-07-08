@@ -578,13 +578,16 @@ class Manipulator:
         robot_pos = tuple(args.get("robot_pos", (0.0, 0.0, 0.0)))
         robot_quat = tuple(args.get("robot_quat", (1.0, 0.0, 0.0, 0.0)))
         if args.get("robot_morph", "mjcf") == "urdf":
-            morph = gs.morphs.URDF(
-                file=robot_file,
-                pos=robot_pos,
-                quat=robot_quat,
-                fixed=args.get("robot_fixed", True),
-                merge_fixed_links=args.get("merge_fixed_links", True),
-            )
+            urdf_kwargs = {
+                "file": robot_file,
+                "pos": robot_pos,
+                "quat": robot_quat,
+                "fixed": args.get("robot_fixed", True),
+                "merge_fixed_links": args.get("merge_fixed_links", True),
+            }
+            if "decompose_robot_error_threshold" in args:
+                urdf_kwargs["decompose_robot_error_threshold"] = args["decompose_robot_error_threshold"]
+            morph = gs.morphs.URDF(**urdf_kwargs)
         else:
             morph = gs.morphs.MJCF(
                 file=robot_file,

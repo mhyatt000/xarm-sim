@@ -56,6 +56,9 @@ class Config:
     video_dir: Path = PROJECT_ROOT / "outputs" / "friction_grasp"
     video_fps: float = 30.0
     video_every_steps: int = 4  # 4 = normal 30 Hz capture; 1 = 120 Hz slow-motion at 30 fps
+    pre_lift_hold_s: float = 0.0  # diagnostic: hold closed before lifting so contacts can settle
+    lift_slowdown: float = 1.0  # diagnostic: multiply only the lift segment duration
+    ramp_close: bool = False  # diagnostic: ramp finger target across the close segment
     carry_hold_s: float = 0.0   # diagnostic: hold the grasp before release so slip is visible
     # slip gate: cube motion relative to the TCP during the carry (post-settle to release)
     slip_settle_steps: int = 12   # 0.1 s after the close completes before the reference pose
@@ -115,25 +118,60 @@ def _write_video_frame(env: TaskEnv, cfg: Config, video_writer, step_idx: int,
     video_writer.write(cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
 
 
+def _go_to_goal_with_finger(env: TaskEnv, goal_pose: torch.Tensor, finger_dof: float) -> None:
+    robot = env.robot
+    init_qpos = None
+    if robot._args.get("ik_init_at_home", False):
+        init_qpos = robot._init_qpos.unsqueeze(0).expand(goal_pose.shape[0], -1)
+    q_pos = robot._robot_entity.inverse_kinematics(
+        link=robot._ee_link,
+        pos=goal_pose[:, :3],
+        quat=goal_pose[:, 3:7],
+        init_qpos=init_qpos,
+        max_samples=robot._args.get("ik_max_samples", 50),
+        max_solver_iters=robot._args.get("ik_max_solver_iters", 20),
+        damping=robot._args.get("ik_damping", 0.01),
+        dofs_idx_local=robot._arm_dof_idx,
+    )
+    q_pos[:, robot._fingers_dof] = float(finger_dof)
+    robot._robot_entity.control_dofs_position(position=q_pos)
+
+
 def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_writer=None) -> dict:
     """One weld-free scripted lift episode; returns _episode_result stats + slip metrics."""
     env.reset(seed=seed)
     policy = _make_policy(env, gen_cfg)
+    if cfg.lift_slowdown != 1.0 and hasattr(policy, "segment_weights"):
+        weights = list(policy.segment_weights)
+        if len(weights) >= 4:
+            weights[3] = weights[3] * max(0.1, float(cfg.lift_slowdown))
+            policy.segment_weights = tuple(weights)
     policy.reset()
     cube_start = env.cube_pos().copy()
     max_rise = 0.0
-    slip_start = policy.grasp_lock_step + cfg.slip_settle_steps
+    pre_lift_hold_steps = max(0, int(round(cfg.pre_lift_hold_s / env.cfg.physics_dt)))
+
+    def shifted(policy_step: int) -> int:
+        if policy_step >= policy.grasp_lock_step:
+            return policy_step + pre_lift_hold_steps
+        return policy_step
+
+    slip_start = shifted(policy.grasp_lock_step) + cfg.slip_settle_steps
     # carry-phase boundaries for the slip timeline: end of lift, transport, settle
     seg = policy._segment_steps
-    boundaries = {"lift_end": 1 + sum(seg[:4]), "transport_end": 1 + sum(seg[:5]),
-                  "pre_release": policy.release_step - 1}
+    boundaries = {'lift_end': shifted(1 + sum(seg[:4])),
+                  'transport_end': shifted(1 + sum(seg[:5])),
+                  'pre_release': shifted(policy.release_step) - 1}
     slip_timeline: dict[str, float] = {}
     close_start = 1 + sum(seg[:2])
     close_end = policy.grasp_lock_step
-    early_lift_end = min(policy.release_step - 1, close_end + 20)
+    early_lift_start = shifted(policy.grasp_lock_step)
+    early_lift_end = min(shifted(policy.release_step) - 1, early_lift_start + 20)
     last_cube_pos = cube_start.copy()
     close_max_step_mm = 0.0
     close_max_step = -1
+    pre_lift_hold_max_step_mm = 0.0
+    pre_lift_hold_max_step = -1
     early_lift_max_step_mm = 0.0
     early_lift_max_step = -1
     rel0 = None
@@ -166,18 +204,39 @@ def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_wr
 
     def track_grab_motion(step_idx: int) -> None:
         nonlocal last_cube_pos, close_max_step_mm, close_max_step
+        nonlocal pre_lift_hold_max_step_mm, pre_lift_hold_max_step
         nonlocal early_lift_max_step_mm, early_lift_max_step
         cube = env.cube_pos().copy()
         d_mm = float(np.linalg.norm(cube - last_cube_pos)) * 1000.0
         if close_start <= step_idx <= close_end and d_mm > close_max_step_mm:
             close_max_step_mm = d_mm
             close_max_step = step_idx
-        if close_end < step_idx <= early_lift_end and d_mm > early_lift_max_step_mm:
+        if close_end < step_idx <= early_lift_start and d_mm > pre_lift_hold_max_step_mm:
+            pre_lift_hold_max_step_mm = d_mm
+            pre_lift_hold_max_step = step_idx
+        if early_lift_start < step_idx <= early_lift_end and d_mm > early_lift_max_step_mm:
             early_lift_max_step_mm = d_mm
             early_lift_max_step = step_idx
         last_cube_pos = cube
 
+    def close_target_for_step(policy_step: int) -> float | None:
+        if not cfg.ramp_close or not (close_start <= policy_step <= close_end):
+            return None
+        denom = max(1, close_end - close_start)
+        alpha = min(1.0, max(0.0, (policy_step - close_start) / denom))
+        robot = env.robot
+        return float(robot._gripper_open_dof + alpha * (robot._gripper_grasp_dof - robot._gripper_open_dof))
+
+    def drive_cmd(policy_step: int, cmd) -> None:
+        finger_dof = close_target_for_step(policy_step)
+        if finger_dof is None:
+            env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+        else:
+            _go_to_goal_with_finger(env, cmd.pose, finger_dof)
+
     def phase_for_step(step_idx: int) -> str:
+        if pre_lift_hold_steps and close_end < step_idx <= early_lift_start:
+            return 'pre_lift_hold'
         if step_idx < slip_start:
             return "approach/close"
         if step_idx < boundaries["lift_end"]:
@@ -192,20 +251,33 @@ def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_wr
 
     with torch.no_grad():
         last_closed_cmd = None
-        for step_idx in range(policy.release_step):
+        actual_step = 0
+        for policy_step in range(policy.release_step):
+            if policy_step == policy.grasp_lock_step and pre_lift_hold_steps and last_closed_cmd is not None:
+                for _ in range(pre_lift_hold_steps):
+                    env.robot.go_to_goal(last_closed_cmd.pose, open_gripper=False)
+                    env.step()
+                    max_rise = max(max_rise, float(env.cube_pos()[2] - cube_start[2]))
+                    track_grab_motion(actual_step)
+                    track_slip(actual_step)
+                    _write_video_frame(env, cfg, video_writer, actual_step,
+                                       phase_for_step(actual_step), slip_mm, slip_deg)
+                    actual_step += 1
             cmd = policy.step()
             last_closed_cmd = cmd
             # no grasp_lock()/grasp_release(): friction only
-            env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+            drive_cmd(policy_step, cmd)
             env.step()
             max_rise = max(max_rise, float(env.cube_pos()[2] - cube_start[2]))
-            track_grab_motion(step_idx)
-            track_slip(step_idx)
-            _write_video_frame(env, cfg, video_writer, step_idx, phase_for_step(step_idx), slip_mm, slip_deg)
+            track_grab_motion(actual_step)
+            track_slip(actual_step)
+            _write_video_frame(env, cfg, video_writer, actual_step,
+                               phase_for_step(actual_step), slip_mm, slip_deg)
+            actual_step += 1
 
         if carry_hold_steps and last_closed_cmd is not None:
             for hold_i in range(carry_hold_steps):
-                step_idx = policy.release_step + hold_i
+                step_idx = actual_step + hold_i
                 env.robot.go_to_goal(last_closed_cmd.pose, open_gripper=False)
                 env.step()
                 max_rise = max(max_rise, float(env.cube_pos()[2] - cube_start[2]))
@@ -216,7 +288,7 @@ def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_wr
                 _write_video_frame(env, cfg, video_writer, step_idx, phase_for_step(step_idx), slip_mm, slip_deg)
 
         for tail_i in range(release_tail):
-            step_idx = policy.release_step + carry_hold_steps + tail_i
+            step_idx = actual_step + carry_hold_steps + tail_i
             cmd = policy.step()
             env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
             env.step()
@@ -236,6 +308,12 @@ def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_wr
     res["slip_timeline"] = {k: round(v, 2) for k, v in slip_timeline.items()}
     res["close_max_step_mm"] = close_max_step_mm
     res["close_max_step"] = close_max_step
+    res['pre_lift_hold_s'] = cfg.pre_lift_hold_s
+    res['pre_lift_hold_steps'] = pre_lift_hold_steps
+    res['pre_lift_hold_max_step_mm'] = pre_lift_hold_max_step_mm
+    res['pre_lift_hold_max_step'] = pre_lift_hold_max_step
+    res["lift_slowdown"] = cfg.lift_slowdown
+    res["ramp_close"] = cfg.ramp_close
     res["early_lift_max_step_mm"] = early_lift_max_step_mm
     res["early_lift_max_step"] = early_lift_max_step
     res["slip_pass"] = slip_mm <= cfg.slip_mm_tol and slip_deg <= cfg.slip_deg_tol
@@ -279,6 +357,9 @@ def main(cfg: Config) -> None:
                   f"pass={res['pass']} max_rise={res['max_rise']:.3f} "
                   f"deliver_dist={res['deliver_dist']:.3f} "
                   f"close_step_mm={res['close_max_step_mm']:.2f}@{res['close_max_step']} "
+                  f"pre_lift_hold_step_mm={res['pre_lift_hold_max_step_mm']:.2f}@{res['pre_lift_hold_max_step']} "
+                  f"lift_slowdown={res['lift_slowdown']:.2f} "
+                  f"ramp_close={res['ramp_close']} "
                   f"early_lift_step_mm={res['early_lift_max_step_mm']:.2f}@{res['early_lift_max_step']} "
                   f"slip@step={res['slip_step']} vec={res['slip_vec_mm']} "
                   f"timeline={res['slip_timeline']}")
