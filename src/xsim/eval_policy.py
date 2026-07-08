@@ -47,48 +47,83 @@ class EvalPolicy(Protocol):
         """True once the policy's trajectory has ended (remote policies are never done)."""
 
 
-# The set of proprio channels ObsSpec knows how to assemble. "ee_pose_mm" scales only the
-# position (x,y,z) by 1000; the quaternion is left untouched — this matches the real
-# /xarm/robot_states TCP pose, which is reported in millimeters.
-_PROPRIO_PARTS = (
-    "joint_pos", "joint_vel", "joint_eff", "ee_pos", "ee_pose", "ee_pose_mm", "gripper_norm"
-)
 # CrossFormer xflow DOF ids: j0..j6 + gripper. See grifflee/crossformer:crossformer/embody.py.
 _DEFAULT_DOF_IDS = (1, 2, 3, 4, 5, 6, 7, 8)
 _DEFAULT_CHUNK_STEPS = tuple(float(i) for i in range(20))
 
+# The "single" embodiment's 140-slot state layout, extracted from
+# Embodiment.REGISTRY["single"] (grifflee/crossformer dev, crossformer/embody.py):
+# slots 0-6 arm joints (ids 1-7), 7 gripper (8), 8-10 cart_pos (9-11), 11-13 cart_ori
+# (12-14), then kp3dc x3 views (ids 258-299, view 1/2/3). MASK_ID=0 pads nothing here.
+# XStateEncoder consumes ONLY observation.state.{base,id,view}+mask.state.base — the
+# proprio_* keys are pipeline raw material the model never sees, so the client must pack
+# (and normalize) this block itself; kp3dc slots are sent masked-out (no FK keypoints).
+_STATE_SLOTS = 140
+_STATE_IDS = tuple(range(1, 15)) + tuple(range(258, 300)) * 3
+_STATE_VIEWS = (0,) * 14 + (1,) * 42 + (2,) * 42 + (3,) * 42
+_STATE_PART_SLOTS = {"joints": (0, 7), "gripper": (7, 8), "position": (8, 11), "orientation": (11, 14)}
+
 
 @dataclass
 class ObsSpec:
-    """Configurable mapping from the sim observation to CrossFormer's webpolicy payload.
+    """Maps the sim observation to the 0707 xarm_sim checkpoint's wire format.
 
-    Defaults match ``grifflee/crossformer`` for xgym lift/stack inference:
-    ``{"observation": {"image_primary", "image_side", "image_left_wrist", "proprio_single"},
-    "dof_ids", "chunk_steps"}``. The proprio vector follows the dataset standardization
-    order: TCP xyz in metres, seven arm joints, then gripper norm.
+    Contract (docs/INFERENCE_CONTRACT.md, verified against the checkpoint's
+    example_batch.msgpack and grifflee/crossformer dev):
+
+    - ``image``: uint8 (1, 1, V, 64, 64, 3), views stacked in sorted-image-topic order
+      ``[low, side, wrist]``; resized client-side because the v1 server only auto-resizes
+      per-view ``image_*`` keys, not the stacked key.
+    - ``proprio_joints`` (1,1,7) rad, ``proprio_gripper`` (1,1,1) norm 1=open,
+      ``proprio_position`` (1,1,3) TCP metres, ``proprio_orientation`` (1,1,3) scipy
+      euler "xyz" of the TCP quat — the server normalizes these with the dataset stats.
+      kp3d keypoint parts are omitted (server zero-fills; encoder trained with input drop).
+    - ``view_mask`` (1,1,V) all-True.
+    - payload wraps obs under "observation" and adds ``dof_ids``/``chunk_steps``
+      (PerceiverIOHead is an XFlowHead: raw-dof-space actions in the requested slots).
     """
 
-    image_keys: dict = field(
+    image_key: str = "image"
+    view_order: tuple[str, ...] = ("low", "side", "wrist")
+    image_hw: tuple[int, int] = (64, 64)
+    include_view_mask: bool = True
+    proprio_keys: dict = field(
         default_factory=lambda: {
-            "low": "image_primary",
-            "side": "image_side",
-            "wrist": "image_left_wrist",
+            "joints": "proprio_joints",
+            "gripper": "proprio_gripper",
+            "position": "proprio_position",
+            "orientation": "proprio_orientation",
         }
     )
-    proprio_key: str = "proprio_single"
-    proprio_parts: tuple[str, ...] = ("ee_pos", "joint_pos", "gripper_norm")
     payload_key: str | None = "observation"
     include_xflow_control: bool = True
     dof_ids: tuple[int, ...] = _DEFAULT_DOF_IDS
     chunk_steps: tuple[float, ...] = _DEFAULT_CHUNK_STEPS
+    # dataset_statistics.json path; when set, a normalized state/{base,id,view} block is
+    # packed client-side (training normalizes proprio BEFORE embody_transform packs it)
+    state_stats: str | None = None
+    state_dataset: str = "xarm_sim"
 
     def build(self, env) -> dict:
         """Render cameras and assemble a CrossFormer webpolicy payload."""
+        import cv2  # deferred: keeps module import light
+
         frames = env.render()
-        obs: dict = {}
-        for cam_name, obs_key in self.image_keys.items():
-            obs[obs_key] = np.ascontiguousarray(frames[cam_name]).astype(np.uint8)
-        obs[self.proprio_key] = self._proprio_vector(env)
+        h, w = self.image_hw
+        views = [
+            cv2.resize(np.ascontiguousarray(frames[name]), (w, h), interpolation=cv2.INTER_AREA)
+            for name in self.view_order
+        ]
+        obs: dict = {
+            # (V,H,W,3) -> (1,1,V,H,W,3): batch and window dims the model expects
+            self.image_key: np.stack(views).astype(np.uint8)[None, None],
+        }
+        if self.include_view_mask:
+            obs["view_mask"] = np.ones((1, 1, len(views)), dtype=bool)
+        for part, key in self.proprio_keys.items():
+            obs[key] = self._proprio_part(env, part)[None, None].astype(np.float32)
+        if self.state_stats is not None:
+            obs["state"], obs["mask"] = self._state_block(env)
 
         payload = obs if self.payload_key is None else {self.payload_key: obs}
         if self.include_xflow_control:
@@ -96,36 +131,63 @@ class ObsSpec:
             payload["chunk_steps"] = np.asarray(self.chunk_steps, dtype=np.float32)
         return payload
 
-    def _proprio_vector(self, env) -> np.ndarray:
-        joint_pos, joint_vel, joint_eff, ee_pose = env.proprio()
-        pieces = []
-        for part in self.proprio_parts:
-            if part == "joint_pos":
-                pieces.append(np.asarray(joint_pos, dtype=np.float64).reshape(-1))
-            elif part == "joint_vel":
-                pieces.append(np.asarray(joint_vel, dtype=np.float64).reshape(-1))
-            elif part == "joint_eff":
-                pieces.append(np.asarray(joint_eff, dtype=np.float64).reshape(-1))
-            elif part == "ee_pos":
-                pieces.append(np.asarray(ee_pose, dtype=np.float64).reshape(-1)[:3])
-            elif part == "ee_pose":
-                pieces.append(np.asarray(ee_pose, dtype=np.float64).reshape(-1))
-            elif part == "ee_pose_mm":
-                ee = np.asarray(ee_pose, dtype=np.float64).reshape(-1).copy()
-                ee[:3] *= 1000.0  # position m -> mm; quat untouched
-                pieces.append(ee)
-            elif part == "gripper_norm":
-                pieces.append(np.asarray([env.gripper_norm()], dtype=np.float64))
-            else:
-                raise ValueError(f"unknown proprio part {part!r}; supported: {_PROPRIO_PARTS}")
-        return np.concatenate(pieces).astype(np.float32)
+    def _state_block(self, env) -> tuple[dict, dict]:
+        """Pack the normalized 140-slot state the XStateEncoder consumes."""
+        if not hasattr(self, "_state_norm"):
+            import json
+
+            stats = json.load(open(self.state_stats))[self.state_dataset]["proprio"]
+            self._state_norm = {
+                part: (np.asarray(stats[part]["mean"]).reshape(-1),
+                       np.asarray(stats[part]["std"]).reshape(-1))
+                for part in _STATE_PART_SLOTS
+            }
+        base = np.zeros(_STATE_SLOTS, dtype=np.float32)
+        mask = np.zeros(_STATE_SLOTS, dtype=bool)
+        for part, (lo, hi) in _STATE_PART_SLOTS.items():
+            mean, std = self._state_norm[part]
+            raw = self._proprio_part(env, part)
+            base[lo:hi] = (raw - mean) / std
+            mask[lo:hi] = True
+        state = {
+            "base": base[None, None],
+            "id": np.asarray(_STATE_IDS, dtype=np.int32)[None, None],
+            "view": np.asarray(_STATE_VIEWS, dtype=np.int32)[None, None],
+        }
+        return state, {"state": {"base": mask[None, None]}}
+
+    def _proprio_part(self, env, part: str) -> np.ndarray:
+        joint_pos, _joint_vel, _joint_eff, ee_pose = env.proprio()
+        ee = np.asarray(ee_pose, dtype=np.float64).reshape(-1)
+        if part == "joints":
+            return np.asarray(joint_pos, dtype=np.float64).reshape(-1)
+        if part == "gripper":
+            return np.asarray([env.gripper_norm()], dtype=np.float64)
+        if part == "position":
+            return ee[:3]  # metres (the dataset builder converts the MCAP mm; sim is native m)
+        if part == "orientation":
+            from scipy.spatial.transform import Rotation
+
+            w, x, y, z = ee[3:7]  # sim proprio quat is wxyz; scipy wants xyzw
+            return Rotation.from_quat([x, y, z, w]).as_euler("xyz")
+        raise ValueError(f"unknown proprio part {part!r}")
 
 
 @dataclass
 class ActionSpec:
-    """How to interpret the action the server returns and apply it to the env."""
+    """How to interpret the action the server returns and apply it to the env.
+
+    ``denorm_stats``: the 0707 checkpoint's flow head predicts in NORMALIZED action space
+    (the v1 server's "xflow is raw dof space" assumption does not hold — verified
+    empirically 2026-07-08: raw j6 ≈ 0.7 vs actual 1.6 rad; denormalized targets are
+    coherent). Point this at the checkpoint's ``dataset_statistics.json`` to apply
+    ``a*std + mean`` per channel where the stats' ``mask`` is True (joints AND gripper for
+    xarm_sim). None disables denormalization.
+    """
 
     mode: Literal["ee_abs", "ee_delta", "joint_abs"] = "joint_abs"
+    denorm_stats: str | None = None
+    denorm_dataset: str = "xarm_sim"
     # key into the returned dict holding the action array/dict; None means the return IS it
     key: str | None = "actions"
     fallback_keys: tuple[str, ...] = (
@@ -142,6 +204,23 @@ class ActionSpec:
     gripper_key: str | None = None
     gripper_open_threshold: float = 0.5  # gripper norm > threshold -> open (1=open)
     close_setpoint: float | None = None  # finger dof when closed; None -> robot's grasp dof
+
+    def denorm_joint_action(self, vec8: np.ndarray) -> np.ndarray:
+        """Denormalize [j0..j6, gripper] per the dataset stats (no-op when unconfigured)."""
+        if self.denorm_stats is None:
+            return vec8
+        if not hasattr(self, "_denorm_cache"):
+            import json
+
+            stats = json.load(open(self.denorm_stats))[self.denorm_dataset]["action"]
+            mean = np.concatenate([stats["joints"]["mean"], stats["gripper"]["mean"]])
+            std = np.concatenate([stats["joints"]["std"], stats["gripper"]["std"]])
+            mask = np.concatenate([stats["joints"]["mask"], stats["gripper"]["mask"]])
+            self._denorm_cache = (mean, std, np.asarray(mask, dtype=bool))
+        mean, std, mask = self._denorm_cache
+        out = np.asarray(vec8, dtype=np.float64).copy()
+        out[mask] = out[mask] * std[mask] + mean[mask]
+        return out
 
 
 class RemotePolicy:
@@ -224,7 +303,7 @@ class RemotePolicy:
 
     def _action_vector(self, result) -> np.ndarray:
         if self.action_spec.mode == "joint_abs":
-            return self._joint_action_vector(result)
+            return self.action_spec.denorm_joint_action(self._joint_action_vector(result))
         return self._row_vector(self._action_payload(result))
 
     def _action_payload(self, result):

@@ -5,6 +5,9 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "xsim"
 
+[tool.uv.sources]
+webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
+
 [project]
 name = "xarm-sim"
 version = "0.1.0"
@@ -24,6 +27,7 @@ dependencies = [
     "tensordict>=0.13.0",
     "torch>=2.12.1",
     "tyro>=1.0.15",
+    "webpolicy",
     "zarr>=3.1.6",
 ]
 
