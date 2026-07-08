@@ -15,7 +15,6 @@ computed per episode; by default only successful episodes are kept.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import math
 import os
 from pathlib import Path
 import sys
@@ -58,10 +57,13 @@ import genesis as gs  # noqa: E402
 
 _mark("genesis_import")
 
-from xsim.task_env import BLOCK_SIZE, BaseDecorCfg, TaskEnv, TaskEnvCfg, StackCfg, TableCfg  # noqa: E402
+from xsim.task_env import BaseDecorCfg, TaskEnv, TaskEnvCfg, StackCfg, TableCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
 from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
 from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
+# success scoring lives in xsim.success so the eval harness shares one definition;
+# alias keeps the existing _episode_result call sites (and scripts importing it) working
+from xsim.success import episode_result as _episode_result  # noqa: E402
 
 
 @dataclass
@@ -314,42 +316,6 @@ def _run_appearance_subprocess_batch(cfg: Config) -> None:
     _write_manifest(cfg, None, ordered_stats, n_success)
     _cleanup_child_manifests(cfg)
     print(f"\nsuccess rate: {n_success}/{cfg.n_episodes}  -> {cfg.out_dir}")
-
-def _yaw_from_quat_wxyz(quat) -> float:
-    w, x, y, z = np.asarray(quat, dtype=np.float64).reshape(-1)[:4]
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-
-def _episode_result(env: TaskEnv, cfg: Config, max_rise: float) -> dict:
-    """Task-specific success stats, computed after the unrecorded settle."""
-    cube_end = env.cube_pos()
-    lifted = max_rise >= cfg.lift_threshold
-    if cfg.task == "stack":
-        green = env.green_pos()
-        stack_z = env.cfg.table.top_z + 1.5 * BLOCK_SIZE
-        xy_err = float(np.linalg.norm(cube_end[:2] - green[:2]))
-        z_err = float(cube_end[2] - stack_z)
-        # face alignment of the settled pair, wrapped to the cube's 90-degree symmetry
-        yaw_err = (_yaw_from_quat_wxyz(env.cube.get_quat().cpu())
-                   - _yaw_from_quat_wxyz(env.cube2.get_quat().cpu())) % (math.pi / 2.0)
-        if yaw_err >= math.pi / 4.0:
-            yaw_err -= math.pi / 2.0
-        stacked = xy_err <= cfg.stack_xy_tol and abs(z_err) <= cfg.stack_z_tol
-        return {
-            "max_rise": max_rise, "lifted": lifted, "stack_xy_err": xy_err,
-            "stack_z_err": z_err, "stack_yaw_err_deg": abs(math.degrees(yaw_err)),
-            "stacked": stacked, "success": lifted and stacked,
-            "green_pos": [float(v) for v in green],
-        }
-    drop = np.asarray(env.current_drop_xy)
-    deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
-    delivered = deliver_dist <= cfg.deliver_radius and float(cube_end[2]) < 0.05
-    return {
-        "max_rise": max_rise, "lifted": lifted, "deliver_dist": deliver_dist,
-        "delivered": delivered, "success": lifted and delivered,
-        "drop_target": [float(drop[0]), float(drop[1])],
-    }
-
 
 def _spec_dict(env: TaskEnv) -> dict[str, CameraSpec]:
     specs = {}

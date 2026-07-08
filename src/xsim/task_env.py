@@ -415,6 +415,11 @@ class TaskEnvCfg:
     fov_deg: float = 42.0                 # fallback vertical FOV → intrinsics
     physics_dt: float = 1.0 / 120.0       # stable sim step; ×record_every → 30 Hz like real
     record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
+    # noslip post-pass (MuJoCo-style): 0 = off, matching all approved training batches.
+    # Without it the friction-cone regularization lets a held cube creep ~1 mm/s down the
+    # fingers regardless of squeeze force; weld-free eval needs it on (measured in
+    # scripts/test_friction_grasp.py)
+    noslip_iterations: int = 0
     rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
     rectangle_y: tuple[float, float] = (-0.15, 0.15)
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
@@ -490,6 +495,7 @@ class TaskEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
+                noslip_iterations=self.cfg.noslip_iterations,
             ),
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
             show_viewer=self.cfg.show_viewer,
