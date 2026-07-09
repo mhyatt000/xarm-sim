@@ -77,6 +77,12 @@ class Config:
     resume: bool = True
     cube_yaw: float = 0.0             # deterministic cube (and green) yaw at spawn
     video_every: int = 0              # save an mp4 of every Nth trial (0 = off, 1 = all)
+    # warm start: drive the TCP to a hover above the cube BEFORE the policy takes over,
+    # commanding arm joints only (the fingers keep reset's command; the policy owns the
+    # gripper). Separates "can't find the cube" from "can't execute the grasp".
+    warm_start: bool = False
+    warm_start_height: float = 0.09   # hover height above the cube center (m)
+    warm_start_steps: int = 240       # physics steps to settle before handing over (2 s)
     # success thresholds -> duck-typed into xsim.success.episode_result
     lift_threshold: float = 0.05      # min cube rise (m) for a lift
     deliver_radius: float = 0.12      # max xy dist (m) from the drop target for a delivery
@@ -181,6 +187,40 @@ def _pin_spawn(env: TaskEnv, cfg: Config, gp: GridPoint) -> None:
         env.cfg.rectangle_y = (y, y)
 
 
+def _capture_frame(env: TaskEnv, video_frames: list[np.ndarray]) -> None:
+    frames = env.render()
+    video_frames.append(np.concatenate(
+        [np.ascontiguousarray(frames[k]) for k in ("low", "side", "wrist")], axis=1))
+
+
+def _warm_start(env: TaskEnv, cfg: Config, video_frames: list[np.ndarray] | None) -> None:
+    """Drive the TCP to a top-down hover above the cube, arm joints only.
+
+    One IK solve, then position control on the arm dofs alone — the finger dofs are
+    deliberately never commanded here, so the policy inherits the gripper exactly as
+    ``env.reset()`` left it.
+    """
+    from xsim.scripted_lift_policy import _yawed_top_down_quat
+
+    robot = env.robot
+    cube = env.cube_pos()
+    pose = torch.as_tensor(
+        [[float(cube[0]), float(cube[1]), float(cube[2]) + cfg.warm_start_height,
+          *_yawed_top_down_quat(0.0)]],
+        dtype=torch.float32, device=env.device,
+    )
+    q = robot._robot_entity.inverse_kinematics(
+        link=robot._ee_link, pos=pose[:, :3], quat=pose[:, 3:7],
+        dofs_idx_local=robot._arm_dof_idx,
+    )
+    robot._robot_entity.control_dofs_position(
+        position=q[:, robot._arm_dof_idx], dofs_idx_local=robot._arm_dof_idx)
+    for step in range(cfg.warm_start_steps):
+        if video_frames is not None and step % env.cfg.record_every == 0:
+            _capture_frame(env, video_frames)
+        env.step()
+
+
 def _write_video(path: Path, frames: list[np.ndarray], fps: float) -> None:
     import cv2
 
@@ -211,6 +251,10 @@ def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint,
     else:
         env.current_drop_xy = (0.35, 0.0)  # pin the lift drop target for consistent scoring
 
+    video_frames: list[np.ndarray] = []
+    if cfg.warm_start:
+        _warm_start(env, cfg, video_frames if video_path is not None else None)
+
     policy.reset()  # after cube placement (ScriptedEvalPolicy caches the cube pose here)
 
     start_z = float(env.cube_pos()[2])
@@ -219,15 +263,12 @@ def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint,
     min_tcp_cube = float("inf")
     max_steps = int(cfg.max_seconds / env.cfg.physics_dt)
     n_steps = 0
-    video_frames: list[np.ndarray] = []
     with torch.no_grad():
         for step in range(max_steps):
             if step % policy.control_every == 0 and not policy.done:
                 policy.act(env)
             if video_path is not None and step % env.cfg.record_every == 0:
-                frames = env.render()
-                video_frames.append(np.concatenate(
-                    [np.ascontiguousarray(frames[k]) for k in ("low", "side", "wrist")], axis=1))
+                _capture_frame(env, video_frames)
             env.step()
             cube = env.cube_pos()
             max_rise = max(max_rise, float(cube[2] - start_z))
