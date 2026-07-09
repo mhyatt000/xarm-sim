@@ -14,9 +14,10 @@ validation baseline). Both are driven through the uniform adapters in ``xsim.eva
     # scripted baseline smoke test (fast raster backend, tiny grid):
     uv run python scripts/eval_grid.py --task lift --policy scripted \
         --env.render-backend raster --grid-nx 3 --grid-ny 3 --reps 1 --backend gpu
-    # real eval of a served model over the grid on the nyx domain:
+    # real eval of a served model (grainlike/bela serving stack) on the nyx domain;
+    # obs/action defaults match that server so no extra flags are needed:
     uv run python scripts/eval_grid.py --task lift --policy remote --host localhost \
-        --port 8000 --env.render-backend nyx --backend gpu
+        --port 8001 --env.render-backend nyx --backend gpu --video-every 10
 
 Grasping runs weld-free and requires the noslip post-pass (``--env.noslip-iterations``,
 defaulted to 10 here) or the cube creeps down the fingers; the closed-finger setpoint
@@ -64,7 +65,7 @@ class Config:
     task: Literal["lift", "stack"] = "lift"
     policy: Literal["remote", "scripted"] = "scripted"  # scripted = validation/baseline
     host: str = "localhost"
-    port: int = 8000
+    port: int = 8001
     grid_nx: int = 10
     grid_ny: int = 10
     reps: int = 10
@@ -75,6 +76,7 @@ class Config:
     close_setpoint: float = 0.58      # closed-finger dof (training value)
     resume: bool = True
     cube_yaw: float = 0.0             # deterministic cube (and green) yaw at spawn
+    video_every: int = 0              # save an mp4 of every Nth trial (0 = off, 1 = all)
     # success thresholds -> duck-typed into xsim.success.episode_result
     lift_threshold: float = 0.05      # min cube rise (m) for a lift
     deliver_radius: float = 0.12      # max xy dist (m) from the drop target for a delivery
@@ -179,7 +181,19 @@ def _pin_spawn(env: TaskEnv, cfg: Config, gp: GridPoint) -> None:
         env.cfg.rectangle_y = (y, y)
 
 
-def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint) -> dict:
+def _write_video(path: Path, frames: list[np.ndarray], fps: float) -> None:
+    import cv2
+
+    h, w = frames[0].shape[:2]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    for frame in frames:
+        writer.write(frame[:, :, ::-1])  # RGB -> BGR
+    writer.release()
+
+
+def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint,
+              video_path: Path | None = None) -> dict:
     """Run one (rep, grid point) trial weld-free and score it."""
     x, y = gp.cube_xy
     seed = cfg.seed + rep * 10007 + gp.grid_idx
@@ -202,17 +216,28 @@ def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint) -> dic
     start_z = float(env.cube_pos()[2])
     table_top = env.cfg.table.top_z
     max_rise = 0.0
+    min_tcp_cube = float("inf")
     max_steps = int(cfg.max_seconds / env.cfg.physics_dt)
     n_steps = 0
+    video_frames: list[np.ndarray] = []
     with torch.no_grad():
         for step in range(max_steps):
             if step % policy.control_every == 0 and not policy.done:
                 policy.act(env)
+            if video_path is not None and step % env.cfg.record_every == 0:
+                frames = env.render()
+                video_frames.append(np.concatenate(
+                    [np.ascontiguousarray(frames[k]) for k in ("low", "side", "wrist")], axis=1))
             env.step()
             cube = env.cube_pos()
             max_rise = max(max_rise, float(cube[2] - start_z))
             n_steps = step + 1
             if step % 30 == 0:
+                # objective approach metric: how close the TCP ever got to the cube
+                _, _, _, ee_pose = env.proprio()
+                tcp = np.asarray(ee_pose, dtype=np.float64).reshape(-1)[:3]
+                d = float(np.linalg.norm(tcp - np.asarray(cube, dtype=np.float64)))
+                min_tcp_cube = min(min_tcp_cube, d)
                 fell = float(cube[2]) < table_top - 0.05
                 flew = float(math.hypot(cube[0], cube[1])) > 0.9
                 if fell or flew:
@@ -226,6 +251,9 @@ def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint) -> dic
         # unrecorded settle holding the last command (no further policy stepping)
         for _ in range(48):
             env.step()
+
+    if video_path is not None and video_frames:
+        _write_video(video_path, video_frames, fps=1.0 / (env.cfg.physics_dt * env.cfg.record_every))
 
     res = episode_result(env, cfg, max_rise)
     if not res["lifted"]:
@@ -245,6 +273,7 @@ def run_trial(env: TaskEnv, cfg: Config, policy, rep: int, gp: GridPoint) -> dic
         "seed": seed,
         "seed_components": {"base": cfg.seed, "rep_term": rep * 10007, "grid_idx": gp.grid_idx},
         "failure_stage": failure_stage,
+        "min_tcp_cube": (round(min_tcp_cube, 4) if math.isfinite(min_tcp_cube) else None),
         "n_steps": n_steps,
         "wall_s": round(time.monotonic() - t0, 3),
         "close_setpoint": cfg.close_setpoint,
@@ -543,7 +572,13 @@ def main(cfg: Config) -> None:
             for gp in points:
                 if (rep, gp.grid_idx) in done_pairs:
                     continue
-                rec = run_trial(env, cfg, policy, rep, gp)
+                ordinal = rep * len(points) + gp.grid_idx
+                video_path = (
+                    resolved_out / "videos" / f"rep{rep}_g{gp.grid_idx:03d}.mp4"
+                    if cfg.video_every > 0 and ordinal % cfg.video_every == 0
+                    else None
+                )
+                rec = run_trial(env, cfg, policy, rep, gp, video_path=video_path)
                 results_fh.write(json.dumps(rec) + "\n")
                 results_fh.flush()
                 records.append(rec)

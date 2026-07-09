@@ -66,23 +66,39 @@ _STATE_PART_SLOTS = {"joints": (0, 7), "gripper": (7, 8), "position": (8, 11), "
 
 @dataclass
 class ObsSpec:
-    """Maps the sim observation to the 0707 xarm_sim checkpoint's wire format.
+    """Maps the sim observation to a served crossformer's wire format.
 
-    Contract (docs/INFERENCE_CONTRACT.md, verified against the checkpoint's
-    example_batch.msgpack and grifflee/crossformer dev):
+    Two wire formats exist (docs/INFERENCE_CONTRACT.md):
 
-    - ``image``: uint8 (1, 1, V, 64, 64, 3), views stacked in sorted-image-topic order
-      ``[low, side, wrist]``; resized client-side because the v1 server only auto-resizes
-      per-view ``image_*`` keys, not the stacked key.
+    ``wire_format="grainlike"`` (default) — the ``scripts/serve/bela.py`` stack
+    (``ModelPolicy -> ActionDenormWrapper -> GrainlikeWrapper``, mhyatt000/crossformer dev).
+    The client sends a RAW arec-shaped sample and the server replays the exact training
+    transforms (proprio normalization, image resize, state-block packing) and returns
+    DENORMALIZED actions as named parts (``actions.joints`` etc.):
+
+    - ``observation.image``: uint8 (1, V, H, W, 3), native resolution (the server resizes
+      to the trained size with the training augmax chain — do not pre-resize), views in
+      sorted-image-topic order ``[low, side, wrist]``.
+    - ``observation.proprio.{joints,gripper,position,orientation}``: raw values with a
+      leading batch dim of 1; kp3d keypoint parts omitted (masked downstream).
+    - ``info.{step,episode}``: episode-relative step index for ``observation.timestep``.
+    - no ``dof_ids``/``chunk_steps`` (``ModelPolicy`` hardcodes the full query grid) and
+      no client-side normalization; leave ``ActionSpec.denorm_stats`` unset.
+
+    ``wire_format="v1"`` — the fork's ``scripts/server.py`` v1 path (verified 2026-07-08
+    against the checkpoint's example_batch.msgpack):
+
+    - ``image``: uint8 (1, 1, V, 64, 64, 3), stacked views resized client-side because the
+      v1 server only auto-resizes per-view ``image_*`` keys, not the stacked key.
     - ``proprio_joints`` (1,1,7) rad, ``proprio_gripper`` (1,1,1) norm 1=open,
       ``proprio_position`` (1,1,3) TCP metres, ``proprio_orientation`` (1,1,3) scipy
       euler "xyz" of the TCP quat — the server normalizes these with the dataset stats.
-      kp3d keypoint parts are omitted (server zero-fills; encoder trained with input drop).
-    - ``view_mask`` (1,1,V) all-True.
-    - payload wraps obs under "observation" and adds ``dof_ids``/``chunk_steps``
-      (PerceiverIOHead is an XFlowHead: raw-dof-space actions in the requested slots).
+    - ``view_mask`` (1,1,V) all-True; obs wrapped under "observation" plus
+      ``dof_ids``/``chunk_steps``; set ``state_stats`` (client-side state packing) and
+      ``ActionSpec.denorm_stats`` (the flow head predicts in normalized space).
     """
 
+    wire_format: Literal["grainlike", "v1"] = "grainlike"
     image_key: str = "image"
     view_order: tuple[str, ...] = ("low", "side", "wrist")
     image_hw: tuple[int, int] = (64, 64)
@@ -104,8 +120,31 @@ class ObsSpec:
     state_stats: str | None = None
     state_dataset: str = "xarm_sim"
 
-    def build(self, env) -> dict:
+    def build(self, env, step: int = 0) -> dict:
         """Render cameras and assemble a CrossFormer webpolicy payload."""
+        if self.wire_format == "grainlike":
+            return self._build_grainlike(env, step)
+        return self._build_v1(env)
+
+    def _build_grainlike(self, env, step: int) -> dict:
+        """Raw arec-shaped sample: the server replays the training transforms."""
+        frames = env.render()
+        views = [np.ascontiguousarray(frames[name]) for name in self.view_order]
+        return {
+            "observation": {
+                "image": np.stack(views).astype(np.uint8)[None],  # (1,V,H,W,3) native res
+                "proprio": {
+                    part: self._proprio_part(env, part).astype(np.float32)[None]
+                    for part in self.proprio_keys
+                },
+            },
+            "info": {
+                "step": np.asarray([step], dtype=np.int64),
+                "episode": np.asarray([0], dtype=np.int64),
+            },
+        }
+
+    def _build_v1(self, env) -> dict:
         import cv2  # deferred: keeps module import light
 
         frames = env.render()
@@ -177,12 +216,14 @@ class ObsSpec:
 class ActionSpec:
     """How to interpret the action the server returns and apply it to the env.
 
-    ``denorm_stats``: the 0707 checkpoint's flow head predicts in NORMALIZED action space
-    (the v1 server's "xflow is raw dof space" assumption does not hold — verified
-    empirically 2026-07-08: raw j6 ≈ 0.7 vs actual 1.6 rad; denormalized targets are
-    coherent). Point this at the checkpoint's ``dataset_statistics.json`` to apply
+    ``denorm_stats``: only for ``ObsSpec(wire_format="v1")`` servers — their flow head
+    predicts in NORMALIZED action space (verified empirically 2026-07-08: raw j6 ≈ 0.7 vs
+    actual 1.6 rad). Point it at the checkpoint's ``dataset_statistics.json`` to apply
     ``a*std + mean`` per channel where the stats' ``mask`` is True (joints AND gripper for
-    xarm_sim). None disables denormalization.
+    xarm_sim). Leave None (no-op) for grainlike servers: their ``ActionDenormWrapper``
+    already returns denormalized named parts (``actions.joints`` (1,1,H,7),
+    ``actions.gripper`` (1,1,H,1)), which the dict branch of ``_joint_action_vector``
+    consumes directly.
     """
 
     mode: Literal["ee_abs", "ee_delta", "joint_abs"] = "joint_abs"
@@ -259,10 +300,12 @@ class RemotePolicy:
         # at the 30 Hz training cadence (record_every=4 physics steps) rather than 120 Hz
         self.control_every = control_every
         self._setpoint_applied = False
+        self._t = 0  # episode-relative policy step, sent as info.step in grainlike payloads
 
     def reset(self) -> None:
         self._client.reset()
         self._setpoint_applied = False  # re-apply close_setpoint on the next act
+        self._t = 0
 
     def act(self, env) -> None:
         spec = self.action_spec
@@ -270,7 +313,8 @@ class RemotePolicy:
             env.robot._gripper_grasp_dof = spec.close_setpoint
             self._setpoint_applied = True
 
-        result = self._client.step(self.obs_spec.build(env))
+        result = self._client.step(self.obs_spec.build(env, self._t))
+        self._t += 1
         action = self._action_vector(result)
         is_open = self._gripper_open(result, action)
 

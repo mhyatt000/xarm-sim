@@ -5,6 +5,33 @@ Date: 2026-07-08. Findings from inspecting `/data/store/weights/0707_iconic-spac
 public `mhyatt000/crossformer` repo. Written for wiring `xsim.eval_policy.RemotePolicy`
 to a served model.
 
+## UPDATE (2026-07-09): the production serve is the GRAINLIKE path — new wire format
+
+mhyatt now serves the checkpoint with `scripts/serve/bela.py` (upstream dev a3d2956 +
+4bdd549): `ModelPolicy -> ActionDenormWrapper -> GrainlikeWrapper`, running on mayo
+(`localhost`, port passed daily — was 8001 on 2026-07-09; the viser viewer for watching
+inference live sits on :8080). Everything in the v1 sections below still applies ONLY to
+the fork's `scripts/server.py`. The grainlike contract, verified live against the running
+server:
+
+- The client sends a RAW arec-shaped sample (leading batch dim 1 on every leaf):
+  `observation.image` uint8 (1, V, H, W, 3) at **native res** (server resizes to the
+  trained 64px with the training augmax chain — do not pre-resize), views in
+  sorted-image-topic order [low, side, wrist]; `observation.proprio.{joints,gripper,
+  position,orientation}` raw/unnormalized; `info.{step,episode}`. No dof_ids/chunk_steps
+  (`ModelPolicy` hardcodes the full 140-dof x 50-step query grid), no kp3d keys (the
+  wrapper warns and masks them downstream), no client-side normalization or state packing
+  — the server replays the exact training transforms.
+- The response is DENORMALIZED named parts: `actions.joints` (1,1,50,7) radians,
+  `actions.gripper` (1,1,50,1) 1=open, `actions.kp3dc_robot`, plus info/act echo keys.
+  `ActionSpec.denorm_stats` must stay None.
+- `xsim.eval_policy.ObsSpec(wire_format="grainlike")` is this format and is now the
+  default; `wire_format="v1"` keeps the old behavior.
+- Live probe 2026-07-09 (scratch, dataset-mean pose + saved debug frames): repeated obs
+  -> |dA| max 0.012 (flow sampling noise); strongly perturbed obs -> |dA| max 0.28 rad.
+  The served stack is obs-sensitive at the wire level; note yesterday's "collapse" verdict
+  was measured through OUR v1 client-side packing, which this path bypasses entirely.
+
 ## UPDATE (later 2026-07-08): questions answered from the fork
 
 The architecture code landed in **grifflee's fork, `~/repo/crossformer`, branch `dev`**
