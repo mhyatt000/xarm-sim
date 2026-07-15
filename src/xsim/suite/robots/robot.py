@@ -91,6 +91,26 @@ class Robot:
         for c in self._controllers:
             c.reset()
 
+    def ik(self, pose: torch.Tensor) -> np.ndarray:
+        """Arm joint targets (7,) for an EE pose [1,7] = [x,y,z,qw,qx,qy,qz]."""
+        pose = pose.to(gs.device)
+        init_qpos = (
+            self._init_qpos.unsqueeze(0).expand(pose.shape[0], -1)
+            if self.model.ik_init_at_home
+            else None
+        )
+        q = self.entity.inverse_kinematics(
+            link=self._ee_link,
+            pos=pose[:, :3],
+            quat=pose[:, 3:7],
+            init_qpos=init_qpos,
+            max_samples=self.model.ik_max_samples,
+            max_solver_iters=self.model.ik_max_solver_iters,
+            damping=self.model.ik_damping,
+            dofs_idx_local=self._arm_idx,
+        )
+        return np.asarray(q[0, self._arm_idx].detach().cpu(), dtype=np.float64)
+
     @property
     def joint_positions(self) -> np.ndarray:
         q = np.asarray(self.entity.get_dofs_position().detach().cpu()).reshape(-1)

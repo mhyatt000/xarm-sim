@@ -59,6 +59,7 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         horizon: int = 300,
         n_envs: int = 1,
         show_viewer: bool = False,
+        noslip_iterations: int = 0,
     ):
         ensure_genesis_init()
         self.physics_dt = physics_dt
@@ -66,6 +67,7 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         self.horizon = horizon
         self.n_envs = n_envs
         self.show_viewer = show_viewer
+        self.noslip_iterations = noslip_iterations
         self.control_every = max(1, round(1.0 / (control_freq * physics_dt)))
         self.control_dt = physics_dt * self.control_every
         self.timestep = 0
@@ -86,6 +88,7 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
+                noslip_iterations=self.noslip_iterations,
             ),
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
             show_viewer=self.show_viewer,

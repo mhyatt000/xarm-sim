@@ -29,6 +29,10 @@ class RobotModel:
     arm_kv: tuple[float, ...] = ()
     arm_force_limit: float = 50.0
     gripper_name: str | None = None
+    ik_init_at_home: bool = True
+    ik_max_samples: int = 50
+    ik_max_solver_iters: int = 40
+    ik_damping: float = 0.01
     entity: object = field(default=None, repr=False, compare=False)
 
     def __init_subclass__(cls, **kwargs):
