@@ -94,7 +94,11 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
             show_viewer=self.show_viewer,
         )
         self.model.add_to(self.scene)
+        self._setup_cameras()  # nyx sensors must exist before build
         self.scene.build(n_envs=self.n_envs)
+
+    def _setup_cameras(self) -> None:
+        """Add cameras/sensors to the scene, pre-build."""
 
     def _setup_references(self) -> None:
         pass
@@ -116,11 +120,15 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         self._pre_action(action)
         for _ in range(self.control_every):
             self.scene.step()
+            self._post_sim_step()
         reward, terminated, truncated, info = self._post_action(action)
         return self._get_observations(), reward, terminated, truncated, info
 
     def _pre_action(self, action) -> None:
         raise NotImplementedError
+
+    def _post_sim_step(self) -> None:
+        """After each physics step inside the decimation loop (e.g. camera sync)."""
 
     def _post_action(self, action) -> tuple[float, bool, bool, dict]:
         reward = self.reward(action)

@@ -7,12 +7,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from xsim.suite.models.cameras import CameraSpec, look_offset_T
 from xsim.suite.models.robots.robot_model import RobotModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 
 # Low ready pose matching the real demos' start, TCP ~ (0.34, 0, 0.10) top-down.
 _DEFAULT_ARM_QPOS = tuple(math.radians(v) for v in (0.0, -26.2, 0.0, 13.5, 0.0, 25.0, 90.0))
+
+# RealSense D435 colour at 640x480: fx ~ 617 -> vFOV ~ 42.6 (no calibration data).
+REALSENSE_FOV_DEG = 42.5
+# Side-mounted wrist RealSense, matched frame-by-frame against the real stream
+# (candidate "P1" of the 2026-07-02 mount sweep, carried over from task_env.py).
+_XARM7_CAMERAS = (
+    CameraSpec(
+        "wrist",
+        fov_deg=REALSENSE_FOV_DEG,
+        attach_link="link_tcp",
+        attach_offset=look_offset_T(
+            back=0.14, side=0.085, lift=-0.03, pitch_deg=-5.0, yaw_deg=25.0, roll_deg=-90.0
+        ),
+    ),
+)
 
 
 @dataclass
@@ -30,3 +46,4 @@ class XArm7(RobotModel):
     arm_kv: tuple[float, ...] = (135.0, 135.0, 105.0, 105.0, 60.0, 60.0, 60.0)
     arm_force_limit: float = 50.0
     gripper_name: str | None = "XArm7Gripper"
+    cameras: tuple[CameraSpec, ...] = _XARM7_CAMERAS
