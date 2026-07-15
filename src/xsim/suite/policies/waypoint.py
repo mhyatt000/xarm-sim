@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,16 +19,37 @@ GRIPPER_CLOSED = 0.0
 @dataclass
 class Waypoint:
     pose: torch.Tensor  # [1,7] world EE pose [x,y,z, qw,qx,qy,qz]
-    gripper: float  # GRIPPER_OPEN / GRIPPER_CLOSED
-    steps: int  # control ticks to hold this target
+    gripper: float  # GRIPPER_OPEN / GRIPPER_CLOSED, commanded while travelling here
+    steps: int  # control ticks to travel here from the previous waypoint
+
+
+def _slerp(qa: torch.Tensor, qb: torch.Tensor, t: float) -> torch.Tensor:
+    """Shortest-arc quaternion slerp; falls back to nlerp when nearly parallel."""
+    qa = qa / qa.norm()
+    qb = qb / qb.norm()
+    dot = float((qa * qb).sum())
+    if dot < 0.0:  # antipode: q and -q are the same rotation, take the short way
+        qb, dot = -qb, -dot
+    if dot > 0.9995:
+        q = qa + t * (qb - qa)
+        return q / q.norm()
+    theta = math.acos(min(dot, 1.0))
+    s = math.sin(theta)
+    return (math.sin((1.0 - t) * theta) / s) * qa + (math.sin(t * theta) / s) * qb
 
 
 class WaypointPolicy:
     """Gym-style scripted policy: reset() builds a waypoint plan via the
-    waypoints() hook; act() emits [j0..j6, g] actions (np.float32, shape (8,)),
-    solving IK once per waypoint at the step it becomes active and holding each
-    target for its ``steps`` ticks. When the plan is exhausted it keeps
-    emitting the final hold action."""
+    waypoints() hook; act() emits [j0..j6, g] actions (np.float32, shape (8,)).
+
+    The commanded EE pose interpolates smoothly (position lerp, quaternion
+    slerp) from the previous waypoint to the active one over its ``steps``
+    ticks — arriving exactly on the waypoint at the last tick and immediately
+    departing into the next segment. IK is solved per tick on the interpolated
+    pose. A segment whose pose equals the previous one degenerates to a dwell
+    (how grasp-close holds are expressed). When the plan is exhausted the final
+    action repeats forever.
+    """
 
     def __init__(self, robot: Robot, steps_per_segment: int = 20):
         self.robot = robot
@@ -46,15 +68,19 @@ class WaypointPolicy:
 
     def _generator(self, wps: list[Waypoint]):
         action = None
+        prev = wps[0].pose  # plans start at the current EE pose
         for wp in wps:
-            # IK is solved when the waypoint becomes active, not upfront:
-            # later segments depend on physics only through the plan built at reset.
-            action = self._action(wp)
-            for _ in range(max(1, wp.steps)):
+            steps = max(1, wp.steps)
+            for k in range(1, steps + 1):
+                t = k / steps
+                pos = prev[0, :3] + t * (wp.pose[0, :3] - prev[0, :3])
+                quat = _slerp(prev[0, 3:7], wp.pose[0, 3:7], t)
+                action = self._action(torch.cat([pos, quat]).reshape(1, 7), wp.gripper)
                 yield action
+            prev = wp.pose
         while True:
             yield action
 
-    def _action(self, wp: Waypoint) -> np.ndarray:
-        joints = self.robot.ik(wp.pose.to(device=gs.device, dtype=gs.tc_float))
-        return np.append(joints, wp.gripper).astype(np.float32)
+    def _action(self, pose: torch.Tensor, gripper: float) -> np.ndarray:
+        joints = self.robot.ik(pose.to(device=gs.device, dtype=gs.tc_float))
+        return np.append(joints, gripper).astype(np.float32)

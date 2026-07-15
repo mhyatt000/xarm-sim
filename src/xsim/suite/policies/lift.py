@@ -31,9 +31,10 @@ if TYPE_CHECKING:
 GRASP_TCP_OFFSET = 0.018
 APPROACH_HEIGHT = 0.12
 LIFT_HEIGHT = 0.09
-# Per-waypoint hold durations (x steps_per_segment): approach, plunge, close,
+# Per-segment travel durations (x steps_per_segment): approach, plunge, close,
 # lift, transport+settle, release, retreat. Approach keeps the real demos' slow
-# start; lift is deliberately fast.
+# start; lift is deliberately fast. Close/release reuse the previous pose, so
+# those segments are in-place dwells.
 SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.6, 0.6, 1.0)
 
 
