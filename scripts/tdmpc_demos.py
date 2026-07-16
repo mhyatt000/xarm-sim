@@ -45,6 +45,7 @@ class Config:
     control_freq: float = 15.0
     max_steps: int = 150
     max_delta_rad: float = 0.10
+    binary_gripper: bool = True
     noslip_iterations: int = 10
 
 
@@ -84,7 +85,8 @@ def main(cfg: Config) -> None:
     env = build_env(TrainConfig(
         n_envs=cfg.n_envs, backend=cfg.backend, sim_hz=cfg.sim_hz,
         control_freq=cfg.control_freq, max_steps=cfg.max_steps,
-        max_delta_rad=cfg.max_delta_rad, noslip_iterations=cfg.noslip_iterations,
+        max_delta_rad=cfg.max_delta_rad, binary_gripper=cfg.binary_gripper,
+        noslip_iterations=cfg.noslip_iterations,
     ))
     env.autoreset = False
     policy = LiftPolicy(env.unwrapped, steps_per_segment=cfg.steps_per_segment)

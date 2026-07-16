@@ -59,7 +59,8 @@ class Config:
     demos: Path = PROJECT_ROOT / "outputs" / "tdmpc" / "demos.pt"
     pretrain_updates: int = 10_000
     seed_steps: int = 500             # random-action transitions before the agent acts
-    demo_rounds_per_eval: int = 1     # scripted sync rounds (n_envs episodes each) after each eval
+    demo_rounds_per_eval: int = 1     # scripted sync rounds (n_envs episodes each) at injection time
+    demo_every_evals: int = 2         # inject after every Nth eval (v5's every-eval gave a 41%-scripted buffer)
     steps_per_segment: int = 20       # scripted policy pacing for injected demos
     # training
     utd: float = 1.0                  # gradient updates per recorded transition
@@ -83,6 +84,11 @@ class Config:
     control_freq: float = 15.0        # v1 control regime (suite default is 30 Hz)
     max_steps: int = 150              # episode truncation, in control steps
     max_delta_rad: float = 0.10       # joint-target delta per control tick at |a| = 1
+    # snap the wrapper's gripper channel to open/grasp extremes: v1's exploration
+    # geometry (any a[7]<0 = full grasp). v4/v5 showed the continuous channel delays
+    # sparse-reward grasp discovery ~4x (v5 ignition 167k vs v1 45k) — sustained
+    # near-(-1) closure is too rare under planner noise. Env stays continuous.
+    binary_gripper: bool = True
     noslip_iterations: int = 10       # weld-free grasping needs the noslip solver
 
 
@@ -325,7 +331,7 @@ def build_env(cfg: Config) -> TensorShim:
         horizon=cfg.max_steps, n_envs=cfg.n_envs,
         noslip_iterations=cfg.noslip_iterations,
     )
-    delta = DeltaActionWrapper(env, cfg.max_delta_rad)
+    delta = DeltaActionWrapper(env, cfg.max_delta_rad, binary_gripper=cfg.binary_gripper)
     return TensorShim(GymWrapper(delta), delta)
 
 
@@ -591,10 +597,13 @@ class Trainer:
         self.pretrain()
 
         next_eval = 0
+        n_evals = 0
         while self.step < cfg.steps:
             if self.step >= next_eval:
                 self._eval_and_save()
-                self.scripted_rounds(cfg.demo_rounds_per_eval)
+                if n_evals % cfg.demo_every_evals == 0:
+                    self.scripted_rounds(cfg.demo_rounds_per_eval)
+                n_evals += 1
                 next_eval += cfg.eval_freq
             self.collect_until(min(next_eval, cfg.steps))
 

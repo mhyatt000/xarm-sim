@@ -12,11 +12,16 @@ class DeltaActionWrapper(gym.Wrapper):
 
     - arm: ``target = clip(qpos + a[:n] * max_delta_rad, joint_limits)``, so |a|=1
       moves each joint target by at most ``max_delta_rad`` per control tick;
-    - gripper: affine ``[-1, 1] -> [0, 1]`` (continuous, +1 = open).
+    - gripper: affine ``[-1, 1] -> [0, 1]`` (continuous, +1 = open), or snapped to
+      the extremes when ``binary_gripper`` — half the action space then commands a
+      full grasp, which makes accidental sustained closure (and hence sparse-reward
+      grasp discovery) vastly more likely under exploration.
     """
 
-    def __init__(self, env: gym.Env, max_delta_rad: float = 0.10):
+    def __init__(self, env: gym.Env, max_delta_rad: float = 0.10,
+                 binary_gripper: bool = False):
         super().__init__(env)
+        self.binary_gripper = binary_gripper
         robots = env.unwrapped.robots
         assert len(robots) == 1 and robots[0].gripper_controller is not None, (
             "DeltaActionWrapper assumes one robot with an arm + gripper action layout"
@@ -43,6 +48,8 @@ class DeltaActionWrapper(gym.Wrapper):
             qpos + a[:, : self._n_arm] * self.max_delta_rad, self._q_lo, self._q_hi
         )
         gripper = (a[:, self._n_arm :] + 1.0) / 2.0
+        if self.binary_gripper:
+            gripper = (gripper > 0.5).astype(np.float64)
         return self.env.step(np.concatenate([target, gripper], axis=-1))
 
     def absolute_to_delta(self, action: np.ndarray) -> np.ndarray:
