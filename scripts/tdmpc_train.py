@@ -68,7 +68,7 @@ class Config:
     buffer_size: int = 500_000
     model_size: int = 5
     mpc: bool = True
-    compile: bool = False
+    compile: bool = True                    # 46ms -> 3.7ms per update on a 5090; coexists with Genesis
     # eval
     eval_freq: int = 5_000
     eval_episodes: int = 10
