@@ -28,7 +28,24 @@ DEFAULT_CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
 DEFAULT_CLEAN_W_TABLE_SPLAT = PROJECT_ROOT / "assets" / "lab_clean_w_table.ply"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from xsim.task_env import splat_world_transform  # noqa: E402
+# calibrated world-from-splat pose of the lab scan (was xsim.task_env, retired 2026-07)
+DEFAULT_SPLAT_POS = (-0.2237, 0.7717, 0.1711)
+DEFAULT_SPLAT_QUAT = (-0.501119, 0.487918, -0.50087, 0.509849)  # xyzw
+DEFAULT_SPLAT_SCALE = 0.9966
+
+
+def splat_world_transform(pos=DEFAULT_SPLAT_POS, quat=DEFAULT_SPLAT_QUAT, scale=DEFAULT_SPLAT_SCALE):
+    """(4x4 world-from-splat transform incl. scale) for cropping/analysis tooling."""
+    x, y, z, w = quat
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    T = np.eye(4)
+    T[:3, :3] = scale * R
+    T[:3, 3] = pos
+    return T
 
 
 @dataclass
