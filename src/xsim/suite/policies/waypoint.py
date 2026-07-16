@@ -91,7 +91,12 @@ class WaypointPolicy:
 
     def _action(self, pose: torch.Tensor, gripper: float) -> np.ndarray:
         if self.cartesian:
-            p = np.asarray(pose.detach().cpu(), dtype=np.float64)
+            p = np.asarray(pose.detach().cpu(), dtype=np.float64).copy()
+            # canonicalize the double cover: q and -q are one rotation, but MSE
+            # labels split across hemispheres regress toward the zero quat. All
+            # task grasps are qx-dominant (top-down family), so pin qx >= 0.
+            flip = p[:, 4] < 0.0
+            p[flip, 3:7] *= -1.0
             g = np.full((p.shape[0], 1), gripper)
             return np.concatenate([p, g], axis=-1).astype(np.float32)
         joints = self.robot.ik(pose.to(device=gs.device, dtype=gs.tc_float))
