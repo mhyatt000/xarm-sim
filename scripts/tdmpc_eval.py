@@ -40,6 +40,7 @@ class Config:
     max_steps: int = 150
     max_delta_rad: float = 0.10
     binary_gripper: bool = True
+    cube_vel_obs: bool = True         # v6/v7 checkpoints: pass --no-cube-vel-obs (32-d obs)
     noslip_iterations: int = 10
 
 
@@ -50,6 +51,7 @@ def main(cfg: Config) -> None:
     tcfg = TrainConfig(n_envs=cfg.n_envs, backend=cfg.backend, sim_hz=cfg.sim_hz,
                        control_freq=cfg.control_freq, max_steps=cfg.max_steps,
                        max_delta_rad=cfg.max_delta_rad, binary_gripper=cfg.binary_gripper,
+                       cube_vel_obs=cfg.cube_vel_obs,
                        noslip_iterations=cfg.noslip_iterations,
                        mpc=cfg.mpc, compile=cfg.compile)
     env = build_env(tcfg)

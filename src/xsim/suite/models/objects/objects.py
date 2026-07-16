@@ -52,6 +52,14 @@ class GenesisObject:
         """Orientations (n_envs, 4) as wxyz quaternions."""
         return np.asarray(self.entity.get_quat().detach().cpu())
 
+    def get_vel(self) -> np.ndarray:
+        """Linear velocities (n_envs, 3)."""
+        return np.asarray(self.entity.get_vel().detach().cpu())
+
+    def get_ang(self) -> np.ndarray:
+        """Angular velocities (n_envs, 3)."""
+        return np.asarray(self.entity.get_ang().detach().cpu())
+
 
 @dataclass
 class BoxObject(GenesisObject):

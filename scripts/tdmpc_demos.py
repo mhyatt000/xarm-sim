@@ -46,6 +46,8 @@ class Config:
     max_steps: int = 150
     max_delta_rad: float = 0.10
     binary_gripper: bool = True
+    cube_vel_obs: bool = True
+    dev_penalty_coef: float = 0.0     # keep demos' recorded rewards purely sparse
     noslip_iterations: int = 10
 
 
@@ -86,6 +88,7 @@ def main(cfg: Config) -> None:
         n_envs=cfg.n_envs, backend=cfg.backend, sim_hz=cfg.sim_hz,
         control_freq=cfg.control_freq, max_steps=cfg.max_steps,
         max_delta_rad=cfg.max_delta_rad, binary_gripper=cfg.binary_gripper,
+        cube_vel_obs=cfg.cube_vel_obs, dev_penalty_coef=cfg.dev_penalty_coef,
         noslip_iterations=cfg.noslip_iterations,
     ))
     env.autoreset = False

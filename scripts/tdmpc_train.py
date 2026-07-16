@@ -93,6 +93,14 @@ class Config:
     # sparse-reward grasp discovery ~4x (v5 ignition 167k vs v1 45k) — sustained
     # near-(-1) closure is too rare under planner noise. Env stays continuous.
     binary_gripper: bool = True
+    # cube linear+angular velocity in obs (32 -> 38 dims): single-frame Markov fix.
+    # Checkpoints/demos are obs-dim-coupled — v6/v7 artifacts need this off.
+    cube_vel_obs: bool = True
+    # r' = success - coef*mean((a - a_ref)^2) against a wrapper-owned LiftPolicy
+    # replanned on every (partial) reset. 0 = off. Prior-regularized ("sparse-ish"):
+    # the optimum defaults to demo style unless deviating buys more than the
+    # accumulated penalty; 0.002 keeps a typical episode's total penalty ~0.02.
+    dev_penalty_coef: float = 0.0
     noslip_iterations: int = 10       # weld-free grasping needs the noslip solver
 
 
@@ -490,7 +498,12 @@ def build_env(cfg: Config) -> TensorShim:
     import genesis as gs
 
     from xsim.suite import make
-    from xsim.suite.wrappers import DeltaActionWrapper, GymWrapper
+    from xsim.suite.wrappers import (
+        DeltaActionWrapper,
+        DeviationPenaltyWrapper,
+        GymWrapper,
+        ObjectVelocityWrapper,
+    )
 
     gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
             precision="32", logging_level="warning")
@@ -500,8 +513,19 @@ def build_env(cfg: Config) -> TensorShim:
         horizon=cfg.max_steps, n_envs=cfg.n_envs,
         noslip_iterations=cfg.noslip_iterations,
     )
+    if cfg.cube_vel_obs:
+        env = ObjectVelocityWrapper(env)
     delta = DeltaActionWrapper(env, cfg.max_delta_rad, binary_gripper=cfg.binary_gripper)
-    return TensorShim(GymWrapper(delta), delta)
+    top = delta
+    if cfg.dev_penalty_coef > 0:
+        from xsim.suite.policies import LiftPolicy
+
+        top = DeviationPenaltyWrapper(
+            delta,
+            lambda e: LiftPolicy(e, steps_per_segment=cfg.steps_per_segment),
+            coef=cfg.dev_penalty_coef,
+        )
+    return TensorShim(GymWrapper(top), delta)
 
 
 def to_td(obs, action=None, reward=None, terminated=None, action_dim: int = 8):
