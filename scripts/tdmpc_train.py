@@ -1,25 +1,28 @@
-"""TD-MPC2 online training on the xsim.suite Lift task (sparse reward).
+"""TD-MPC2 online training on the xsim.suite Lift task (sparse reward, batched envs).
 
 Drives the vendored ``xsim.suite.algo.tdmpc2`` agent on the suite stack without
 hydra/wandb:
 
-- env: :class:`xsim.suite.Lift` (dict state obs, absolute joint actions) under the
-  suite's ``DeltaActionWrapper`` (``[-1,1]^8`` relative joint targets + continuous
-  gripper) and ``GymWrapper`` (flat obs vector), plus a script-local ``TensorShim``
-  giving tdmpc2 its old-gym 4-tuple tensor contract and lift guard rails (max_rise
-  tracking, fell/flew early termination). Success = cube 5 cm above the table.
-- agent/buffer: stock ``TDMPC2`` + torchrl ``Buffer``, driven by a flat config
-  dataclass built here (replacing ``common.parser.parse_cfg``); model_size 5 defaults.
+- env: :class:`xsim.suite.Lift` at ``n_envs`` parallel Genesis envs (dict state obs,
+  absolute joint actions) under the suite's ``DeltaActionWrapper`` (``[-1,1]^8``
+  relative joint targets + continuous gripper) and ``GymWrapper`` (flat obs vectors),
+  plus a script-local ``TensorShim`` giving tdmpc2 tensors, the old-gym 4-tuple
+  contract, per-env lift guard rails (max_rise, fell/flew), and optional autoreset
+  (done envs restart in place via the suite's partial reset).
+- agent: ``BatchedTDMPC2`` — stock TD-MPC2 with the MPPI planner re-derived over a
+  leading env dim (per-env elites/warm-starts, one compiled CUDA graph for all envs);
+  the vendored code is not modified.
 - bootstrapping: the replay buffer is pre-seeded with scripted-policy demos collected
-  by ``scripts/tdmpc_demos.py`` (same action space, same dynamics), the agent is
-  pretrained on them, and (optionally) a fresh scripted episode is injected every
-  ``demo_every``-th training episode so sparse successes keep flowing while the agent
-  is weak.
-- loop: per-step interleaved act/step/update like ``OnlineTrainer``, with periodic
-  seeded eval, best/latest checkpoints, eval videos (low cam), and jsonl metrics.
+  by ``scripts/tdmpc_demos.py``, the agent is pretrained on them, and
+  ``demo_rounds_per_eval`` scripted rounds are injected after each eval while
+  collection is already paused.
+- loop: continuous async collection (episodes close per env and the env restarts
+  immediately); before each eval the loop drains in-flight episodes instead of
+  discarding them. ``step`` counts recorded transitions; ``utd`` gradient updates run
+  per recorded transition, as in the single-env version.
 
     uv run python scripts/tdmpc_demos.py --episodes 100          # once
-    uv run python scripts/tdmpc_train.py --steps 200000
+    uv run python scripts/tdmpc_train.py --steps 200000 --n-envs 16
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import dataclasses
 import json
-import math
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -48,7 +50,7 @@ torch.set_float32_matmul_precision("high")
 @dataclass
 class Config:
     # run
-    steps: int = 200_000              # online env steps (demo-injected steps count too)
+    steps: int = 200_000              # recorded env transitions (scripted rounds count too)
     seed: int = 1
     exp_name: str = "default"
     out: Path = PROJECT_ROOT / "outputs" / "tdmpc"
@@ -56,11 +58,11 @@ class Config:
     # bootstrap
     demos: Path = PROJECT_ROOT / "outputs" / "tdmpc" / "demos.pt"
     pretrain_updates: int = 10_000
-    seed_steps: int = 500             # random-action env steps before the agent acts
-    demo_every: int = 10              # inject a scripted episode every Nth episode (0 = off)
+    seed_steps: int = 500             # random-action transitions before the agent acts
+    demo_rounds_per_eval: int = 1     # scripted sync rounds (n_envs episodes each) after each eval
     steps_per_segment: int = 20       # scripted policy pacing for injected demos
     # training
-    utd: float = 1.0                  # gradient updates per env step
+    utd: float = 1.0                  # gradient updates per recorded transition
     batch_size: int = 256
     horizon: int = 3                  # tdmpc2 planning horizon
     max_std: float = 2.0              # planner sampling std; lower = smoother exploration
@@ -71,10 +73,11 @@ class Config:
     compile: bool = True                    # 46ms -> 3.7ms per update on a 5090; coexists with Genesis
     # eval
     eval_freq: int = 5_000
-    eval_episodes: int = 10
+    eval_episodes: int = 16
     eval_seed: int = 51_000
     save_video: bool = True
     # env
+    n_envs: int = 16
     backend: Literal["gpu", "cpu"] = "gpu"
     sim_hz: int = 120
     control_freq: float = 15.0        # v1 control regime (suite default is 30 Hz)
@@ -114,8 +117,8 @@ def make_tdmpc_cfg(cfg: Config, obs_dim: int, action_dim: int, work_dir: Path):
     d.update(MODEL_SIZE[cfg.model_size])
     d.update(
         task="xarm-lift", tasks=["xarm-lift"], task_title="Xarm Lift",
-        # Buffer capacity = min(buffer_size, steps); pad steps so preloaded demo
-        # transitions never wrap the ring storage (wrapped episodes -> garbage slices).
+        # Buffer capacity = min(buffer_size, steps); pad steps so preloaded demos and
+        # the drain overshoot never wrap the ring storage (wrapped episodes -> garbage).
         steps=cfg.steps + 25_000, batch_size=cfg.batch_size, horizon=cfg.horizon,
         max_std=cfg.max_std,
         buffer_size=cfg.buffer_size, mpc=cfg.mpc, compile=cfg.compile, seed=cfg.seed,
@@ -134,10 +137,107 @@ def make_tdmpc_cfg(cfg: Config, obs_dim: int, action_dim: int, work_dir: Path):
     return dc()
 
 
-def make_agent(tdcfg):
+def make_agent(tdcfg, n_envs: int):
+    """Stock TD-MPC2 with the MPPI planner re-derived over a leading env dim.
+
+    Same math as the vendored ``_plan``/``_estimate_value`` (single-task branch), with
+    the env batch folded into the sample dim and elites/scores/warm-start means kept
+    per env. One compiled CUDA graph serves all envs, so act stays O(1) in n_envs.
+    There is no per-env t0 flag: ``reset_envs`` zeroes the env's warm-start rows, and
+    shifting zeros is zeros — identical to the stock t0 branch.
+    """
+    from common import math as tdmath
     from tdmpc2 import TDMPC2
 
-    return TDMPC2(tdcfg)
+    class BatchedTDMPC2(TDMPC2):
+        def __init__(self, cfg, n_envs: int):
+            super().__init__(cfg)
+            self.n_envs = n_envs
+            self._prev_means = torch.nn.Buffer(
+                torch.zeros(n_envs, cfg.horizon, cfg.action_dim, device=self.device))
+
+        def reset_envs(self, envs_idx) -> None:
+            self._prev_means[torch.as_tensor(envs_idx, device=self.device)] = 0.0
+
+        @torch.no_grad()
+        def act(self, obs, t0=False, eval_mode=False, task=None):
+            """Batched act: obs (B, obs_dim) -> actions (B, action_dim) on cpu."""
+            obs = obs.to(self.device, non_blocking=True)
+            if self.cfg.mpc:
+                return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+            z = self.model.encode(obs, task)
+            action, info = self.model.pi(z, task)
+            if eval_mode:
+                action = info["mean"]
+            return action.cpu()
+
+        @torch.no_grad()
+        def _estimate_value(self, z, actions, task):
+            # stock body, minus multitask, with a rollout-count-agnostic termination shape
+            G, discount = 0, 1
+            termination = torch.zeros(z.shape[0], 1, dtype=torch.float32, device=z.device)
+            for t in range(self.cfg.horizon):
+                reward = tdmath.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
+                z = self.model.next(z, actions[t], task)
+                G = G + discount * (1 - termination) * reward
+                discount = discount * self.discount
+                if self.cfg.episodic:
+                    termination = torch.clip(
+                        termination + (self.model.termination(z, task) > 0.5).float(), max=1.0)
+            action, _ = self.model.pi(z, task)
+            return G + discount * (1 - termination) * self.model.Q(z, action, task, return_type="avg")
+
+        @torch.no_grad()
+        def _plan(self, obs, t0=False, eval_mode=False, task=None):
+            cfg = self.cfg
+            B, H, A = obs.shape[0], cfg.horizon, cfg.action_dim
+            S, P, E = cfg.num_samples, cfg.num_pi_trajs, cfg.num_elites
+            z = self.model.encode(obs, task)  # (B, L)
+            if P > 0:
+                pi_actions = torch.empty(H, B, P, A, device=self.device)
+                _z = z.unsqueeze(1).expand(B, P, -1).reshape(B * P, -1)
+                for t in range(H - 1):
+                    a, _ = self.model.pi(_z, task)
+                    pi_actions[t] = a.view(B, P, A)
+                    _z = self.model.next(_z, a, task)
+                a, _ = self.model.pi(_z, task)
+                pi_actions[-1] = a.view(B, P, A)
+
+            zs = z.unsqueeze(1).expand(B, S, -1).reshape(B * S, -1)
+            mean = torch.zeros(H, B, A, device=self.device)
+            mean[:-1] = self._prev_means.permute(1, 0, 2)[1:]
+            std = torch.full((H, B, A), cfg.max_std, dtype=torch.float, device=self.device)
+            actions = torch.empty(H, B, S, A, device=self.device)
+            if P > 0:
+                actions[:, :, :P] = pi_actions
+
+            for _ in range(cfg.iterations):
+                r = torch.randn(H, B, S - P, A, device=std.device)
+                actions[:, :, P:] = (mean.unsqueeze(2) + std.unsqueeze(2) * r).clamp(-1, 1)
+                value = self._estimate_value(zs, actions.view(H, B * S, A), task).nan_to_num(0)
+                value = value.view(B, S)
+                elite_idxs = torch.topk(value, E, dim=1).indices              # (B, E)
+                elite_value = torch.gather(value, 1, elite_idxs)              # (B, E)
+                gather_idx = elite_idxs.reshape(1, B, E, 1).expand(H, B, E, A)
+                elite_actions = torch.gather(actions, 2, gather_idx)          # (H, B, E, A)
+
+                max_value = elite_value.max(dim=1, keepdim=True).values
+                score = torch.exp(cfg.temperature * (elite_value - max_value))
+                score = score / score.sum(dim=1, keepdim=True)                # (B, E)
+                w = score.reshape(1, B, E, 1)
+                mean = (w * elite_actions).sum(dim=2)                         # (H, B, A)
+                std = ((w * (elite_actions - mean.unsqueeze(2)) ** 2).sum(dim=2)).sqrt()
+                std = std.clamp(cfg.min_std, cfg.max_std)
+
+            rand_idx = tdmath.gumbel_softmax_sample(score, dim=1)             # (B,)
+            sel = rand_idx.reshape(1, B, 1, 1).expand(H, B, 1, A)
+            a = torch.gather(elite_actions, 2, sel).squeeze(2)[0]             # (B, A)
+            if not eval_mode:
+                a = a + std[0] * torch.randn(B, A, device=std.device)
+            self._prev_means.copy_(mean.permute(1, 0, 2))
+            return a.clamp(-1, 1)
+
+    return BatchedTDMPC2(tdcfg, n_envs)
 
 
 # ---------------------------------------------------------------------------------------
@@ -146,41 +246,63 @@ def make_agent(tdcfg):
 
 
 class TensorShim:
-    """tdmpc2's env contract over the wrapped suite env: tensor obs/actions, old-gym
-    4-tuple step with ``info['terminated']``, ``rand_act`` — plus lift guard rails
-    (max_rise tracking, fell/flew early termination) kept out of the suite env."""
+    """tdmpc2's env contract over the wrapped suite env, batched: tensor obs/actions,
+    old-gym 4-tuple step with per-env ``info`` arrays, ``rand_act`` — plus lift guard
+    rails (max_rise tracking, fell/flew early termination) and optional autoreset.
+
+    With ``autoreset`` on, done envs restart in place via the suite's partial reset:
+    the returned obs rows for those envs are the NEW episodes' first observations,
+    the finished episodes' terminal rows ride in ``info["final_obs"]`` (indexed by
+    ``info["reset_envs"]``).
+    """
 
     def __init__(self, env, delta_wrapper):
         self.env = env
         self.delta_wrapper = delta_wrapper
         self.unwrapped = env.unwrapped
-        self.observation_space = env.observation_space
-        self.action_space = env.action_space
+        self.n_envs = self.unwrapped.n_envs
+        self.obs_dim = env.single_observation_space.shape[0]
+        self.action_dim = delta_wrapper.single_action_space.shape[0]
+        self.autoreset = True
         self._cube = self.unwrapped.cube
         self._top_z = self.unwrapped.arena.top_z
-        self._start_z = 0.0
-        self._max_rise = 0.0
+        self._start_z = np.zeros(self.n_envs)
+        self._max_rise = np.zeros(self.n_envs)
 
     def rand_act(self) -> torch.Tensor:
-        return torch.from_numpy(self.action_space.sample().astype(np.float32))
+        return torch.rand(self.n_envs, self.action_dim, device="cpu") * 2.0 - 1.0
+
+    def _cube_z(self) -> np.ndarray:
+        return np.asarray(self._cube.get_pos(), dtype=np.float64)[:, 2]
 
     def reset(self, seed: int | None = None) -> torch.Tensor:
         obs, _ = self.env.reset(seed=seed)
-        self._start_z = float(self._cube.get_pos()[2])
-        self._max_rise = 0.0
+        self._start_z[:] = self._cube_z()
+        self._max_rise[:] = 0.0
         return torch.from_numpy(obs)
 
-    def step(self, action) -> tuple[torch.Tensor, float, bool, dict]:
-        a = action.detach().cpu().numpy() if torch.is_tensor(action) else action
+    def step(self, action) -> tuple[torch.Tensor, np.ndarray, np.ndarray, dict]:
+        a = action.detach().cpu().numpy() if torch.is_tensor(action) else np.asarray(action)
         obs, reward, terminated, truncated, info = self.env.step(a)
-        cube = np.asarray(self._cube.get_pos(), dtype=np.float64).reshape(-1)
-        self._max_rise = max(self._max_rise, float(cube[2]) - self._start_z)
-        fell = float(cube[2]) < self._top_z - 0.05
-        flew = math.hypot(float(cube[0]), float(cube[1])) > 0.9
-        terminated = bool(terminated or fell or flew)
+        cube = np.asarray(self._cube.get_pos(), dtype=np.float64)
+        self._max_rise = np.maximum(self._max_rise, cube[:, 2] - self._start_z)
+        fell = cube[:, 2] < self._top_z - 0.05
+        flew = np.hypot(cube[:, 0], cube[:, 1]) > 0.9
+        terminated = np.asarray(terminated, dtype=bool) | fell | flew
+        done = terminated | np.asarray(truncated, dtype=bool)
         info = dict(info, terminated=terminated, fell=fell, flew=flew,
-                    max_rise=self._max_rise)
-        return torch.from_numpy(obs), float(reward), terminated or truncated, info
+                    max_rise=self._max_rise.copy())
+        obs_t = torch.from_numpy(obs)
+
+        if self.autoreset and done.any():
+            idx = np.flatnonzero(done)
+            info["reset_envs"] = idx
+            info["final_obs"] = obs_t[idx].clone()
+            new_obs, _ = self.env.reset(options={"envs_idx": idx})
+            obs_t[idx] = torch.from_numpy(new_obs[idx])
+            self._start_z[idx] = self._cube_z()[idx]
+            self._max_rise[idx] = 0.0
+        return obs_t, np.asarray(reward, dtype=np.float64), done, info
 
     def absolute_to_delta(self, action: np.ndarray) -> np.ndarray:
         return self.delta_wrapper.absolute_to_delta(action)
@@ -200,7 +322,8 @@ def build_env(cfg: Config) -> TensorShim:
     env = make(
         "Lift", robots="XArm7", camera_names=["low"], render_backend="raster",
         physics_dt=1.0 / cfg.sim_hz, control_freq=cfg.control_freq,
-        horizon=cfg.max_steps, noslip_iterations=cfg.noslip_iterations,
+        horizon=cfg.max_steps, n_envs=cfg.n_envs,
+        noslip_iterations=cfg.noslip_iterations,
     )
     delta = DeltaActionWrapper(env, cfg.max_delta_rad)
     return TensorShim(GymWrapper(delta), delta)
@@ -237,13 +360,11 @@ class Trainer:
         self.metrics_path = self.work_dir / "metrics.jsonl"
 
         self.env = build_env(cfg)
-        tdcfg = make_tdmpc_cfg(
-            cfg, self.env.observation_space.shape[0], self.env.action_space.shape[0],
-            self.work_dir)
+        tdcfg = make_tdmpc_cfg(cfg, self.env.obs_dim, self.env.action_dim, self.work_dir)
 
         from common.buffer import Buffer
 
-        self.agent = make_agent(tdcfg)
+        self.agent = make_agent(tdcfg, cfg.n_envs)
         if cfg.resume is not None:
             self.agent.load(str(cfg.resume))
             print(f"[resume] loaded {cfg.resume}")
@@ -254,7 +375,9 @@ class Trainer:
         self.best_success = -1.0
         self._start = time.time()
         self._update_debt = 0.0
-        self._scripted = None  # lazily built demo-injection policy
+        self._scripted = None       # lazily built demo-injection policy
+        self._window: list[dict] = []  # per-episode stats awaiting an aggregate log row
+        self._train_metrics: dict = {}
 
     # -- logging -------------------------------------------------------------------
     def log(self, kind: str, d: dict) -> None:
@@ -276,6 +399,28 @@ class Trainer:
                 out[k] = float(v)
         return out
 
+    def _close_episode(self, tds: list, stats: dict) -> None:
+        """Buffer + account one finished episode; aggregate-log every n_envs closes."""
+        if len(tds) >= self.cfg.horizon + 1:
+            self.buffer.add(torch.cat(tds))
+        self.episode += 1
+        stats["ep_reward"] = float(np.nansum([td["reward"].item() for td in tds[1:]]))
+        stats["ep_len"] = len(tds) - 1
+        self._window.append(stats)
+        if len(self._window) >= self.cfg.n_envs:
+            w = self._window
+            self.log("train", {
+                "episodes": len(w),
+                "ep_reward": float(np.mean([s["ep_reward"] for s in w])),
+                "ep_len": float(np.mean([s["ep_len"] for s in w])),
+                "success": float(np.mean([s["success"] for s in w])),
+                "max_rise": float(np.mean([s["max_rise"] for s in w])),
+                "scripted": float(np.mean([s["scripted"] for s in w])),
+                "tps": self.step / max(time.time() - self._start, 1e-9),
+                **self._train_metrics,
+            })
+            self._window = []
+
     # -- demo handling --------------------------------------------------------------
     def preload_demos(self) -> None:
         blob = torch.load(self.cfg.demos, weights_only=False)
@@ -286,24 +431,6 @@ class Trainer:
                 n += 1
         print(f"[demos] preloaded {n} episodes "
               f"({sum(len(e) - 1 for e in blob['episodes'])} transitions) from {self.cfg.demos}")
-
-    def scripted_episode(self) -> tuple[list, dict]:
-        """Roll one scripted-policy episode (through the full wrapper stack) for
-        online injection."""
-        from xsim.suite.policies import LiftPolicy
-
-        if self._scripted is None:
-            self._scripted = LiftPolicy(
-                self.env.unwrapped, steps_per_segment=self.cfg.steps_per_segment)
-        obs = self.env.reset()
-        self._scripted.reset()
-        tds = [to_td(obs)]
-        done, info = False, {}
-        while not done:
-            a = torch.from_numpy(self.env.absolute_to_delta(self._scripted.act()))
-            obs, reward, done, info = self.env.step(a)
-            tds.append(to_td(obs, a, reward, info["terminated"]))
-        return tds, info
 
     # -- phases ----------------------------------------------------------------------
     def pretrain(self) -> None:
@@ -317,30 +444,128 @@ class Trainer:
                 self.log("pretrain", {"update": i + 1, **self._scalars(metrics),
                                       "ups": (i + 1) / (time.time() - t0)})
 
+    def maybe_update(self, n_transitions: int) -> None:
+        self._update_debt += self.cfg.utd * n_transitions
+        while self._update_debt >= 1.0:
+            torch.compiler.cudagraph_mark_step_begin()
+            self._train_metrics = self._scalars(self.agent.update(self.buffer))
+            self._update_debt -= 1.0
+
+    def _actions(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.step < self.cfg.seed_steps:
+            return self.env.rand_act()
+        torch.compiler.cudagraph_mark_step_begin()
+        return self.agent.act(obs)
+
+    def collect_until(self, until: int) -> None:
+        """Async collection (autoreset) until `step` reaches `until`, then drain."""
+        if self.step >= until:
+            return
+        B = self.cfg.n_envs
+        env = self.env
+        env.autoreset = True
+        obs = env.reset()
+        self.agent.reset_envs(np.arange(B))
+        tds = [[to_td(obs[i])] for i in range(B)]
+
+        while self.step < until:
+            actions = self._actions(obs)
+            obs, reward, done, info = env.step(actions)
+            reset_idx = np.asarray(info.get("reset_envs", []), dtype=int)
+            pos = {int(e): k for k, e in enumerate(reset_idx)}
+            for i in range(B):
+                row = info["final_obs"][pos[i]] if i in pos else obs[i]
+                tds[i].append(to_td(row, actions[i], reward[i], info["terminated"][i]))
+            self.step += B
+            self.maybe_update(B)
+            for i in reset_idx:
+                self._close_episode(tds[i], dict(
+                    success=float(info["success"][i]), max_rise=float(info["max_rise"][i]),
+                    scripted=0.0))
+                tds[i] = [to_td(obs[i])]  # obs row i is already the new episode's first obs
+            if len(reset_idx):
+                self.agent.reset_envs(reset_idx)
+
+        # drain: let in-flight episodes finish (recorded) instead of discarding them
+        env.autoreset = False
+        live = np.ones(B, dtype=bool)
+        while live.any():
+            actions = self._actions(obs)
+            obs, reward, done, info = env.step(actions)
+            for i in np.flatnonzero(live):
+                tds[i].append(to_td(obs[i], actions[i], reward[i], info["terminated"][i]))
+            self.step += int(live.sum())
+            self.maybe_update(int(live.sum()))
+            for i in np.flatnonzero(live & done):
+                self._close_episode(tds[i], dict(
+                    success=float(info["success"][i]), max_rise=float(info["max_rise"][i]),
+                    scripted=0.0))
+            live &= ~done
+
+    def scripted_rounds(self, n: int) -> None:
+        """Sync scripted rounds (B demo episodes each), run while collection is paused."""
+        from xsim.suite.policies import LiftPolicy
+
+        if n <= 0:
+            return
+        B = self.cfg.n_envs
+        env = self.env
+        env.autoreset = False
+        if self._scripted is None:
+            self._scripted = LiftPolicy(
+                env.unwrapped, steps_per_segment=self.cfg.steps_per_segment)
+        for _ in range(n):
+            obs = env.reset()
+            self._scripted.reset()
+            tds = [[to_td(obs[i])] for i in range(B)]
+            live = np.ones(B, dtype=bool)
+            while live.any():
+                actions = torch.from_numpy(env.absolute_to_delta(self._scripted.act()))
+                obs, reward, done, info = env.step(actions)
+                for i in np.flatnonzero(live):
+                    tds[i].append(to_td(obs[i], actions[i], reward[i], info["terminated"][i]))
+                self.step += int(live.sum())
+                self.maybe_update(int(live.sum()))
+                for i in np.flatnonzero(live & done):
+                    self._close_episode(tds[i], dict(
+                        success=float(info["success"][i]), max_rise=float(info["max_rise"][i]),
+                        scripted=1.0))
+                live &= ~done
+
     def evaluate(self) -> dict:
+        B = self.cfg.n_envs
+        env = self.env
+        env.autoreset = False
         successes, rewards, lengths, rises = [], [], [], []
         frames = []
-        for i in range(self.cfg.eval_episodes):
-            record = self.cfg.save_video and i == 0
-            obs = self.env.reset(seed=self.cfg.eval_seed + i)
-            done, t, ep_reward, info = False, 0, 0.0, {}
-            while not done:
+        rounds = max(1, -(-self.cfg.eval_episodes // B))
+        for rd in range(rounds):
+            record = self.cfg.save_video and rd == 0
+            obs = env.reset(seed=self.cfg.eval_seed + rd)
+            self.agent.reset_envs(np.arange(B))
+            live = np.ones(B, dtype=bool)
+            ep_reward = np.zeros(B)
+            ep_len = np.zeros(B, dtype=int)
+            while live.any():
                 torch.compiler.cudagraph_mark_step_begin()
-                action = self.agent.act(obs, t0=t == 0, eval_mode=True)
-                obs, reward, done, info = self.env.step(action)
-                ep_reward += float(reward)
-                t += 1
-                if record:
-                    frames.append(self.env.render_views()["low"])
-            successes.append(float(info["success"]))
-            rewards.append(ep_reward)
-            lengths.append(t)
-            rises.append(float(info.get("max_rise", 0.0)))
+                actions = self.agent.act(obs, eval_mode=True)
+                obs, reward, done, info = env.step(actions)
+                ep_reward[live] += reward[live]
+                ep_len[live] += 1
+                if record and live[0]:
+                    frames.append(env.render_views()["low"])
+                for i in np.flatnonzero(live & done):
+                    successes.append(float(info["success"][i]))
+                    rewards.append(float(ep_reward[i]))
+                    lengths.append(int(ep_len[i]))
+                    rises.append(float(info["max_rise"][i]))
+                live &= ~done
         if frames:
             self._save_video(frames)
         return dict(
             eval_success=float(np.mean(successes)), eval_reward=float(np.mean(rewards)),
             eval_length=float(np.mean(lengths)), eval_max_rise=float(np.mean(rises)),
+            eval_episodes=len(successes),
         )
 
     def _save_video(self, frames: list) -> None:
@@ -352,14 +577,13 @@ class Trainer:
         except Exception as e:  # video is best-effort; never kill training over it
             print(f"[video] failed: {e}")
 
-    def maybe_update(self, n_env_steps: int = 1) -> dict:
-        self._update_debt += self.cfg.utd * n_env_steps
-        metrics = {}
-        while self._update_debt >= 1.0:
-            torch.compiler.cudagraph_mark_step_begin()
-            metrics = self.agent.update(self.buffer)
-            self._update_debt -= 1.0
-        return metrics
+    def _eval_and_save(self) -> None:
+        eval_metrics = self.evaluate()
+        self.log("eval", eval_metrics)
+        self.agent.save(str(self.work_dir / "latest.pt"))
+        if eval_metrics["eval_success"] >= self.best_success:
+            self.best_success = eval_metrics["eval_success"]
+            self.agent.save(str(self.work_dir / "best.pt"))
 
     def train(self) -> None:
         cfg = self.cfg
@@ -367,56 +591,14 @@ class Trainer:
         self.pretrain()
 
         next_eval = 0
-        train_metrics: dict = {}
         while self.step < cfg.steps:
             if self.step >= next_eval:
-                eval_metrics = self.evaluate()
-                self.log("eval", eval_metrics)
-                self.agent.save(str(self.work_dir / "latest.pt"))
-                if eval_metrics["eval_success"] >= self.best_success:
-                    self.best_success = eval_metrics["eval_success"]
-                    self.agent.save(str(self.work_dir / "best.pt"))
+                self._eval_and_save()
+                self.scripted_rounds(cfg.demo_rounds_per_eval)
                 next_eval += cfg.eval_freq
+            self.collect_until(min(next_eval, cfg.steps))
 
-            inject = cfg.demo_every > 0 and self.episode > 0 and self.episode % cfg.demo_every == 0
-            if inject:
-                tds, info = self.scripted_episode()
-                for _ in range(len(tds) - 1):
-                    self.step += 1
-                    train_metrics.update(self._scalars(self.maybe_update()))
-            else:
-                obs = self.env.reset()
-                tds = [to_td(obs)]
-                done, info = False, {}
-                while not done:
-                    if self.step < cfg.seed_steps:
-                        action = self.env.rand_act()
-                    else:
-                        torch.compiler.cudagraph_mark_step_begin()
-                        action = self.agent.act(obs, t0=len(tds) == 1)
-                    obs, reward, done, info = self.env.step(action)
-                    tds.append(to_td(obs, action, reward, info["terminated"]))
-                    self.step += 1
-                    train_metrics.update(self._scalars(self.maybe_update()))
-
-            if len(tds) >= cfg.horizon + 1:
-                self.buffer.add(torch.cat(tds))
-            self.episode += 1
-            ep_reward = float(np.nansum([td["reward"].item() for td in tds[1:]]))
-            self.log("train", {
-                "ep_reward": ep_reward, "ep_len": len(tds) - 1,
-                "success": float(info.get("success", False)), "scripted": int(inject),
-                "max_rise": float(info.get("max_rise", 0.0)),
-                "sps": self.step / max(time.time() - self._start, 1e-9),
-                **train_metrics,
-            })
-
-        eval_metrics = self.evaluate()
-        self.log("eval", eval_metrics)
-        self.agent.save(str(self.work_dir / "latest.pt"))
-        if eval_metrics["eval_success"] >= self.best_success:
-            self.best_success = eval_metrics["eval_success"]
-            self.agent.save(str(self.work_dir / "best.pt"))
+        self._eval_and_save()
         print(f"[done] best eval success: {self.best_success:.0%}")
 
 
