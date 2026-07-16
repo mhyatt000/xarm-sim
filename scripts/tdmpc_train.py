@@ -68,6 +68,10 @@ class Config:
     horizon: int = 3                  # tdmpc2 planning horizon
     max_std: float = 2.0              # planner sampling std; lower = smoother exploration
     discount: float = 0.99
+    # TD value-target bootstrap length: 1 = stock 1-step TD; n>1 sums n discounted
+    # rewards before bootstrapping, so sparse terminal reward jumps n transitions of
+    # value credit per update instead of one (ignition fix for the lift reward)
+    nstep: int = 25
     buffer_size: int = 500_000
     model_size: int = 5
     mpc: bool = True
@@ -154,6 +158,8 @@ def make_agent(tdcfg, n_envs: int):
     """
     from common import math as tdmath
     from tdmpc2 import TDMPC2
+    from tensordict import TensorDict
+    import torch.nn.functional as F
 
     class BatchedTDMPC2(TDMPC2):
         def __init__(self, cfg, n_envs: int):
@@ -243,7 +249,170 @@ def make_agent(tdcfg, n_envs: int):
             self._prev_means.copy_(mean.permute(1, 0, 2))
             return a.clamp(-1, 1)
 
+        def update(self, buffer):
+            """Stock update, unpacking NStepBuffer's extra n-step fields."""
+            obs, action, reward, terminated, nstep, task = buffer.sample()
+            kwargs = {}
+            if task is not None:
+                kwargs["task"] = task
+            torch.compiler.cudagraph_mark_step_begin()
+            return self._update(obs, action, reward, terminated, *nstep, **kwargs)
+
+        def _update(self, obs, action, reward, terminated,
+                    nstep_reward, nstep_obs, nstep_terminated, nstep_discount, task=None):
+            # vendored _update (single-task branch), with one change: the value target
+            # bootstraps n steps ahead (augment_nstep fields) instead of one.
+            with torch.no_grad():
+                next_z = self.model.encode(obs[1:], task)  # consistency still needs 1-step latents
+                boot_z = self.model.encode(nstep_obs, task)
+                a, _ = self.model.pi(boot_z, task)
+                td_targets = nstep_reward + nstep_discount * (1 - nstep_terminated) * \
+                    self.model.Q(boot_z, a, task, return_type="min", target=True)
+
+            # Prepare for update
+            self.model.train()
+
+            # Latent rollout
+            zs = torch.empty(self.cfg.horizon + 1, self.cfg.batch_size, self.cfg.latent_dim,
+                             device=self.device)
+            z = self.model.encode(obs[0], task)
+            zs[0] = z
+            consistency_loss = 0
+            for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
+                z = self.model.next(z, _action, task)
+                consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+                zs[t + 1] = z
+
+            # Predictions
+            _zs = zs[:-1]
+            qs = self.model.Q(_zs, action, task, return_type="all")
+            reward_preds = self.model.reward(_zs, action, task)
+            if self.cfg.episodic:
+                termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
+
+            # Compute losses
+            reward_loss, value_loss = 0, 0
+            for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(
+                    zip(reward_preds.unbind(0), reward.unbind(0),
+                        td_targets.unbind(0), qs.unbind(1))):
+                reward_loss = reward_loss + \
+                    tdmath.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t
+                for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
+                    value_loss = value_loss + \
+                        tdmath.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean() \
+                        * self.cfg.rho**t
+
+            consistency_loss = consistency_loss / self.cfg.horizon
+            reward_loss = reward_loss / self.cfg.horizon
+            if self.cfg.episodic:
+                termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
+            else:
+                termination_loss = 0.
+            value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+            total_loss = (
+                self.cfg.consistency_coef * consistency_loss +
+                self.cfg.reward_coef * reward_loss +
+                self.cfg.termination_coef * termination_loss +
+                self.cfg.value_coef * value_loss
+            )
+
+            # Update model
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.cfg.grad_clip_norm)
+            self.optim.step()
+            self.optim.zero_grad(set_to_none=True)
+
+            # Update policy
+            pi_info = self.update_pi(zs.detach(), task)
+
+            # Update target Q-functions
+            self.model.soft_update_target_Q()
+
+            # Return training statistics
+            self.model.eval()
+            info = TensorDict({
+                "consistency_loss": consistency_loss,
+                "reward_loss": reward_loss,
+                "value_loss": value_loss,
+                "termination_loss": termination_loss,
+                "total_loss": total_loss,
+                "grad_norm": grad_norm,
+            })
+            if self.cfg.episodic:
+                info.update(tdmath.termination_statistics(
+                    torch.sigmoid(termination_pred[-1]), terminated[-1]))
+            info.update(pi_info)
+            return info.detach().mean()
+
     return BatchedTDMPC2(tdcfg, n_envs)
+
+
+def augment_nstep(td, n: int, gamma: float):
+    """Add n-step bootstrap fields to a whole-episode TensorDict (T+1 frames).
+
+    For frame i in 1..T, with e = min(i+n-1, T) (clamped to the episode end):
+
+        nstep_reward[i]     = sum_{j=i..e} gamma^(j-i) * reward[j]
+        nstep_obs[i]        = obs[e]            (bootstrap observation)
+        nstep_terminated[i] = terminated[e]
+        nstep_discount[i]   = gamma^(e-i+1)     (bootstrap discount)
+
+    Frame 0 gets zero placeholders (its reward/terminated are NaN and it is never a
+    target; the fields only need to exist for stacking). n=1 reduces exactly to the
+    stock 1-step quantities: nstep_reward=reward, nstep_obs=obs[i], nstep_discount=gamma.
+    """
+    T = td.shape[0] - 1
+    reward = td["reward"].to("cpu", torch.float32)
+    terminated = td["terminated"].to("cpu", torch.float32)
+    obs = td["obs"].cpu()
+    nstep_reward = torch.zeros(T + 1, dtype=torch.float32, device="cpu")
+    nstep_obs = torch.zeros_like(obs)
+    nstep_terminated = torch.zeros(T + 1, dtype=torch.float32, device="cpu")
+    nstep_discount = torch.zeros(T + 1, dtype=torch.float32, device="cpu")
+    for i in range(1, T + 1):
+        e = min(i + n - 1, T)
+        k = torch.arange(e - i + 1, dtype=torch.float32, device="cpu")  # gs.init defaults cuda
+        nstep_reward[i] = (gamma**k * reward[i : e + 1]).sum()
+        nstep_obs[i] = obs[e]
+        nstep_terminated[i] = terminated[e]
+        nstep_discount[i] = gamma ** (e - i + 1)
+    td["nstep_reward"] = nstep_reward
+    td["nstep_obs"] = nstep_obs
+    td["nstep_terminated"] = nstep_terminated
+    td["nstep_discount"] = nstep_discount
+    return td
+
+
+def make_buffer(tdcfg):
+    """Stock tdmpc2 Buffer, with sampled batches also carrying the n-step fields."""
+    from common.buffer import Buffer
+
+    class NStepBuffer(Buffer):
+        def _prepare_batch(self, td):
+            # stock _prepare_batch, extended: also select/slice the four nstep fields
+            # (episodes are augmented via augment_nstep before entering the buffer)
+            td = td.select(
+                "obs", "action", "reward", "terminated", "task",
+                "nstep_reward", "nstep_obs", "nstep_terminated", "nstep_discount",
+                strict=False,
+            ).to(self._device, non_blocking=True)
+            obs = td.get("obs").contiguous()
+            action = td.get("action")[1:].contiguous()
+            reward = td.get("reward")[1:].unsqueeze(-1).contiguous()
+            terminated = td.get("terminated")[1:].unsqueeze(-1).contiguous()
+            nstep = (
+                td.get("nstep_reward")[1:].unsqueeze(-1).contiguous(),     # (H, B, 1)
+                td.get("nstep_obs")[1:].contiguous(),                      # (H, B, obs)
+                td.get("nstep_terminated")[1:].unsqueeze(-1).contiguous(), # (H, B, 1)
+                td.get("nstep_discount")[1:].unsqueeze(-1).contiguous(),   # (H, B, 1)
+            )
+            task = td.get("task", None)
+            if task is not None:
+                task = task[0].contiguous()
+            return obs, action, reward, terminated, nstep, task
+
+    return NStepBuffer(tdcfg)
 
 
 # ---------------------------------------------------------------------------------------
@@ -368,13 +537,11 @@ class Trainer:
         self.env = build_env(cfg)
         tdcfg = make_tdmpc_cfg(cfg, self.env.obs_dim, self.env.action_dim, self.work_dir)
 
-        from common.buffer import Buffer
-
         self.agent = make_agent(tdcfg, cfg.n_envs)
         if cfg.resume is not None:
             self.agent.load(str(cfg.resume))
             print(f"[resume] loaded {cfg.resume}")
-        self.buffer = Buffer(tdcfg)
+        self.buffer = make_buffer(tdcfg)
         self.tdcfg = tdcfg
         self.step = 0
         self.episode = 0
@@ -405,10 +572,14 @@ class Trainer:
                 out[k] = float(v)
         return out
 
+    def _add_episode(self, td) -> None:
+        """Single buffer entry point: every episode gets its n-step fields here."""
+        self.buffer.add(augment_nstep(td, self.cfg.nstep, self.cfg.discount))
+
     def _close_episode(self, tds: list, stats: dict) -> None:
         """Buffer + account one finished episode; aggregate-log every n_envs closes."""
         if len(tds) >= self.cfg.horizon + 1:
-            self.buffer.add(torch.cat(tds))
+            self._add_episode(torch.cat(tds))
         self.episode += 1
         stats["ep_reward"] = float(np.nansum([td["reward"].item() for td in tds[1:]]))
         stats["ep_len"] = len(tds) - 1
@@ -433,7 +604,7 @@ class Trainer:
         n = 0
         for ep in blob["episodes"]:
             if len(ep) >= self.cfg.horizon + 1:
-                self.buffer.add(ep)
+                self._add_episode(ep)
                 n += 1
         print(f"[demos] preloaded {n} episodes "
               f"({sum(len(e) - 1 for e in blob['episodes'])} transitions) from {self.cfg.demos}")
