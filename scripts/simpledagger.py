@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import time
 from typing import Literal
@@ -55,6 +56,9 @@ class Config:
     epochs_per_round: int = 10
     batch_size: int = 256
     lr: float = 1e-3
+    # per-round cosine decay lr -> lr_final: late rounds (largest dataset, best
+    # policy) take refining steps instead of reshaping ones
+    lr_final: float = 1e-4
     hidden_dim: int = 256
     # eval/checkpoint an EMA of the student: the live net swings round-to-round
     # (b4096-v3 eval oscillated 2%-82% at stable BC loss)
@@ -79,7 +83,7 @@ class Config:
     # a per-env spawn/outcome table; no training
     play: Path | None = None
     play_video: Path | None = None    # default: <checkpoint dir>/rollout.mp4
-    cameras: tuple[str, ...] = ("low", "wrist")
+    cameras: tuple[str, ...] = ("low", "side", "wrist")
     spp: int = 8
     video_max_width: int = 1280       # per-camera grid width cap, px
 
@@ -264,11 +268,15 @@ class Trainer:
         cfg = self.cfg
         for rnd in range(cfg.rounds):
             beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
+            frac = rnd / max(1, cfg.rounds - 1)
+            lr = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (1.0 + math.cos(math.pi * frac))
+            for g in self.optim.param_groups:
+                g["lr"] = lr
             for _ in range(cfg.episodes_per_round):
                 stats = self.rollout(beta=beta, record=True,
                                      seed=cfg.seed + rnd if rnd == 0 else None)
                 self.log("collect", {"round": rnd, "beta": beta, **stats})
-            self.log("bc", {"round": rnd, **self.train_bc()})
+            self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate()
             self.log("eval", {"round": rnd, **eval_metrics})
             torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
