@@ -55,9 +55,13 @@ class WaypointPolicy:
     action repeats forever.
     """
 
-    def __init__(self, robot: Robot, steps_per_segment: int = 20):
+    def __init__(self, robot: Robot, steps_per_segment: int = 20,
+                 cartesian: bool = False):
         self.robot = robot
         self.steps_per_segment = steps_per_segment
+        # cartesian: emit [x,y,z, qw..qz, g] pose actions (CartesianActionWrapper's
+        # space) instead of solving IK here — pose labels are branch-unambiguous
+        self.cartesian = cartesian
         self._commands = None
 
     def waypoints(self) -> list[Waypoint]:
@@ -86,6 +90,10 @@ class WaypointPolicy:
             yield action
 
     def _action(self, pose: torch.Tensor, gripper: float) -> np.ndarray:
+        if self.cartesian:
+            p = np.asarray(pose.detach().cpu(), dtype=np.float64)
+            g = np.full((p.shape[0], 1), gripper)
+            return np.concatenate([p, g], axis=-1).astype(np.float32)
         joints = self.robot.ik(pose.to(device=gs.device, dtype=gs.tc_float))
         g = np.full((joints.shape[0], 1), gripper)
         return np.concatenate([joints, g], axis=-1).astype(np.float32)

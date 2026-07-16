@@ -77,8 +77,9 @@ class LiftPolicy(WaypointPolicy):
         env: Lift,
         steps_per_segment: int = 20,
         drop_xy: tuple[float, float] = (0.35, 0.0),
+        cartesian: bool = False,
     ):
-        super().__init__(env.robots[0], steps_per_segment)
+        super().__init__(env.robots[0], steps_per_segment, cartesian=cartesian)
         self.env = env
         self.drop_xy = drop_xy
 
