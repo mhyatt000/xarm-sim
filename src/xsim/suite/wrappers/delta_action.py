@@ -25,25 +25,32 @@ class DeltaActionWrapper(gym.Wrapper):
         self.max_delta_rad = float(max_delta_rad)
         self._q_lo, self._q_hi = self.robot.arm_controller.joint_limits
         self._n_arm = self.robot.arm_controller.action_dim
-        self.action_space = gym.spaces.Box(
+        self.single_action_space = gym.spaces.Box(
             -1.0, 1.0, shape=(self._n_arm + 1,), dtype=np.float32
+        )
+        self.action_space = gym.vector.utils.batch_space(
+            self.single_action_space, env.unwrapped.n_envs
         )
 
     def step(self, action):
-        a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), -1.0, 1.0)
+        a = np.clip(
+            np.asarray(action, dtype=np.float64).reshape(-1, self._n_arm + 1),
+            -1.0,
+            1.0,
+        )
         qpos = self.robot.joint_positions
         target = np.clip(
-            qpos + a[: self._n_arm] * self.max_delta_rad, self._q_lo, self._q_hi
+            qpos + a[:, : self._n_arm] * self.max_delta_rad, self._q_lo, self._q_hi
         )
-        gripper = (a[self._n_arm] + 1.0) / 2.0
-        return self.env.step(np.append(target, gripper))
+        gripper = (a[:, self._n_arm :] + 1.0) / 2.0
+        return self.env.step(np.concatenate([target, gripper], axis=-1))
 
     def absolute_to_delta(self, action: np.ndarray) -> np.ndarray:
         """Inverse map: absolute ``[j0..jn, g in [0,1]]`` -> the wrapper's delta
         action, saturating joint moves the arm cannot make in one tick. The one
         shared path for converting scripted-policy outputs into agent actions."""
-        a = np.asarray(action, dtype=np.float64).reshape(-1)
+        a = np.asarray(action, dtype=np.float64).reshape(-1, self._n_arm + 1)
         qpos = self.robot.joint_positions
-        delta = np.clip((a[: self._n_arm] - qpos) / self.max_delta_rad, -1.0, 1.0)
-        gripper = 2.0 * np.clip(a[self._n_arm], 0.0, 1.0) - 1.0
-        return np.append(delta, gripper).astype(np.float32)
+        delta = np.clip((a[:, : self._n_arm] - qpos) / self.max_delta_rad, -1.0, 1.0)
+        gripper = 2.0 * np.clip(a[:, self._n_arm :], 0.0, 1.0) - 1.0
+        return np.concatenate([delta, gripper], axis=-1).astype(np.float32)

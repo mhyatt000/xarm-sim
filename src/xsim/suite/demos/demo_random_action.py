@@ -14,7 +14,7 @@ def main() -> None:
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         print(
-            f"step={i} reward={reward:.3f} terminated={terminated} "
+            f"step={i} reward={reward.round(3)} terminated={terminated} "
             f"truncated={truncated} info={info}"
         )
 

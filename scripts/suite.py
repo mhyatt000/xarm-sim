@@ -4,7 +4,7 @@ Builds a registered env by name and steps either random actions or the
 scripted waypoint lift policy — a quick check that model composition,
 controllers, policies, and the episode loop hold together.
 
-    uv run python scripts/suite.py [--env Lift] [--steps 5] [--seed 0]
+    uv run python scripts/suite.py [--env Lift] [--steps 5] [--seed 0] [--n-envs 16]
     uv run python scripts/suite.py --policy waypoint --steps 200 --seed 0
 """
 
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import tyro
 
 import xsim.suite as suite
@@ -27,6 +28,7 @@ class Config:
     steps: int = 5
     seed: int = 0
     horizon: int = 300
+    n_envs: int = 1
     show_viewer: bool = False
     policy: Literal["random", "waypoint"] = "random"
     steps_per_segment: int = 20
@@ -40,6 +42,7 @@ def main(cfg: Config) -> None:
     env = suite.make(
         cfg.env,
         horizon=cfg.horizon,
+        n_envs=cfg.n_envs,
         show_viewer=cfg.show_viewer,
         noslip_iterations=cfg.noslip_iterations,
         render_backend=cfg.render_backend,
@@ -74,11 +77,13 @@ def main(cfg: Config) -> None:
         action = policy.act(obs) if policy is not None else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         record()
+        done = terminated | truncated
         print(
-            f"step {i}: reward={reward:.3f} terminated={terminated} "
-            f"truncated={truncated} info={info} cube={obs['cube_pos'].round(3)}"
+            f"step {i}: reward={np.round(reward, 3)} terminated={terminated.astype(int)} "
+            f"truncated={truncated.astype(int)} success={info['success'].astype(int)} "
+            f"cube0={obs['cube_pos'][0].round(3)}"
         )
-        if terminated or truncated:
+        if done.all():
             print(f"episode end at step {i}: success={info['success']}")
             if policy is not None:
                 break

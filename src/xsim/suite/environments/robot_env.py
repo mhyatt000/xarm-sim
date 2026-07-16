@@ -97,6 +97,7 @@ class RobotEnv(GenesisEnv):
                     res=self.camera_res, fov=spec.fov_deg or self.fov_deg, GUI=False,
                     pos=spec.pos or (1.0, 0.0, 0.5), lookat=spec.lookat or (0.0, 0.0, 0.0),
                     near=0.02, far=50.0,  # default near clips the wrist cam's own gripper
+                    env_idx=0,  # rendering is single-env
                 )
 
     def _bind_cameras(self) -> None:
@@ -121,7 +122,8 @@ class RobotEnv(GenesisEnv):
         for name in self._rig_attached:
             self.cams[name].move_to_attach()
         for cam, link, offset in self._manual_attached:
-            T = pose_to_T(link.get_pos(), link.get_quat()) @ offset
+            # cameras follow env 0 (rendering is single-env)
+            T = pose_to_T(link.get_pos()[0], link.get_quat()[0]) @ offset
             pos = tuple(T[:3, 3])
             cam.update_camera_pose(pos=pos, lookat=tuple(T[:3, 3] - T[:3, 2]), up=tuple(T[:3, 1]))
 
@@ -163,10 +165,13 @@ class RobotEnv(GenesisEnv):
             robot.setup()
         self._bind_cameras()
         lows, highs = zip(*(robot.action_limits for robot in self.robots))
-        self.action_space = gym.spaces.Box(
+        self.single_action_space = gym.spaces.Box(
             np.concatenate(lows).astype(np.float32),
             np.concatenate(highs).astype(np.float32),
             dtype=np.float32,
+        )
+        self.action_space = gym.vector.utils.batch_space(
+            self.single_action_space, self.n_envs
         )
 
     @property
@@ -181,22 +186,22 @@ class RobotEnv(GenesisEnv):
             observables[pf + "joint_vel"] = lambda robot=robot: robot.joint_velocities
             observables[pf + "eef_pos"] = lambda robot=robot: robot.ee_pos
             observables[pf + "eef_quat"] = lambda robot=robot: robot.ee_quat
-            observables[pf + "gripper_norm"] = lambda robot=robot: [robot.gripper_norm]
+            observables[pf + "gripper_norm"] = lambda robot=robot: robot.gripper_norm[:, None]
         return observables
 
     def _pre_action(self, action) -> None:
-        a = np.asarray(action, dtype=np.float64).reshape(-1)
-        if a.shape[0] != self.action_dim:
+        a = np.asarray(action, dtype=np.float64)
+        if a.shape != (self.n_envs, self.action_dim):
             raise ValueError(
-                f"Action has dimension {a.shape[0]}, expected {self.action_dim}"
+                f"Action has shape {a.shape}, expected {(self.n_envs, self.action_dim)}"
             )
         offset = 0
         for robot in self.robots:
-            robot.control(a[offset : offset + robot.action_dim])
+            robot.control(a[:, offset : offset + robot.action_dim])
             offset += robot.action_dim
 
-    def _reset_internal(self) -> None:
-        super()._reset_internal()
+    def _reset_internal(self, envs_idx=None) -> None:
+        super()._reset_internal(envs_idx)
         for robot in self.robots:
-            robot.reset()
+            robot.reset(envs_idx)
         self._sync_attached_cams()  # wrist cam follows the freshly reset arm

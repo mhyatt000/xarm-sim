@@ -74,14 +74,14 @@ class Robot:
         return lo, hi
 
     def control(self, action: np.ndarray) -> None:
-        a = np.asarray(action, dtype=np.float64).reshape(-1)
-        if a.shape[0] != self.action_dim:
+        a = np.asarray(action, dtype=np.float64)
+        if a.ndim != 2 or a.shape[1] != self.action_dim:
             raise ValueError(
-                f"action has {a.shape[0]} dims, expected {self.action_dim}"
+                f"action has shape {a.shape}, expected (n_envs, {self.action_dim})"
             )
         offset = 0
         for c in self._controllers:
-            c.run(a[offset : offset + c.action_dim])
+            c.run(a[:, offset : offset + c.action_dim])
             offset += c.action_dim
 
     def reset(self, envs_idx=None) -> None:
@@ -92,7 +92,7 @@ class Robot:
             c.reset()
 
     def ik(self, pose: torch.Tensor) -> np.ndarray:
-        """Arm joint targets (7,) for an EE pose [1,7] = [x,y,z,qw,qx,qy,qz]."""
+        """Arm joint targets (n_envs, 7) for EE poses [n_envs, 7] = [x,y,z,qw,qx,qy,qz]."""
         pose = pose.to(gs.device)
         init_qpos = (
             self._init_qpos.unsqueeze(0).expand(pose.shape[0], -1)
@@ -109,30 +109,30 @@ class Robot:
             damping=self.model.ik_damping,
             dofs_idx_local=self._arm_idx,
         )
-        return np.asarray(q[0, self._arm_idx].detach().cpu(), dtype=np.float64)
+        return np.asarray(q[:, self._arm_idx].detach().cpu(), dtype=np.float64)
 
     @property
     def joint_positions(self) -> np.ndarray:
-        q = np.asarray(self.entity.get_dofs_position().detach().cpu()).reshape(-1)
-        return q[: self.model.arm_dofs]
+        q = np.asarray(self.entity.get_dofs_position().detach().cpu())
+        return q[:, : self.model.arm_dofs]
 
     @property
     def joint_velocities(self) -> np.ndarray:
-        v = np.asarray(self.entity.get_dofs_velocity().detach().cpu()).reshape(-1)
-        return v[: self.model.arm_dofs]
+        v = np.asarray(self.entity.get_dofs_velocity().detach().cpu())
+        return v[:, : self.model.arm_dofs]
 
     @property
     def ee_pos(self) -> np.ndarray:
-        return np.asarray(self._ee_link.get_pos().detach().cpu()).reshape(-1)
+        return np.asarray(self._ee_link.get_pos().detach().cpu())
 
     @property
     def ee_quat(self) -> np.ndarray:
-        return np.asarray(self._ee_link.get_quat().detach().cpu()).reshape(-1)
+        return np.asarray(self._ee_link.get_quat().detach().cpu())
 
     @property
-    def gripper_norm(self) -> float:
+    def gripper_norm(self) -> np.ndarray:
+        q = np.asarray(self.entity.get_dofs_position().detach().cpu())
         if self.gripper is None:
-            return 1.0
-        q = np.asarray(self.entity.get_dofs_position().detach().cpu()).reshape(-1)
-        g = q[self.model.arm_dofs]
-        return float(np.clip(1.0 - g / self.gripper.close_dof, 0.0, 1.0))
+            return np.ones(q.shape[0], dtype=np.float64)
+        g = q[:, self.model.arm_dofs]
+        return np.clip(1.0 - g / self.gripper.close_dof, 0.0, 1.0)

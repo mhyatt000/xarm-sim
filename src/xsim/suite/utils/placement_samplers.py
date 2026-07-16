@@ -16,9 +16,12 @@ class UniformRandomSampler:
     y_range: tuple[float, float]
     yaw_range: tuple[float, float] = (-math.pi / 4, math.pi / 4)
 
-    def sample(self, rng: np.random.Generator) -> tuple[float, float, float]:
+    def sample(
+        self, rng: np.random.Generator, n: int = 1
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(x, y, yaw) arrays of shape (n,)."""
         return (
-            float(rng.uniform(*self.x_range)),
-            float(rng.uniform(*self.y_range)),
-            float(rng.uniform(*self.yaw_range)),
+            rng.uniform(*self.x_range, n),
+            rng.uniform(*self.y_range, n),
+            rng.uniform(*self.yaw_range, n),
         )

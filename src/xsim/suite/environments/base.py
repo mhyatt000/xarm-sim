@@ -50,6 +50,12 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
     a Task); this class owns the scene, the control decimation, and the
     step/reset flow. The scene is built once — reset() only restores state
     (Genesis scenes cannot be rebuilt).
+
+    Always batched: obs values are (n_envs, ...), actions (n_envs, action_dim),
+    and reward/terminated/truncated/info["success"] are (n_envs,) arrays — even
+    at n_envs=1. Episodes end per env; there is no auto-reset. Callers reset the
+    finished subset via reset(envs_idx=...) (or options={"envs_idx": ...} when
+    going through gym wrappers, whose reset() only forwards seed/options).
     """
 
     def __init__(
@@ -62,6 +68,8 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         noslip_iterations: int = 0,
     ):
         ensure_genesis_init()
+        if n_envs < 1:
+            raise ValueError(f"n_envs must be >= 1, got {n_envs}")
         self.physics_dt = physics_dt
         self.control_freq = control_freq
         self.horizon = horizon
@@ -70,12 +78,15 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         self.noslip_iterations = noslip_iterations
         self.control_every = max(1, round(1.0 / (control_freq * physics_dt)))
         self.control_dt = physics_dt * self.control_every
-        self.timestep = 0
+        self.timestep = np.zeros(n_envs, dtype=np.int64)
         self._load_model()
         self._initialize_sim()
         self._setup_references()
         self._observables = self._setup_observables()
-        self.observation_space = self._infer_observation_space()
+        self.single_observation_space = self._infer_observation_space()
+        self.observation_space = gym.vector.utils.batch_space(
+            self.single_observation_space, self.n_envs
+        )
 
     def _load_model(self) -> None:
         raise NotImplementedError
@@ -106,13 +117,24 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
     def _setup_observables(self) -> OrderedDict[str, Callable[[], np.ndarray]]:
         return OrderedDict()
 
-    def _reset_internal(self) -> None:
+    def _reset_internal(self, envs_idx=None) -> None:
         pass
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None):
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict | None = None,
+        envs_idx=None,
+    ):
         super().reset(seed=seed)
-        self.timestep = 0
-        self._reset_internal()
+        if envs_idx is None and options is not None:
+            envs_idx = options.get("envs_idx")
+        if envs_idx is None:
+            self.timestep[:] = 0
+        else:
+            self.timestep[np.asarray(envs_idx)] = 0
+        self._reset_internal(envs_idx)
         return self._get_observations(), {}
 
     def step(self, action):
@@ -130,24 +152,23 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
     def _post_sim_step(self) -> None:
         """After each physics step inside the decimation loop (e.g. camera sync)."""
 
-    def _post_action(self, action) -> tuple[float, bool, bool, dict]:
-        reward = self.reward(action)
-        success = self._check_success()
+    def _post_action(self, action) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         return (
-            reward,
-            self._check_terminated(),
+            np.asarray(self.reward(action), dtype=np.float32),
+            np.asarray(self._check_terminated(), dtype=bool),
             self.timestep >= self.horizon,
-            {"success": success},
+            {"success": np.asarray(self._check_success(), dtype=bool)},
         )
 
-    def reward(self, action=None) -> float:
+    def reward(self, action=None) -> np.ndarray:
+        """Per-env rewards, shape (n_envs,)."""
         raise NotImplementedError
 
-    def _check_success(self) -> bool:
-        return False
+    def _check_success(self) -> np.ndarray:
+        return np.zeros(self.n_envs, dtype=bool)
 
-    def _check_terminated(self) -> bool:
-        return False
+    def _check_terminated(self) -> np.ndarray:
+        return np.zeros(self.n_envs, dtype=bool)
 
     def _get_observations(self) -> dict[str, np.ndarray]:
         return {
@@ -156,10 +177,11 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
         }
 
     def _infer_observation_space(self) -> gym.spaces.Dict:
+        """Per-env space; the batched space is batch_space(single, n_envs)."""
         sample = self._get_observations()
         return gym.spaces.Dict(
             {
-                k: gym.spaces.Box(-np.inf, np.inf, shape=v.shape, dtype=np.float32)
+                k: gym.spaces.Box(-np.inf, np.inf, shape=v.shape[1:], dtype=np.float32)
                 for k, v in sample.items()
             }
         )

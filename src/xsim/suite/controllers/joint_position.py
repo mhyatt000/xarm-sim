@@ -54,7 +54,9 @@ class JointPositionController(Controller):
 
     def run(self, action: np.ndarray) -> None:
         target = np.clip(
-            np.asarray(action, dtype=np.float64).reshape(-1), self._q_lo, self._q_hi
+            np.asarray(action, dtype=np.float64).reshape(-1, self.action_dim),
+            self._q_lo,
+            self._q_hi,
         )
-        t = torch.tensor(target[None], device=gs.device, dtype=gs.tc_float)
+        t = torch.tensor(target, device=gs.device, dtype=gs.tc_float)
         self.entity.control_dofs_position(position=t, dofs_idx_local=self.dofs_idx)

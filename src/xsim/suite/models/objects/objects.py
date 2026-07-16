@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import genesis as gs
@@ -24,22 +23,34 @@ class GenesisObject:
         """Height of the object's top above its origin."""
         raise NotImplementedError
 
-    def set_pose(self, x: float, y: float, z: float, yaw: float = 0.0) -> None:
-        pos = torch.tensor([[x, y, z]], device=gs.device, dtype=gs.tc_float)
-        quat = torch.tensor(
-            [[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]],
-            device=gs.device,
-            dtype=gs.tc_float,
+    def set_pose(self, x, y, z, yaw=0.0, envs_idx=None) -> None:
+        """Place the object in the selected envs (all when ``envs_idx=None``).
+
+        ``x/y/z/yaw`` broadcast against each other; pass (K,) arrays with
+        K = n_envs (or len(envs_idx)) for per-env poses.
+        """
+        x, y, z, yaw = np.broadcast_arrays(
+            *(np.atleast_1d(np.asarray(v, dtype=np.float64)) for v in (x, y, z, yaw))
         )
-        self.entity.set_pos(pos, skip_forward=True)
-        self.entity.set_quat(quat, skip_forward=False)
+        pos = np.stack([x, y, z], axis=1)
+        half = yaw / 2.0
+        quat = np.stack(
+            [np.cos(half), np.zeros_like(half), np.zeros_like(half), np.sin(half)],
+            axis=1,
+        )
+        pos_t = torch.tensor(pos, device=gs.device, dtype=gs.tc_float)
+        quat_t = torch.tensor(quat, device=gs.device, dtype=gs.tc_float)
+        # skip_forward chains so forward kinematics runs once for the batch
+        self.entity.set_pos(pos_t, envs_idx=envs_idx, skip_forward=True)
+        self.entity.set_quat(quat_t, envs_idx=envs_idx, skip_forward=False)
 
     def get_pos(self) -> np.ndarray:
-        return np.asarray(self.entity.get_pos().detach().cpu()).reshape(-1)
+        """Positions (n_envs, 3)."""
+        return np.asarray(self.entity.get_pos().detach().cpu())
 
     def get_quat(self) -> np.ndarray:
-        """Orientation as wxyz quaternion."""
-        return np.asarray(self.entity.get_quat().detach().cpu()).reshape(-1)
+        """Orientations (n_envs, 4) as wxyz quaternions."""
+        return np.asarray(self.entity.get_quat().detach().cpu())
 
 
 @dataclass

@@ -37,8 +37,10 @@ class GripperController(Controller):
         self.entity.set_dofs_force_range(-f, f, dofs_idx_local=self.dofs_idx)
 
     def run(self, action: np.ndarray) -> None:
-        a = float(np.clip(np.asarray(action, dtype=np.float64).reshape(-1)[0], 0.0, 1.0))
+        a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), 0.0, 1.0)
         dof = self.gripper.grasp_dof + a * (self.gripper.open_dof - self.gripper.grasp_dof)
         n = int(self.dofs_idx.shape[0])
-        t = torch.full((1, n), float(dof), device=gs.device, dtype=gs.tc_float)
+        t = torch.tensor(
+            np.repeat(dof[:, None], n, axis=1), device=gs.device, dtype=gs.tc_float
+        )
         self.entity.control_dofs_position(position=t, dofs_idx_local=self.dofs_idx)

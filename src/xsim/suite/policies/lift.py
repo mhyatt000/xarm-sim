@@ -14,6 +14,7 @@ import math
 from typing import TYPE_CHECKING
 
 import genesis as gs
+import numpy as np
 import torch
 
 from xsim.suite.policies.waypoint import (
@@ -83,43 +84,55 @@ class LiftPolicy(WaypointPolicy):
     def waypoints(self) -> list[Waypoint]:
         r = self.robot
         ee = torch.cat(
-            [torch.as_tensor(r.ee_pos), torch.as_tensor(r.ee_quat)]
-        ).to(device=gs.device, dtype=torch.float32)
-        home_quat = ee[3:7].clone()
+            [torch.as_tensor(r.ee_pos), torch.as_tensor(r.ee_quat)], dim=-1
+        ).to(device=gs.device, dtype=torch.float32)  # (B, 7)
+        home_quat = ee[:, 3:7].clone()
         cube = torch.as_tensor(
             self.env.cube.get_pos(), device=gs.device, dtype=torch.float32
-        )
-        q = self.env.cube.get_quat()  # wxyz; cube spawn rotation is pure-z
-        cube_yaw = 2.0 * math.atan2(float(q[3]), float(q[0]))
+        )  # (B, 3)
+        q = self.env.cube.get_quat()  # (B, 4) wxyz; cube spawn rotation is pure-z
+        cube_yaw = 2.0 * np.arctan2(q[:, 3], q[:, 0])
         drop_x, drop_y = self.drop_xy
         top_z = self.env.arena.top_z
 
         grasp_quat = torch.as_tensor(
-            nearest_side_grasp_quat(cube_yaw, home_quat),
+            np.stack(
+                [
+                    nearest_side_grasp_quat(float(yaw), home_quat[i])
+                    for i, yaw in enumerate(cube_yaw)
+                ]
+            ),
             device=gs.device,
             dtype=torch.float32,
-        )
+        )  # (B, 4)
 
-        def pose(xyz, quat):
-            return torch.cat(
-                [torch.as_tensor(xyz, device=gs.device, dtype=torch.float32), quat]
-            ).reshape(1, 7)
+        def pose(x, y, z, quat):
+            xyz = torch.stack(
+                [
+                    torch.as_tensor(v, device=gs.device, dtype=torch.float32).expand(
+                        quat.shape[0]
+                    )
+                    for v in (x, y, z)
+                ],
+                dim=-1,
+            )
+            return torch.cat([xyz, quat], dim=-1)
 
         grasp_z = top_z + GRASP_TCP_OFFSET
         lift_z = grasp_z + LIFT_HEIGHT
-        above = pose([cube[0], cube[1], grasp_z + APPROACH_HEIGHT], grasp_quat)
-        at = pose([cube[0], cube[1], grasp_z], grasp_quat)
-        lift = pose([cube[0], cube[1], lift_z], grasp_quat)
+        above = pose(cube[:, 0], cube[:, 1], grasp_z + APPROACH_HEIGHT, grasp_quat)
+        at = pose(cube[:, 0], cube[:, 1], grasp_z, grasp_quat)
+        lift = pose(cube[:, 0], cube[:, 1], lift_z, grasp_quat)
         # transport level with the lift; release happens over the drop (no lowering)
-        over_drop = pose([drop_x, drop_y, lift_z], grasp_quat)
-        retreat = pose([drop_x, drop_y, grasp_z + APPROACH_HEIGHT], grasp_quat)
+        over_drop = pose(drop_x, drop_y, lift_z, grasp_quat)
+        retreat = pose(drop_x, drop_y, grasp_z + APPROACH_HEIGHT, grasp_quat)
 
         def hold(weight: float) -> int:
             return max(2, round(weight * self.steps_per_segment))
 
         w = SEGMENT_WEIGHTS
         return [
-            Waypoint(ee.reshape(1, 7), GRIPPER_OPEN, 1),
+            Waypoint(ee, GRIPPER_OPEN, 1),
             Waypoint(above, GRIPPER_OPEN, hold(w[0])),
             Waypoint(at, GRIPPER_OPEN, hold(w[1])),
             Waypoint(at, GRIPPER_CLOSED, hold(w[2])),

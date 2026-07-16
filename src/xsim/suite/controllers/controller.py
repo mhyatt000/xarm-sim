@@ -28,4 +28,5 @@ class Controller(ABC):
 
     @abstractmethod
     def run(self, action: np.ndarray) -> None:
-        """Apply one control tick's action to this part's dofs."""
+        """Apply one control tick's batched (n_envs, action_dim) action to this
+        part's dofs."""

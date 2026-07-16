@@ -53,25 +53,25 @@ class Lift(ManipulationEnv):
         )
         return observables
 
-    def _reset_internal(self) -> None:
-        super()._reset_internal()
-        x, y, yaw = self.placement_initializer.sample(self.np_random)
-        self.cube.set_pose(x, y, self.arena.top_z + self.cube.top_offset, yaw)
+    def _reset_internal(self, envs_idx=None) -> None:
+        super()._reset_internal(envs_idx)
+        n = self.n_envs if envs_idx is None else len(np.atleast_1d(envs_idx))
+        x, y, yaw = self.placement_initializer.sample(self.np_random, n)
+        self.cube.set_pose(
+            x, y, self.arena.top_z + self.cube.top_offset, yaw, envs_idx=envs_idx
+        )
 
-    def reward(self, action=None) -> float:
-        if self._check_success():
-            return 1.0
+    def reward(self, action=None) -> np.ndarray:
+        success = self._check_success()
         if self.reward_shaping:
-            return 0.5 * (
-                1.0
-                - float(
-                    np.tanh(10.0 * self._gripper_to_target_dist(self.cube.get_pos()))
-                )
+            shaped = 0.5 * (
+                1.0 - np.tanh(10.0 * self._gripper_to_target_dist(self.cube.get_pos()))
             )
-        return 0.0
+            return np.where(success, 1.0, shaped).astype(np.float32)
+        return success.astype(np.float32)
 
-    def _check_success(self) -> bool:
-        return float(self.cube.get_pos()[2]) > self.arena.top_z + self.lift_height
+    def _check_success(self) -> np.ndarray:
+        return self.cube.get_pos()[:, 2] > self.arena.top_z + self.lift_height
 
-    def _check_terminated(self) -> bool:
+    def _check_terminated(self) -> np.ndarray:
         return self._check_success()
