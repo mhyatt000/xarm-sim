@@ -33,10 +33,11 @@ GRASP_TCP_OFFSET = 0.018
 APPROACH_HEIGHT = 0.12
 LIFT_HEIGHT = 0.09
 # Per-segment travel durations (x steps_per_segment): approach, plunge, close,
-# lift, transport+settle, release, retreat. Approach keeps the real demos' slow
-# start; lift is deliberately fast. Close/release reuse the previous pose, so
-# those segments are in-place dwells.
-SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.6, 0.6, 1.0)
+# lift, hold, transport+settle, release, retreat. Approach keeps the real demos'
+# slow start; lift is deliberately fast. Close/hold/release reuse the previous
+# pose, so those segments are in-place dwells — hold keeps the cube still in the
+# grip long enough to satisfy Lift's held-success condition (hold_ticks + settle).
+SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 0.6, 1.6, 0.6, 1.0)
 
 
 def yawed_top_down_quat(yaw: float) -> tuple[float, float, float, float]:
@@ -137,7 +138,8 @@ class LiftPolicy(WaypointPolicy):
             Waypoint(at, GRIPPER_OPEN, hold(w[1])),
             Waypoint(at, GRIPPER_CLOSED, hold(w[2])),
             Waypoint(lift, GRIPPER_CLOSED, hold(w[3])),
-            Waypoint(over_drop, GRIPPER_CLOSED, hold(w[4])),
-            Waypoint(over_drop, GRIPPER_OPEN, hold(w[5])),
-            Waypoint(retreat, GRIPPER_OPEN, hold(w[6])),
+            Waypoint(lift, GRIPPER_CLOSED, hold(w[4])),  # hold still at height
+            Waypoint(over_drop, GRIPPER_CLOSED, hold(w[5])),
+            Waypoint(over_drop, GRIPPER_OPEN, hold(w[6])),
+            Waypoint(retreat, GRIPPER_OPEN, hold(w[7])),
         ]

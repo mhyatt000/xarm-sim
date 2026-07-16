@@ -104,6 +104,10 @@ class Config:
     # accumulated penalty; 0.002 keeps a typical episode's total penalty ~0.02.
     dev_penalty_coef: float = 0.0
     noslip_iterations: int = 10       # weld-free grasping needs the noslip solver
+    # rendering (videos only; never on the physics path)
+    render_backend: Literal["raster", "nyx"] = "raster"
+    render_spp: int = 8               # nyx samples per pixel
+    cameras: tuple[str, ...] | None = ("low",)  # None = all declared (low, side, wrist)
 
 
 # ---------------------------------------------------------------------------------------
@@ -509,8 +513,15 @@ def build_env(cfg: Config) -> TensorShim:
 
     gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
             precision="32", logging_level="warning")
+    renderer_config = None
+    if cfg.render_backend == "nyx":
+        from xsim.suite.renderers import NyxConfig
+
+        renderer_config = NyxConfig(spp=cfg.render_spp)
     env = make(
-        "Lift", robots="XArm7", camera_names=["low"], render_backend="raster",
+        "Lift", robots="XArm7",
+        camera_names=list(cfg.cameras) if cfg.cameras is not None else None,
+        render_backend=cfg.render_backend, renderer_config=renderer_config,
         physics_dt=1.0 / cfg.sim_hz, control_freq=cfg.control_freq,
         horizon=cfg.max_steps, n_envs=cfg.n_envs,
         noslip_iterations=cfg.noslip_iterations,
@@ -756,7 +767,8 @@ class Trainer:
                 ep_reward[live] += reward[live]
                 ep_len[live] += 1
                 if record and live[0]:
-                    frames.append(env.render_views()["low"])
+                    views = env.render_views()
+                    frames.append(np.concatenate([views[k] for k in sorted(views)], axis=1))
                 for i in np.flatnonzero(live & done):
                     successes.append(float(info["success"][i]))
                     rewards.append(float(ep_reward[i]))

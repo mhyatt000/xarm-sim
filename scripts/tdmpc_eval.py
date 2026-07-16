@@ -42,6 +42,11 @@ class Config:
     binary_gripper: bool = True
     cube_vel_obs: bool = True         # v6/v7 checkpoints: pass --no-cube-vel-obs (32-d obs)
     noslip_iterations: int = 10
+    # rendering: --render-backend nyx --cameras None renders all views (low, side,
+    # wrist) with the splat renderer; videos concatenate views side by side
+    render_backend: Literal["raster", "nyx"] = "raster"
+    render_spp: int = 8
+    cameras: tuple[str, ...] | None = ("low",)
 
 
 def main(cfg: Config) -> None:
@@ -53,6 +58,8 @@ def main(cfg: Config) -> None:
                        max_delta_rad=cfg.max_delta_rad, binary_gripper=cfg.binary_gripper,
                        cube_vel_obs=cfg.cube_vel_obs,
                        noslip_iterations=cfg.noslip_iterations,
+                       render_backend=cfg.render_backend, render_spp=cfg.render_spp,
+                       cameras=cfg.cameras,
                        mpc=cfg.mpc, compile=cfg.compile)
     env = build_env(tcfg)
     env.autoreset = False
@@ -85,7 +92,8 @@ def main(cfg: Config) -> None:
             prev_a = actions
             ep_len[live] += 1
             if record and live[0]:
-                frames.append(env.render_views()["low"])
+                views = env.render_views()
+                frames.append(np.concatenate([views[k] for k in sorted(views)], axis=1))
             for i in np.flatnonzero(live & done):
                 res = dict(round=rd, env=int(i), seed=cfg.seed + rd,
                            success=bool(info["success"][i]), steps=int(ep_len[i]),
