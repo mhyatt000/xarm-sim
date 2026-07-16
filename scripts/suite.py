@@ -25,6 +25,7 @@ from xsim.suite.renderers import NyxConfig
 @dataclass
 class Config:
     env: str = "Lift"
+    robots: list[str] | None = None  # override the env's default robot set
     steps: int = 5
     seed: int = 0
     horizon: int = 300
@@ -41,6 +42,7 @@ class Config:
 def main(cfg: Config) -> None:
     env = suite.make(
         cfg.env,
+        **({"robots": cfg.robots} if cfg.robots is not None else {}),
         horizon=cfg.horizon,
         n_envs=cfg.n_envs,
         show_viewer=cfg.show_viewer,

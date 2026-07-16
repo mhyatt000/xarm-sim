@@ -8,6 +8,7 @@ from typing import Literal
 import genesis as gs
 
 from xsim.suite.models.cameras import CameraSpec
+from xsim.suite.models.mounts import Mount
 
 ROBOT_MODEL_REGISTRY: dict[str, type[RobotModel]] = {}
 
@@ -37,6 +38,8 @@ class RobotModel:
     ik_damping: float = 0.01
     # robot-mounted cameras (robosuite keeps eye-in-hand cams in the robot XML)
     cameras: tuple[CameraSpec, ...] = ()
+    # fixed rig the robot bolts onto; its geometry is added alongside the robot
+    mount: Mount | None = None
     entity: object = field(default=None, repr=False, compare=False)
 
     def __init_subclass__(cls, **kwargs):

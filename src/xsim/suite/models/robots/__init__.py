@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from xsim.suite.models.robots.dxarm7 import DXArm7L, DXArm7R
 from xsim.suite.models.robots.robot_model import ROBOT_MODEL_REGISTRY, RobotModel
 from xsim.suite.models.robots.xarm7 import XArm7
 
-__all__ = ["ROBOT_MODEL_REGISTRY", "RobotModel", "XArm7", "create_robot_model"]
+__all__ = [
+    "DXArm7L",
+    "DXArm7R",
+    "ROBOT_MODEL_REGISTRY",
+    "RobotModel",
+    "XArm7",
+    "create_robot_model",
+]
 
 
 def create_robot_model(name: str) -> RobotModel:
