@@ -32,11 +32,6 @@ class Config:
     out: Path | None = None       # default: <checkpoint dir>/eval
     mpc: bool = True              # plan with MPPI (false = raw policy prior)
     compile: bool = True
-    # retrofit chunk-execution knobs: plan_horizon overrides the planner's rollout
-    # length (the world model is 1-step, so any horizon works on any checkpoint);
-    # exec_horizon executes the first k planned actions open-loop per plan call.
-    plan_horizon: int | None = None
-    exec_horizon: int = 1
     # env (mirrors tdmpc_train.Config)
     n_envs: int = 16
     backend: Literal["gpu", "cpu"] = "gpu"
@@ -59,9 +54,6 @@ def main(cfg: Config) -> None:
                        cube_vel_obs=cfg.cube_vel_obs,
                        noslip_iterations=cfg.noslip_iterations,
                        mpc=cfg.mpc, compile=cfg.compile)
-    if cfg.plan_horizon is not None:
-        tcfg.horizon = cfg.plan_horizon
-    assert 1 <= cfg.exec_horizon <= (cfg.plan_horizon or tcfg.horizon)
     env = build_env(tcfg)
     env.autoreset = False
     out = cfg.out or cfg.checkpoint.parent / "eval"
@@ -84,19 +76,14 @@ def main(cfg: Config) -> None:
         ep_len = np.zeros(B, dtype=int)
         jerk_sum = np.zeros(B)
         prev_a: torch.Tensor | None = None
-        t = 0
         while live.any():
-            if t % cfg.exec_horizon == 0:
-                torch.compiler.cudagraph_mark_step_begin()
-                actions = agent.act(obs, eval_mode=True)
-            else:  # open-loop continuation of the last plan
-                actions = agent.plan_action(t % cfg.exec_horizon)
+            torch.compiler.cudagraph_mark_step_begin()
+            actions = agent.act(obs, eval_mode=True)
             obs, reward, done, info = env.step(actions)
             if prev_a is not None:
                 jerk_sum[live] += ((actions - prev_a) ** 2).mean(dim=-1).numpy()[live]
             prev_a = actions
             ep_len[live] += 1
-            t += 1
             if record and live[0]:
                 frames.append(env.render_views()["low"])
             for i in np.flatnonzero(live & done):
@@ -117,11 +104,10 @@ def main(cfg: Config) -> None:
     rate = float(np.mean([r["success"] for r in results]))
     jerk = float(np.mean([r["jerk"] for r in results]))
     print(f"\n[result] success {sum(r['success'] for r in results)}/{len(results)} ({rate:.0%}) "
-          f"mean_jerk={jerk:.3f} plan_h={cfg.plan_horizon} exec_h={cfg.exec_horizon}")
+          f"mean_jerk={jerk:.3f}")
     with (out / "results.json").open("w") as f:
         json.dump({"checkpoint": str(cfg.checkpoint), "success_rate": rate,
-                   "mean_jerk": jerk, "plan_horizon": cfg.plan_horizon,
-                   "exec_horizon": cfg.exec_horizon, "episodes": results}, f, indent=2)
+                   "mean_jerk": jerk, "episodes": results}, f, indent=2)
     print(f"[result] wrote {out / 'results.json'}")
 
 

@@ -175,20 +175,11 @@ def make_agent(tdcfg, n_envs: int):
         def __init__(self, cfg, n_envs: int):
             super().__init__(cfg)
             self.n_envs = n_envs
-            # full chosen plan from the last _plan call, [B, H, A]: lets callers
-            # execute k > 1 planned actions open-loop (exec-horizon chunking)
-            self._last_plan = torch.nn.Buffer(
-                torch.zeros(n_envs, cfg.horizon, cfg.action_dim, device=self.device),
-                persistent=False)
             self._prev_means = torch.nn.Buffer(
                 torch.zeros(n_envs, cfg.horizon, cfg.action_dim, device=self.device))
 
         def reset_envs(self, envs_idx) -> None:
             self._prev_means[torch.as_tensor(envs_idx, device=self.device)] = 0.0
-
-        def plan_action(self, j: int) -> torch.Tensor:
-            """j-th action (B, A) of the last plan, for open-loop chunk execution."""
-            return self._last_plan[:, j].cpu()
 
         @torch.no_grad()
         def act(self, obs, t0=False, eval_mode=False, task=None):
@@ -262,9 +253,7 @@ def make_agent(tdcfg, n_envs: int):
 
             rand_idx = tdmath.gumbel_softmax_sample(score, dim=1)             # (B,)
             sel = rand_idx.reshape(1, B, 1, 1).expand(H, B, 1, A)
-            chosen = torch.gather(elite_actions, 2, sel).squeeze(2)           # (H, B, A)
-            self._last_plan.copy_(chosen.permute(1, 0, 2).clamp(-1, 1))
-            a = chosen[0]                                                     # (B, A)
+            a = torch.gather(elite_actions, 2, sel).squeeze(2)[0]             # (B, A)
             if not eval_mode:
                 a = a + std[0] * torch.randn(B, A, device=std.device)
             self._prev_means.copy_(mean.permute(1, 0, 2))
