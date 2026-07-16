@@ -130,14 +130,24 @@ class RobotEnv(GenesisEnv):
     def _post_sim_step(self) -> None:
         self._sync_attached_cams()
 
-    def render_views(self) -> dict[str, np.ndarray]:
+    def render_views(self, all_envs: bool = False) -> dict[str, np.ndarray]:
         """Named RGB frames from every instantiated camera (on demand — rendering
-        is never part of the step loop)."""
+        is never part of the step loop). ``all_envs=True`` returns (n_envs, H, W, 3)
+        stacks instead of env 0's frame — nyx only, whose sensors render every env
+        into the batch cache anyway; raster cameras are built on env 0."""
         out = {}
         for name, cam in self.cams.items():
-            rgb = cam.render(rgb=True)[0] if hasattr(cam, "render") else cam.read(envs_idx=0).rgb
+            if hasattr(cam, "render"):  # raster camera
+                if all_envs:
+                    raise ValueError(
+                        "all_envs rendering requires render_backend='nyx'; "
+                        "raster cameras are single-env"
+                    )
+                rgb = cam.render(rgb=True)[0]
+            else:
+                rgb = cam.read().rgb if all_envs else cam.read(envs_idx=0).rgb
             rgb = rgb.detach().cpu().numpy() if hasattr(rgb, "detach") else np.asarray(rgb)
-            if rgb.ndim == 4:
+            if not all_envs and rgb.ndim == 4:
                 rgb = rgb[0]
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
