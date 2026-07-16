@@ -130,6 +130,10 @@ class Robot:
         return np.asarray(self._ee_link.get_quat().detach().cpu())
 
     @property
+    def ee_vel(self) -> np.ndarray:
+        return np.asarray(self._ee_link.get_vel().detach().cpu())
+
+    @property
     def gripper_norm(self) -> np.ndarray:
         q = np.asarray(self.entity.get_dofs_position().detach().cpu())
         if self.gripper is None:

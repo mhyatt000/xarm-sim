@@ -13,11 +13,13 @@ class Lift(ManipulationEnv):
     """xArm7 red-cube lift: sparse reward for a stable, held lift.
     Suite counterpart of robosuite's Lift, composed from TableArena + BoxObject.
 
-    Success requires, for ``success_hold_ticks`` CONSECUTIVE control steps:
-    cube above ``lift_height``, cube speed under ``success_max_speed``, cube
-    within ``success_eef_xy_radius`` of the end-effector in the xy plane, and
-    cube-robot contact. An instantaneous height crossing (a fling) no longer
-    counts — the cube must be held up, still, in the gripper.
+    Success requires, for ``success_hold_ticks`` CONSECUTIVE control steps
+    (default 1): cube above ``lift_height``, cube speed RELATIVE TO THE
+    END-EFFECTOR under ``success_max_speed``, cube within
+    ``success_eef_xy_radius`` of the end-effector in the xy plane, and
+    cube-robot contact. Relative speed distinguishes a fling (cube fast vs the
+    hand) from a brisk transport (cube moving with the hand), so the hold-tick
+    count no longer has to do that job.
     """
 
     def __init__(
@@ -28,7 +30,7 @@ class Lift(ManipulationEnv):
         x_range: tuple[float, float] = (0.35, 0.58),
         y_range: tuple[float, float] = (-0.15, 0.15),
         lift_height: float = 0.05,
-        success_hold_ticks: int = 4,
+        success_hold_ticks: int = 1,
         success_max_speed: float = 0.10,
         success_eef_xy_radius: float = 0.08,
         reward_shaping: bool = False,
@@ -104,7 +106,8 @@ class Lift(ManipulationEnv):
         ``success_hold_ticks`` consecutive control steps."""
         pos = self.cube.get_pos()
         high = pos[:, 2] > self.arena.top_z + self.lift_height
-        slow = np.linalg.norm(self.cube.get_vel(), axis=-1) < self.success_max_speed
+        rel_vel = self.cube.get_vel() - self.robots[0].ee_vel
+        slow = np.linalg.norm(rel_vel, axis=-1) < self.success_max_speed
         near = (
             np.linalg.norm(pos[:, :2] - self.robots[0].ee_pos[:, :2], axis=-1)
             < self.success_eef_xy_radius
