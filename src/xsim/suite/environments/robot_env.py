@@ -12,7 +12,7 @@ import numpy as np
 from xsim.suite.environments.base import GenesisEnv
 from xsim.suite.models.cameras import CameraSpec
 from xsim.suite.models.robots import create_robot_model
-from xsim.suite.renderers import NyxConfig
+from xsim.suite.renderers import BatchConfig, NyxConfig
 from xsim.suite.robots import Robot
 
 
@@ -34,7 +34,7 @@ class RobotEnv(GenesisEnv):
         camera_res: tuple[int, int] = (640, 480),
         fov_deg: float = 42.0,
         render_backend: Literal["raster", "nyx", "batch"] = "raster",
-        renderer_config: NyxConfig | None = None,
+        renderer_config: NyxConfig | BatchConfig | None = None,
         **kwargs,
     ):
         names = [robots] if isinstance(robots, str) else list(robots)
@@ -55,7 +55,8 @@ class RobotEnv(GenesisEnv):
         if self.render_backend == "batch":
             import genesis as gs
 
-            return gs.options.renderers.BatchRenderer(use_rasterizer=True)
+            cfg = self.renderer_config or BatchConfig()
+            return gs.options.renderers.BatchRenderer(use_rasterizer=cfg.use_rasterizer)
         return None
 
     def _declared_cameras(self) -> list[tuple[CameraSpec, object]]:
@@ -108,16 +109,14 @@ class RobotEnv(GenesisEnv):
                     **({} if self.render_backend == "batch" else {"env_idx": 0}),
                 )
             if self.render_backend == "batch":
-                # madrona takes no lights from the scene; unlit frames are near-black.
-                # Key/fill pair roughly matching the nyx look (DEFAULT_LIGHT_DIR).
-                self.scene.add_light(
-                    pos=(0.0, 0.0, 3.0), dir=(-0.4, -0.4, -0.8), color=(1.0, 1.0, 1.0),
-                    directional=True, castshadow=True, cutoff=45.0, intensity=2.0,
-                )
-                self.scene.add_light(
-                    pos=(0.0, 0.0, 3.0), dir=(0.5, 0.3, -0.6), color=(1.0, 1.0, 1.0),
-                    directional=True, castshadow=False, cutoff=45.0, intensity=1.0,
-                )
+                # madrona takes no lights from the scene; unlit frames are near-black
+                cfg = self.renderer_config or BatchConfig()
+                for light in cfg.lights:
+                    self.scene.add_light(
+                        pos=light.pos, dir=light.dir, color=light.color,
+                        directional=True, castshadow=light.castshadow,
+                        cutoff=45.0, intensity=light.intensity,
+                    )
 
     def _bind_cameras(self) -> None:
         """Post-build: pose static cams (incl. their up vector) and attach mounted ones."""

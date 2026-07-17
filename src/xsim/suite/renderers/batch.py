@@ -1,0 +1,32 @@
+"""Madrona batch renderer config.
+
+Renderer-only concerns for render_backend="batch": rasterizer vs raytracer,
+and the light rig (madrona takes no lights from the scene; unlit frames are
+near-black). Lighting is part of the observation domain for image policies —
+freeze it per experiment, or vary it deliberately as domain randomization.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class BatchLight:
+    dir: tuple[float, float, float]
+    intensity: float
+    castshadow: bool = False
+    color: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    pos: tuple[float, float, float] = (0.0, 0.0, 3.0)  # unused for directional
+
+
+@dataclass
+class BatchConfig:
+    # raytracer by default: 273k vs 102k env-cam frames/s at B=256x3cam@64px on a
+    # 5090, with real shadows; the rasterizer is the compatibility path
+    use_rasterizer: bool = False
+    # key/fill pair roughly matching the nyx DEFAULT_LIGHT_DIR look
+    lights: tuple[BatchLight, ...] = (
+        BatchLight(dir=(-0.4, -0.4, -0.8), intensity=2.0, castshadow=True),
+        BatchLight(dir=(0.5, 0.3, -0.6), intensity=1.0),
+    )
