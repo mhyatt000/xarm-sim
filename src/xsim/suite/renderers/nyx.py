@@ -81,8 +81,21 @@ def camera_options(
     spp: int,
     lights: list[dict],
     light_fields: tuple,
+    owner=None,
 ):
+    # Link-mounted cams attach natively (entity_idx/link_idx_local/offset_T):
+    # the sensor recomputes link_T @ offset_T per env inside every render, so
+    # each env's camera rides its own arm — never pose these from the outside.
+    attach = {}
+    if spec.attach_link is not None:
+        link = owner.get_link(spec.attach_link)
+        attach = dict(
+            entity_idx=owner.idx,
+            link_idx_local=link.idx_local,
+            offset_T=spec.attach_offset,
+        )
     return NyxCameraOptions(
+        **attach,
         res=res,
         fov=fov_deg,
         pos=spec.pos or (1.0, 0.0, 0.5),

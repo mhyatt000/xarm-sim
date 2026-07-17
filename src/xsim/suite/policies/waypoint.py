@@ -46,48 +46,80 @@ class WaypointPolicy:
     waypoints() hook; act() emits batched [j0..j6, g] actions (np.float32,
     shape (n_envs, 8)). All envs share the segment schedule; poses differ.
 
-    The commanded EE pose interpolates smoothly (position lerp, quaternion
-    slerp) from the previous waypoint to the active one over its ``steps``
-    ticks — arriving exactly on the waypoint at the last tick and immediately
-    departing into the next segment. IK is solved per tick on the interpolated
-    pose. A segment whose pose equals the previous one degenerates to a dwell
-    (how grasp-close holds are expressed). When the plan is exhausted the final
-    action repeats forever.
+    Closed-loop (default): each act() re-anchors to the robot's *actual* EE pose
+    and commands one step of the remaining fraction toward the active waypoint —
+    ``ee + (wp - ee) / remaining`` (slerp for the quat) — landing exactly on the
+    waypoint at the segment's last tick. Because the anchor is the measured pose,
+    the command is a valid correction from wherever the arm actually is, so the
+    policy stays meaningful when it is queried for DAgger labels (or takes over
+    mid-episode) while another policy has been driving off-schedule.
+
+    Open-loop (``closed_loop=False``, the previous behavior) interpolates from
+    the *nominal* previous waypoint on a fixed clock, ignoring the sim entirely
+    after reset.
+
+    IK is solved per tick on the commanded pose. A segment whose pose equals the
+    previous one degenerates to a dwell (how grasp-close holds are expressed).
+    When the plan is exhausted the final waypoint is commanded forever.
     """
 
     def __init__(self, robot: Robot, steps_per_segment: int = 20,
-                 cartesian: bool = False):
+                 cartesian: bool = False, closed_loop: bool = True,
+                 lookahead: float = 2.0):
         self.robot = robot
         self.steps_per_segment = steps_per_segment
         # cartesian: emit [x,y,z, qw..qz, g] pose actions (CartesianActionWrapper's
         # space) instead of solving IK here — pose labels are branch-unambiguous
         self.cartesian = cartesian
-        self._commands = None
+        self.closed_loop = closed_loop
+        # closed-loop only: command lookahead/remaining of the gap instead of
+        # 1/remaining. The PD arm realizes only ~55% of a commanded step per tick,
+        # so the exact-fraction command lands ~steps^-0.55 short of the waypoint;
+        # a 2x lead keeps commands bounded while compensating tracking lag.
+        self.lookahead = lookahead
+        self._plan: list[Waypoint] | None = None
 
     def waypoints(self) -> list[Waypoint]:
         """Return the episode's plan, built from the sim's current state."""
         raise NotImplementedError
 
     def reset(self, obs: Any = None) -> None:
-        self._commands = self._generator(self.waypoints())
+        self._plan = self.waypoints()
+        self._seg = 0
+        self._remaining = max(1, self._plan[0].steps)
+        self._prev = self._plan[0].pose  # open-loop anchor; plans start at the current EE poses
+        self._hold_action: np.ndarray | None = None
+
+    def _ee_pose(self) -> torch.Tensor:
+        r = self.robot
+        return torch.cat(
+            [torch.as_tensor(r.ee_pos), torch.as_tensor(r.ee_quat)], dim=-1
+        ).to(device=gs.device, dtype=torch.float32)
 
     def act(self, obs: Any = None) -> np.ndarray:
-        return next(self._commands)
-
-    def _generator(self, wps: list[Waypoint]):
-        action = None
-        prev = wps[0].pose  # plans start at the current EE poses
-        for wp in wps:
-            steps = max(1, wp.steps)
-            for k in range(1, steps + 1):
-                t = k / steps
-                pos = prev[:, :3] + t * (wp.pose[:, :3] - prev[:, :3])
-                quat = _slerp(prev[:, 3:7], wp.pose[:, 3:7], t)
-                action = self._action(torch.cat([pos, quat], dim=-1), wp.gripper)
-                yield action
-            prev = wp.pose
-        while True:
-            yield action
+        if self._hold_action is not None:  # plan exhausted: terminal hold
+            return self._hold_action
+        wp = self._plan[self._seg]
+        steps = max(1, wp.steps)
+        if self.closed_loop:
+            anchor = self._ee_pose()
+            t = min(1.0, self.lookahead / self._remaining)
+        else:
+            anchor = self._prev
+            t = (steps - self._remaining + 1) / steps
+        pos = anchor[:, :3] + t * (wp.pose[:, :3] - anchor[:, :3])
+        quat = _slerp(anchor[:, 3:7], wp.pose[:, 3:7], t)
+        action = self._action(torch.cat([pos, quat], dim=-1), wp.gripper)
+        self._remaining -= 1
+        if self._remaining == 0:
+            self._prev = wp.pose
+            self._seg += 1
+            if self._seg < len(self._plan):
+                self._remaining = max(1, self._plan[self._seg].steps)
+            else:
+                # the last tick commanded wp.pose exactly (t == 1); repeat it forever
+                self._hold_action = action
+        return action
 
     def _action(self, pose: torch.Tensor, gripper: float) -> np.ndarray:
         if self.cartesian:
