@@ -8,6 +8,45 @@ import gymnasium as gym
 import numpy as np
 
 
+def load_plates(plates: dict[str, np.ndarray | Path], res: tuple[int, int],
+                views: list[str] | None = None) -> dict[str, np.ndarray]:
+    """Load/resize plate images to camera res; keys not in ``views`` are dropped."""
+    import cv2
+
+    out = {}
+    for name, plate in plates.items():
+        if views is not None and name not in views:
+            continue
+        if isinstance(plate, (str, Path)):
+            plate = cv2.imread(str(plate))[:, :, ::-1]  # BGR -> RGB
+        out[name] = np.ascontiguousarray(
+            cv2.resize(np.asarray(plate), res, interpolation=cv2.INTER_AREA)
+        ).astype(np.uint8)
+    return out
+
+
+def _np(x) -> np.ndarray:
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+
+
+def render_plated_views(base, plates: dict[str, np.ndarray],
+                        seg_background: int = 0) -> dict[str, np.ndarray]:
+    """All-envs frames from a batch-backend env, with static-camera background
+    plates composited wherever the segmentation mask reads ``seg_background``."""
+    out = {}
+    for name, cam in base.cams.items():
+        plate = plates.get(name)
+        if plate is None:
+            rgb = _np(cam.render(rgb=True)[0])[..., :3]
+        else:
+            rgb_t, _, seg_t, _ = cam.render(rgb=True, segmentation=True)
+            rgb = _np(rgb_t)[..., :3]
+            bg = _np(seg_t) == seg_background  # (B, H, W)
+            rgb = np.where(bg[..., None], plate[None], rgb)
+        out[name] = rgb.astype(np.uint8)
+    return out
+
+
 class ImageObsWrapper(gym.Wrapper):
     """Adds ``obs["rgb"]``: (n_envs, V, 3, H, W) uint8 — one frame per
     instantiated camera per control step, views ordered by sorted camera name
@@ -37,41 +76,13 @@ class ImageObsWrapper(gym.Wrapper):
             self.single_observation_space, base.n_envs
         )
         self._seg_background = seg_background
-        self._plates: dict[str, np.ndarray] | None = None
-        if plates:
-            import cv2
-
-            self._plates = {}
-            for name, plate in plates.items():
-                if name not in self.views:
-                    continue
-                if isinstance(plate, (str, Path)):
-                    plate = cv2.imread(str(plate))[:, :, ::-1]  # BGR -> RGB
-                self._plates[name] = np.ascontiguousarray(
-                    cv2.resize(np.asarray(plate), (w, h), interpolation=cv2.INTER_AREA)
-                ).astype(np.uint8)
-
-    @staticmethod
-    def _np(x) -> np.ndarray:
-        return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+        self._plates = load_plates(plates, (w, h), self.views) if plates else None
 
     def _frames(self) -> dict[str, np.ndarray]:
         base = self.env.unwrapped
         if not self._plates:
             return base.render_views(all_envs=True)
-        out = {}
-        for name in self.views:
-            cam = base.cams[name]
-            plate = self._plates.get(name)
-            if plate is None:
-                rgb = self._np(cam.render(rgb=True)[0])[..., :3]
-            else:
-                rgb_t, _, seg_t, _ = cam.render(rgb=True, segmentation=True)
-                rgb = self._np(rgb_t)[..., :3]
-                bg = self._np(seg_t) == self._seg_background  # (B, H, W)
-                rgb = np.where(bg[..., None], plate[None], rgb)
-            out[name] = rgb.astype(np.uint8)
-        return out
+        return render_plated_views(base, self._plates, self._seg_background)
 
     def _attach(self, obs: dict) -> dict:
         views = self._frames()

@@ -39,6 +39,9 @@ class Config:
     render_backend: Literal["raster", "nyx", "batch"] = "raster"
     spp: int = 8                    # nyx samples per pixel
     batch_rasterizer: bool = False  # batch backend: rasterizer instead of the raytracer
+    # composite splat background plates behind static cams (batch backend only;
+    # generate with scripts/make_plates.py)
+    plates_dir: Path | None = None
     camera_res: tuple[int, int] = (640, 480)  # batch: keep VRAM in mind at high n_envs
     video: Path | None = None       # write render() frames to an mp4 (cv2, no GUI)
     # tile every env into a per-camera grid (nyx/batch — raster cams are single-env);
@@ -84,6 +87,12 @@ def main(cfg: Config) -> None:
     writer = None
     grid = (cfg.video_all_envs and cfg.n_envs > 1
             and cfg.render_backend in ("nyx", "batch"))
+    plates = None
+    if cfg.plates_dir is not None and cfg.render_backend == "batch":
+        from xsim.suite.wrappers.image_obs import load_plates
+
+        plates = load_plates(
+            {p.stem: p for p in sorted(cfg.plates_dir.glob("*.png"))}, cfg.camera_res)
 
     def record() -> None:
         nonlocal writer
@@ -92,7 +101,12 @@ def main(cfg: Config) -> None:
         import cv2
 
         if grid:
-            views = env.render_views(all_envs=True)
+            if plates is not None:
+                from xsim.suite.wrappers.image_obs import render_plated_views
+
+                views = render_plated_views(env, plates)
+            else:
+                views = env.render_views(all_envs=True)
             frame = np.concatenate(
                 [tile_grid(views[k], cfg.video_max_width) for k in sorted(views)],
                 axis=1,
