@@ -31,6 +31,29 @@ class Mount:
 
 
 @dataclass
+class PlateMount(Mount):
+    """The bare 5x8 in, 1 cm baseplate a table-mounted arm bolts onto: top face
+    flush with the robot base origin (z=0), so it fills the gap down to the
+    TableArena top at z = -0.01."""
+
+    plate_size: tuple[float, float, float] = (5 * IN, 8 * IN, 0.01)
+    color: tuple[float, float, float] = (0.62, 0.63, 0.65)
+
+    def base_pose(self):
+        return (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)
+
+    def add_to(self, scene: gs.Scene) -> None:
+        scene.add_entity(
+            gs.morphs.Box(
+                size=self.plate_size,
+                pos=(0.0, 0.0, -self.plate_size[2] / 2),
+                fixed=True,
+            ),
+            surface=gs.surfaces.Plastic(color=self.color, roughness=0.6),
+        )
+
+
+@dataclass
 class VMount4040(Mount):
     """One side of the dual-arm 45 deg V rig (mirrored about y=0), built from
     4040 extrusion approximated as 2x2 in bars:

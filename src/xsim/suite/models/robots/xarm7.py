@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from xsim.suite.models.cameras import CameraSpec, look_offset_T
+from xsim.suite.models.mounts import Mount, PlateMount
 from xsim.suite.models.robots.robot_model import RobotModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
@@ -47,3 +48,6 @@ class XArm7(RobotModel):
     arm_force_limit: float = 50.0
     gripper_name: str | None = "XArm7Gripper"
     cameras: tuple[CameraSpec, ...] = _XARM7_CAMERAS
+    # the real arm bolts onto a 5x8 in baseplate; TableArena.top_z = -0.01
+    # already prices in its 1 cm thickness, this adds the visible body
+    mount: Mount | None = field(default_factory=PlateMount)

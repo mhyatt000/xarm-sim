@@ -52,7 +52,9 @@ class TableArena(Arena):
 
     # Robot base sits on a 1 cm mounting plate, so table top is 1 cm below the base origin.
     top_z: float = -0.01
-    center_xy: tuple[float, float] = (0.375, 0.01)
+    # y-centered on the robot; x placed so the table's rear edge (xmin =
+    # -0.0635) is flush with the PlateMount's rear edge (5 in plate, -2.5 in)
+    center_xy: tuple[float, float] = (0.3937, 0.0)
     # Real cart 3ft x 2ft top.
     size_xy: tuple[float, float] = (0.9144, 0.6096)
     color: tuple[float, float, float] = (0.13, 0.14, 0.17)
