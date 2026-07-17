@@ -34,15 +34,15 @@ _TABLE_CAMERAS = (
     view_from_c2w_cv("side", SIDE_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
 )
 
-# Splat -> world alignment solved by scripts/align_ransac.py (1.1 cm RMS); the
-# table plane below was placed to match this scan's real table top, so the
-# alignment is arena data — whether it renders is the nyx renderer config's call.
+# Splat -> world alignment: align_ransac.py seed refined by scripts/icp_splat.py
+# (ICP of splat centers against the table slab + PlateMount mesh); scans are
+# metric so scale is pinned at 1.0.
 _CLEAN_SPLAT = _PROJECT_ROOT / "assets" / "lab_clean.ply"
 DEFAULT_SPLAT = SplatAsset(
     uri=_CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply"),
-    pos=(-0.2237, 0.7717, 0.1711),
-    quat_xyzw=(-0.501119, 0.487918, -0.50087, 0.509849),
-    scale=0.9966,
+    pos=(-0.2513, 0.767, 0.1847),
+    quat_xyzw=(-0.526301, 0.471493, -0.470877, 0.528183),
+    scale=1.0,
 )
 
 
