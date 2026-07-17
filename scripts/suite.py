@@ -36,10 +36,11 @@ class Config:
     policy: Literal["random", "waypoint"] = "random"
     steps_per_segment: int = 20
     noslip_iterations: int = 10
-    render_backend: Literal["raster", "nyx"] = "raster"
+    render_backend: Literal["raster", "nyx", "batch"] = "raster"
     spp: int = 8                    # nyx samples per pixel
+    camera_res: tuple[int, int] = (640, 480)  # batch: keep VRAM in mind at high n_envs
     video: Path | None = None       # write render() frames to an mp4 (cv2, no GUI)
-    # tile every env into a per-camera grid (nyx only — raster cams are single-env);
+    # tile every env into a per-camera grid (nyx/batch — raster cams are single-env);
     # otherwise the video shows env 0
     video_all_envs: bool = True
     video_max_width: int = 2048     # per-camera grid width cap, px
@@ -72,10 +73,12 @@ def main(cfg: Config) -> None:
         show_viewer=cfg.show_viewer,
         noslip_iterations=cfg.noslip_iterations,
         render_backend=cfg.render_backend,
+        camera_res=cfg.camera_res,
         renderer_config=NyxConfig(spp=cfg.spp) if cfg.render_backend == "nyx" else None,
     )
     writer = None
-    grid = cfg.video_all_envs and cfg.render_backend == "nyx" and cfg.n_envs > 1
+    grid = (cfg.video_all_envs and cfg.n_envs > 1
+            and cfg.render_backend in ("nyx", "batch"))
 
     def record() -> None:
         nonlocal writer
