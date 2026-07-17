@@ -87,6 +87,12 @@ class Config:
     # control; adjacent 30Hz frames are near-duplicates and RAM is the binding
     # constraint at B >= 256: ~36KB/sample at 3x64x64)
     frame_stride: int = 1
+    # splat background plates composited behind static cameras wherever madrona's
+    # segmentation says sky (scripts/make_plates.py); None = raw batch frames
+    plates_dir: Path | None = None
+    # madrona rasterizer for image obs (the light calibration was matched under
+    # it); False = raytracer (2.7x faster, real shadows, different visual domain)
+    batch_rasterizer: bool = True
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
@@ -283,7 +289,7 @@ def build_env(cfg: Config, render: bool = False):
     import genesis as gs
 
     from xsim.suite import make
-    from xsim.suite.renderers import NyxConfig
+    from xsim.suite.renderers import BatchConfig, NyxConfig
     from xsim.suite.wrappers import CartesianActionWrapper, GymWrapper, ImageObsWrapper
 
     image = cfg.policy == "image"
@@ -297,7 +303,8 @@ def build_env(cfg: Config, render: bool = False):
         # image obs ride the madrona batch renderer (~100k env-cam fps at 64px);
         # nyx stays the photo-real path for state-mode play videos
         render_backend="batch" if image else ("nyx" if with_cams else "raster"),
-        renderer_config=NyxConfig(spp=cfg.spp) if (with_cams and not image) else None,
+        renderer_config=(BatchConfig(use_rasterizer=cfg.batch_rasterizer) if image
+                         else NyxConfig(spp=cfg.spp) if with_cams else None),
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
         horizon=cfg.horizon, n_envs=cfg.n_envs,
         control_freq=cfg.control_freq,
@@ -306,7 +313,10 @@ def build_env(cfg: Config, render: bool = False):
     if cfg.cartesian:
         env = CartesianActionWrapper(env)
     if image:
-        return ImageObsWrapper(env)  # dict obs; the trainer flattens per key set
+        plates = None
+        if cfg.plates_dir is not None:
+            plates = {p.stem: p for p in sorted(cfg.plates_dir.glob("*.png"))}
+        return ImageObsWrapper(env, plates=plates)  # dict obs; trainer flattens per key set
     return GymWrapper(env)
 
 

@@ -25,8 +25,10 @@ class BatchConfig:
     # raytracer by default: 273k vs 102k env-cam frames/s at B=256x3cam@64px on a
     # 5090, with real shadows; the rasterizer is the compatibility path
     use_rasterizer: bool = False
-    # key/fill pair roughly matching the nyx DEFAULT_LIGHT_DIR look
+    # key/fill pair matching the nyx DEFAULT_LIGHT_DIR look; x0.85 intensity from
+    # the visual match against the nyx render (see gs-madrona notes: ambient is
+    # hardcoded 0.05, so the pair carries almost all illumination)
     lights: tuple[BatchLight, ...] = (
-        BatchLight(dir=(-0.4, -0.4, -0.8), intensity=2.0, castshadow=True),
-        BatchLight(dir=(0.5, 0.3, -0.6), intensity=1.0),
+        BatchLight(dir=(-0.4, -0.4, -0.8), intensity=1.7, castshadow=True),
+        BatchLight(dir=(0.5, 0.3, -0.6), intensity=0.85),
     )
