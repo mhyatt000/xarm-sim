@@ -32,3 +32,18 @@ class BatchConfig:
         BatchLight(dir=(-0.4, -0.4, -0.8), intensity=1.7, castshadow=True),
         BatchLight(dir=(0.5, 0.3, -0.6), intensity=0.85),
     )
+    # per-env static-camera jitter (domain randomization): each env's static
+    # cams get a uniform offset in [-noise, noise] per axis added to the spec's
+    # pos/lookat, sampled once at build. Batch cams hold one pose per env, so
+    # this is free; attached cams ride their link and are untouched. Background
+    # plates baked at the default pose (make_plates.py) misalign under jitter.
+    cam_pos_noise: float = 0.0  # metres
+    cam_lookat_noise: float = 0.0  # metres
+    cam_noise_seed: int | None = None
+    # live splat backgrounds: rasterize the arena splat with gsplat at reset and
+    # composite it wherever segmentation reads background — per-env, so it
+    # follows jittered static cams (baked plates can't). Wrist cams get their
+    # reset-pose view; it drifts as the arm moves, but wrist frames rarely show
+    # background pixels.
+    splat_bg: bool = False
+    splat_chunk: int = 128  # cameras per gsplat rasterization call

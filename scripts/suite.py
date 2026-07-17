@@ -39,9 +39,15 @@ class Config:
     render_backend: Literal["raster", "nyx", "batch"] = "raster"
     spp: int = 8                    # nyx samples per pixel
     batch_rasterizer: bool = False  # batch backend: rasterizer instead of the raytracer
+    # batch backend: per-env static-cam pose jitter, metres (seeded from --seed)
+    cam_pos_noise: float = 0.0
+    cam_lookat_noise: float = 0.0
     # composite splat background plates behind static cams (batch backend only;
     # generate with scripts/make_plates.py)
     plates_dir: Path | None = None
+    # live gsplat backgrounds rendered per env at reset (batch backend only);
+    # follows jittered cams, unlike baked plates
+    splat_bg: bool = False
     camera_res: tuple[int, int] = (640, 480)  # batch: keep VRAM in mind at high n_envs
     video: Path | None = None       # write render() frames to an mp4 (cv2, no GUI)
     # tile every env into a per-camera grid (nyx/batch — raster cams are single-env);
@@ -80,7 +86,13 @@ def main(cfg: Config) -> None:
         camera_res=cfg.camera_res,
         renderer_config=(
             NyxConfig(spp=cfg.spp) if cfg.render_backend == "nyx"
-            else BatchConfig(use_rasterizer=cfg.batch_rasterizer)
+            else BatchConfig(
+                use_rasterizer=cfg.batch_rasterizer,
+                cam_pos_noise=cfg.cam_pos_noise,
+                cam_lookat_noise=cfg.cam_lookat_noise,
+                cam_noise_seed=cfg.seed,
+                splat_bg=cfg.splat_bg,
+            )
             if cfg.render_backend == "batch" else None
         ),
     )
@@ -115,11 +127,14 @@ def main(cfg: Config) -> None:
             frame = env.render()
         if writer is None:
             cfg.video.parent.mkdir(parents=True, exist_ok=True)
-            writer = cv2.VideoWriter(
-                str(cfg.video), cv2.VideoWriter_fourcc(*"mp4v"),
-                1.0 / env.control_dt, (frame.shape[1], frame.shape[0]),
+            import imageio.v2 as imageio
+
+            writer = imageio.get_writer(
+                str(cfg.video), fps=1.0 / env.control_dt,
+                codec="libx264",  # avc1/H.264 — browser-playable; mp4v/mpeg4 isn't
+                pixelformat="yuv420p", macro_block_size=1,
             )
-        writer.write(frame[:, :, ::-1])  # RGB -> BGR
+        writer.append_data(frame)  # RGB, no BGR swap
     print("action_space:", env.action_space)
     obs, info = env.reset(seed=cfg.seed)
     for name in sorted(obs):
@@ -145,7 +160,7 @@ def main(cfg: Config) -> None:
                 break
             obs, info = env.reset()
     if writer is not None:
-        writer.release()
+        writer.close()
         print(f"video -> {cfg.video}")
 
 
