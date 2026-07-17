@@ -48,6 +48,10 @@ class Config:
     # live gsplat backgrounds rendered per env at reset (batch backend only);
     # follows jittered cams, unlike baked plates
     splat_bg: bool = False
+    # re-splat every N policy steps (0 = only on reset)
+    resplat_every: int = 0
+    # drop splat gaussians below this opacity (speed; <=0.15 looks intact)
+    prune_opacity: float = 0.15
     camera_res: tuple[int, int] = (640, 480)  # batch: keep VRAM in mind at high n_envs
     video: Path | None = None       # write render() frames to an mp4 (cv2, no GUI)
     # tile every env into a per-camera grid (nyx/batch — raster cams are single-env);
@@ -92,6 +96,8 @@ def main(cfg: Config) -> None:
                 cam_lookat_noise=cfg.cam_lookat_noise,
                 cam_noise_seed=cfg.seed,
                 splat_bg=cfg.splat_bg,
+                splat_resplat_every=cfg.resplat_every,
+                splat_prune_opacity=cfg.prune_opacity,
             )
             if cfg.render_backend == "batch" else None
         ),

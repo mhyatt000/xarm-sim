@@ -47,3 +47,10 @@ class BatchConfig:
     # background pixels.
     splat_bg: bool = False
     splat_chunk: int = 128  # cameras per gsplat rasterization call
+    # re-rasterize backgrounds for all cams every N policy steps (counted
+    # globally, not per env). 0 = only on reset — correct while cameras are
+    # static within an episode; >0 is what per-step camera motion needs.
+    splat_resplat_every: int = 0
+    # drop gaussians below this opacity at load: render cost is linear in
+    # count, and <=0.15 keeps plates visually intact (see gsplat_plates.py)
+    splat_prune_opacity: float = 0.15

@@ -58,6 +58,7 @@ class RobotEnv(GenesisEnv):
         self._static_cam_poses: dict[str, tuple] = {}  # name -> (pos, lookat, up)
         self._attached_rigs: dict[str, tuple] = {}  # name -> (link, offset_T)
         self._splat_bg_frames: dict[str, np.ndarray] = {}
+        self._splat_steps = 0  # global step count driving splat_resplat_every
         super().__init__(**kwargs)
 
     # -- cameras -----------------------------------------------------------------
@@ -192,13 +193,16 @@ class RobotEnv(GenesisEnv):
             return
         from xsim.suite.renderers.splat_bg import SplatBackground
 
-        self._splat_bg = SplatBackground(splat, chunk=cfg.splat_chunk)
+        self._splat_bg = SplatBackground(
+            splat, chunk=cfg.splat_chunk, prune_opacity=cfg.splat_prune_opacity
+        )
 
-    def _render_splat_bg(self, envs_idx=None) -> None:
+    def _render_splat_bg(self, envs_idx=None, force: bool = False) -> None:
         """Refresh per-env splat background frames for every camera. Static cams
-        render once (their per-env poses are fixed at build); attached cams
-        re-render the reset envs from their current link pose — the backdrop
-        drifts as the arm moves, but wrist frames rarely show background."""
+        render once (their per-env poses are fixed at build) unless ``force``;
+        attached cams re-render the reset envs from their current link pose —
+        the backdrop drifts as the arm moves, but wrist frames rarely show
+        background."""
         if self._splat_bg is None:
             return
         from xsim.suite.models.cameras import T_GL_TO_CV
@@ -211,7 +215,7 @@ class RobotEnv(GenesisEnv):
             K = self.intrinsics(name)
             if spec.attach_link is None:
                 pose = self._static_cam_poses.get(name)
-                if pose is None or name in self._splat_bg_frames:
+                if pose is None or (name in self._splat_bg_frames and not force):
                     continue
                 # unjittered specs give one shared pose -> a (1, H, W, 3) frame
                 # that broadcasts across envs in the composite
@@ -341,3 +345,12 @@ class RobotEnv(GenesisEnv):
             robot.reset(envs_idx)
         self._sync_attached_cams()  # wrist cam follows the freshly reset arm
         self._render_splat_bg(envs_idx)
+
+    def step(self, action):
+        out = super().step(action)
+        every = getattr(self.renderer_config, "splat_resplat_every", 0)
+        if self._splat_bg is not None and every > 0:
+            self._splat_steps += 1
+            if self._splat_steps % every == 0:
+                self._render_splat_bg(force=True)
+        return out

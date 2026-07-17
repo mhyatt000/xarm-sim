@@ -170,10 +170,14 @@ class SplatBackground:
         ply: Path | None = None,
         device: str = "cuda",
         chunk: int = 128,
+        prune_opacity: float = 0.0,
     ):
         self.device = device
         self.chunk = chunk
         self.splat = load_world_splat(asset, ply, device)
+        if prune_opacity > 0:
+            keep = self.splat["opacities"] >= prune_opacity
+            self.splat = {k: v[keep] for k, v in self.splat.items()}
 
     def render(self, viewmats: np.ndarray, K: np.ndarray, res: tuple[int, int]) -> np.ndarray:
         """(C, 4, 4) OpenCV world->cam viewmats + (3, 3) or (C, 3, 3) intrinsics
