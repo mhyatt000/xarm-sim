@@ -91,7 +91,13 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
     def _load_model(self) -> None:
         raise NotImplementedError
 
+    def _scene_renderer(self):
+        """Scene-level renderer option (None = Genesis default rasterizer).
+        Overridden by layers that select a camera backend (e.g. madrona batch)."""
+        return None
+
     def _initialize_sim(self) -> None:
+        renderer = self._scene_renderer()
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.physics_dt, substeps=4),
             rigid_options=gs.options.RigidOptions(
@@ -103,6 +109,7 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
             ),
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
             show_viewer=self.show_viewer,
+            **({"renderer": renderer} if renderer is not None else {}),
         )
         self.model.add_to(self.scene)
         self._setup_cameras()  # nyx sensors must exist before build

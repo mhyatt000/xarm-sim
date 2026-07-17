@@ -83,6 +83,10 @@ class Config:
     aux_pose_coef: float = 0.1        # aux cube pos+yaw loss weight (0 = off; sim-only supervision)
     grip_coef: float = 0.1            # BCE weight on the gripper logit (labels are 0/1)
     aug_pad: int = 4                  # DrQ random-shift padding, px (0 = off)
+    # record every kth visited state in image mode (labels stay per-step for
+    # control; adjacent 30Hz frames are near-duplicates and RAM is the binding
+    # constraint at B >= 256: ~36KB/sample at 3x64x64)
+    frame_stride: int = 1
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
@@ -290,8 +294,10 @@ def build_env(cfg: Config, render: bool = False):
         "Lift", robots="XArm7",
         camera_names=list(cfg.cameras) if with_cams else [],
         camera_res=(cfg.image_hw, cfg.image_hw) if image else (640, 480),
-        render_backend="nyx" if with_cams else "raster",
-        renderer_config=NyxConfig(spp=cfg.spp) if with_cams else None,
+        # image obs ride the madrona batch renderer (~100k env-cam fps at 64px);
+        # nyx stays the photo-real path for state-mode play videos
+        render_backend="batch" if image else ("nyx" if with_cams else "raster"),
+        renderer_config=NyxConfig(spp=cfg.spp) if (with_cams and not image) else None,
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
         horizon=cfg.horizon, n_envs=cfg.n_envs,
         control_freq=cfg.control_freq,
@@ -402,6 +408,7 @@ class Trainer:
         live = np.ones(B, dtype=bool)
         success = np.zeros(B, dtype=bool)
         ep_len = np.zeros(B, dtype=np.int64)
+        tick = 0
         while live.any():
             teacher_a = self.teacher.act(self._teacher_obs(obs))
             if beta >= 1.0:
@@ -410,8 +417,9 @@ class Trainer:
                 student_a = student.act(self._student_obs(obs))
                 use_teacher = self.rng.random(B) < beta
                 action = np.where(use_teacher[:, None], teacher_a, student_a)
-            if record:
+            if record and (not self.image or tick % self.cfg.frame_stride == 0):
                 self._record(obs, teacher_a, live)
+            tick += 1
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
             success |= live & info["success"]

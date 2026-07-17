@@ -10,7 +10,7 @@ import gymnasium as gym
 import numpy as np
 
 from xsim.suite.environments.base import GenesisEnv
-from xsim.suite.models.cameras import CameraSpec, pose_to_T
+from xsim.suite.models.cameras import CameraSpec
 from xsim.suite.models.robots import create_robot_model
 from xsim.suite.renderers import NyxConfig
 from xsim.suite.robots import Robot
@@ -33,7 +33,7 @@ class RobotEnv(GenesisEnv):
         camera_names: list[str] | None = None,
         camera_res: tuple[int, int] = (640, 480),
         fov_deg: float = 42.0,
-        render_backend: Literal["raster", "nyx"] = "raster",
+        render_backend: Literal["raster", "nyx", "batch"] = "raster",
         renderer_config: NyxConfig | None = None,
         **kwargs,
     ):
@@ -48,10 +48,16 @@ class RobotEnv(GenesisEnv):
         self._camera_specs: dict[str, CameraSpec] = {}
         self._camera_owner: dict[str, object] = {}  # spec name -> robot entity (None = static)
         self._rig_attached: set[str] = set()
-        self._manual_attached: list[tuple[object, object, np.ndarray]] = []
         super().__init__(**kwargs)
 
     # -- cameras -----------------------------------------------------------------
+    def _scene_renderer(self):
+        if self.render_backend == "batch":
+            import genesis as gs
+
+            return gs.options.renderers.BatchRenderer(use_rasterizer=True)
+        return None
+
     def _declared_cameras(self) -> list[tuple[CameraSpec, object]]:
         """(spec, owning robot entity) pairs; arena cams have no owner."""
         declared = [(spec, None) for spec in self.model.arena.cameras]
@@ -89,6 +95,7 @@ class RobotEnv(GenesisEnv):
                     camera_options(
                         spec, self.camera_res, spec.fov_deg or self.fov_deg, cfg.spp,
                         lights if i == 0 else [], light_fields if i == 0 else (),
+                        owner=self._camera_owner[spec.name],
                     )
                 )
         else:
@@ -97,7 +104,19 @@ class RobotEnv(GenesisEnv):
                     res=self.camera_res, fov=spec.fov_deg or self.fov_deg, GUI=False,
                     pos=spec.pos or (1.0, 0.0, 0.5), lookat=spec.lookat or (0.0, 0.0, 0.0),
                     near=0.02, far=50.0,  # default near clips the wrist cam's own gripper
-                    env_idx=0,  # rendering is single-env
+                    # batch (madrona) cameras render every env; raster is single-env
+                    **({} if self.render_backend == "batch" else {"env_idx": 0}),
+                )
+            if self.render_backend == "batch":
+                # madrona takes no lights from the scene; unlit frames are near-black.
+                # Key/fill pair roughly matching the nyx look (DEFAULT_LIGHT_DIR).
+                self.scene.add_light(
+                    pos=(0.0, 0.0, 3.0), dir=(-0.4, -0.4, -0.8), color=(1.0, 1.0, 1.0),
+                    directional=True, castshadow=True, cutoff=45.0, intensity=2.0,
+                )
+                self.scene.add_light(
+                    pos=(0.0, 0.0, 3.0), dir=(0.5, 0.3, -0.6), color=(1.0, 1.0, 1.0),
+                    directional=True, castshadow=False, cutoff=45.0, intensity=1.0,
                 )
 
     def _bind_cameras(self) -> None:
@@ -105,13 +124,13 @@ class RobotEnv(GenesisEnv):
         for name, spec in self._camera_specs.items():
             cam = self.cams[name]
             if spec.attach_link is not None:
-                link = self._camera_owner[name].get_link(spec.attach_link)
-                offset = np.asarray(spec.attach_offset, dtype=np.float64)
+                # nyx sensors have no attach(); they mount via options at creation
+                # (entity_idx/link_idx_local/offset_T) and re-pose per env inside
+                # every render, so there is nothing to bind or sync for them
                 if hasattr(cam, "attach"):
-                    cam.attach(link, offset)
+                    link = self._camera_owner[name].get_link(spec.attach_link)
+                    cam.attach(link, np.asarray(spec.attach_offset, dtype=np.float64))
                     self._rig_attached.add(name)
-                else:
-                    self._manual_attached.append((cam, link, offset))
             elif hasattr(cam, "set_pose"):
                 cam.set_pose(pos=spec.pos, lookat=spec.lookat, up=spec.up)
             else:
@@ -121,11 +140,6 @@ class RobotEnv(GenesisEnv):
     def _sync_attached_cams(self) -> None:
         for name in self._rig_attached:
             self.cams[name].move_to_attach()
-        for cam, link, offset in self._manual_attached:
-            # cameras follow env 0 (rendering is single-env)
-            T = pose_to_T(link.get_pos()[0], link.get_quat()[0]) @ offset
-            pos = tuple(T[:3, 3])
-            cam.update_camera_pose(pos=pos, lookat=tuple(T[:3, 3] - T[:3, 2]), up=tuple(T[:3, 1]))
 
     def _post_sim_step(self) -> None:
         self._sync_attached_cams()
@@ -133,15 +147,15 @@ class RobotEnv(GenesisEnv):
     def render_views(self, all_envs: bool = False) -> dict[str, np.ndarray]:
         """Named RGB frames from every instantiated camera (on demand — rendering
         is never part of the step loop). ``all_envs=True`` returns (n_envs, H, W, 3)
-        stacks instead of env 0's frame — nyx only, whose sensors render every env
-        into the batch cache anyway; raster cameras are built on env 0."""
+        stacks instead of env 0's frame — nyx and batch backends only, which
+        render every env anyway; raster cameras are built on env 0."""
         out = {}
         for name, cam in self.cams.items():
-            if hasattr(cam, "render"):  # raster camera
-                if all_envs:
+            if hasattr(cam, "render"):  # raster or batch camera
+                if all_envs and self.render_backend != "batch":
                     raise ValueError(
-                        "all_envs rendering requires render_backend='nyx'; "
-                        "raster cameras are single-env"
+                        "all_envs rendering requires render_backend='nyx' or "
+                        "'batch'; raster cameras are single-env"
                     )
                 rgb = cam.render(rgb=True)[0]
             else:
