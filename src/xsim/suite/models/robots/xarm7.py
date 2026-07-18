@@ -29,11 +29,10 @@ _XARM7_CAMERAS = (
                attach_offset=_WRIST_OFFSET),
 )
 # Randomized mount, link_tcp frame (derivation + plot: scripts/cam_wrist.py):
-# cone apex = gripper base (URDF joint_tcp origin: 0.172 m behind the TCP),
-# axis = common perpendicular of the fingertip line and the base->TCP line
-# (exactly +x at qpos 0), lookats in the 4 cm ball around the TCP. The
-# committed bracket sits at r = 0.096 m, 27 deg off-axis — inside the cone,
-# just under the 10 cm shell floor. Up copied from the committed mount so
+# apex = gripper base (URDF joint_tcp origin: 0.172 m behind the TCP), axis =
+# common perpendicular of the fingertip line and the base->TCP line (exactly
+# +x at qpos 0); positions in the ellipsoid at 11 cm along the axis, lookats
+# in the oblong patch at the TCP. Up copied from the committed mount so
 # sampled frames roll like the real camera.
 _WRIST_MOUNT = MountSampler(
     name="wrist",

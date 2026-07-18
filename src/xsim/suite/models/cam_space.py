@@ -43,20 +43,27 @@ class MountSampler(CamSampler):
         from right to left tip. line B is from EEF to TCP. C intersects A,B
         and is perpendicular to both (orthogonal). D is colinear to C but
         intersects EEF. 11cm along D (away from EEF) is the cam pos center.
-        create a cone by rotating a line 30 degrees from D (centerline) but
-        still intersecting with D at EEF. the space the camera can occupy is
-        from 10cm to 12cm within that cone. the lookat is sampled from sphere
-        8cm diameter centered at TCP.
+        orthogonal to D at center mark, there will be diameter=8cm circle.
+        make elipsoid with this circle and 2cm radius along D. the lookat
+        area is oblong . begin with a ellipse centered at TCP . diameter is
+        8cm colinear to A, and radius along C equal to cam_center-EEF
+        distance. take the half of this ellipse closest to cam_center, and
+        union with 8cm circle at TCP
 
-    ``apex`` is EEF and ``axis`` is D; the shell floor is dropped to 9 cm so
-    the sampled space contains the committed physical bracket (r = 9.6 cm,
-    27 deg off-axis — inside the cone but under the verbatim 10 cm floor)."""
+    ``apex`` is EEF and ``axis`` is D. The committed physical bracket lies
+    OUTSIDE this ellipsoid (2.5 cm behind the center along D vs the 2 cm
+    semi-axis) — the sampled space deliberately does not contain it. The
+    lookat region is planar (the A-C plane through ``lookat_center``); the
+    circle sits inside the full ellipse, so the union is the ellipse's
+    toward-camera half plus the circle's far half."""
 
     apex: tuple[float, float, float]
-    axis: tuple[float, float, float]  # cone centerline (line D), need not be unit
-    half_angle_deg: float = 30.0
-    r_range: tuple[float, float] = (0.09, 0.12)
+    axis: tuple[float, float, float]  # centerline (line D), need not be unit
+    center_r: float = 0.11  # cam pos center along D; also the lookat ellipse C semi-axis
+    pos_r_across: float = 0.04  # ellipsoid semi-axis orthogonal to D (8 cm circle)
+    pos_r_along: float = 0.02  # ellipsoid semi-axis along D
     lookat_center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lookat_across: tuple[float, float, float] = (0.0, 1.0, 0.0)  # line A direction
     lookat_radius: float = 0.04
 
     def sample(
@@ -64,28 +71,42 @@ class MountSampler(CamSampler):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         axis = np.asarray(self.axis, dtype=np.float64)
         axis /= np.linalg.norm(axis)
-        cos_t = rng.uniform(np.cos(np.radians(self.half_angle_deg)), 1.0, n)
-        phi = rng.uniform(0.0, 2 * np.pi, n)
-        sin_t = np.sqrt(1.0 - cos_t**2)
         u = np.array([0.0, 0.0, 1.0])
         u = u - (u @ axis) * axis
         if np.linalg.norm(u) < 1e-9:  # axis parallel to z: any perpendicular works
             u = np.array([1.0, 0.0, 0.0])
         u /= np.linalg.norm(u)
         v = np.cross(axis, u)
-        dirs = (
-            cos_t[:, None] * axis
-            + sin_t[:, None] * (np.cos(phi)[:, None] * u + np.sin(phi)[:, None] * v)
+        # uniform in the ellipsoid: unit ball scaled per semi-axis
+        b = rng.normal(size=(n, 3))
+        b /= np.linalg.norm(b, axis=1, keepdims=True)
+        b *= np.cbrt(rng.uniform(size=(n, 1)))
+        center = np.asarray(self.apex) + self.center_r * axis
+        pos = center + np.outer(self.pos_r_along * b[:, 0], axis) + self.pos_r_across * (
+            np.outer(b[:, 1], u) + np.outer(b[:, 2], v)
         )
-        r_lo, r_hi = self.r_range
-        r = np.cbrt(rng.uniform(r_lo**3, r_hi**3, n))  # uniform in shell volume
-        pos = np.asarray(self.apex) + r[:, None] * dirs
 
-        d = rng.normal(size=(n, 3))
-        d /= np.linalg.norm(d, axis=1, keepdims=True)
-        lookat = np.asarray(self.lookat_center) + self.lookat_radius * np.cbrt(
-            rng.uniform(size=(n, 1))
-        ) * d
+        across = np.asarray(self.lookat_across, dtype=np.float64)
+        across = across - (across @ axis) * axis
+        across /= np.linalg.norm(across)
+        rl, a = self.lookat_radius, self.center_r
+        s = np.empty(n)
+        t = np.empty(n)
+        filled = 0
+        while filled < n:
+            m = max(2 * (n - filled), 256)
+            u = rng.uniform([-rl, -rl], [a, rl], size=(m, 2))
+            keep = np.where(
+                u[:, 0] >= 0,
+                (u[:, 0] / a) ** 2 + (u[:, 1] / rl) ** 2 <= 1.0,
+                u[:, 0] ** 2 + u[:, 1] ** 2 <= rl**2,
+            )
+            u = u[keep]
+            take = min(len(u), n - filled)
+            s[filled : filled + take] = u[:take, 0]
+            t[filled : filled + take] = u[:take, 1]
+            filled += take
+        lookat = np.asarray(self.lookat_center) + s[:, None] * axis + t[:, None] * across
         return pos, lookat, np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
 
 
