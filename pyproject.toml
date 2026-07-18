@@ -58,6 +58,14 @@ dev = [
 ]
 
 [tool.uv]
+# gs-madrona builds without isolation, so its build deps must be in the venv
+# first: `uv pip install scikit-build-core nanobind ninja`, then `uv sync --inexact`.
+# On hosts with several CUDA installs, FindCUDAToolkit prefers $CUDACXX over
+# CUDAToolkit_ROOT, and distro libs in /usr/lib/x86_64-linux-gnu can shadow the
+# toolkit's at link time (undefined __nvJitLinkCreate_* at import). Pin them:
+#   CMAKE_ARGS="-DCUDA_cudart_static_LIBRARY=$CUDA_HOME/lib64/libcudart_static.a \
+#     -DCUDA_nvJitLink_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so \
+#     -DCUDA_NVJITLINK_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so"
 no-build-isolation-package = ["gs-madrona"]
 environments = ["sys_platform == 'linux'"]
 override-dependencies = [
