@@ -6,9 +6,9 @@ build-backend = "uv_build"
 module-name = "xsim"
 
 [tool.uv.sources]
-webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
 xarm-sim = { workspace = true, editable = true }
 gs-madrona = { workspace = true }
+webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
 
 
 [tool.uv.workspace]

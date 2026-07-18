@@ -14,9 +14,9 @@ Two students (``--policy``):
   (b4096-v7: 93% on the 15cm box).
 - ``image``: CNN on ``rgb`` (B, V, 3, H, W) from all cameras + proprio MLP
   (no cube state) -> joints + gripper logit, with an auxiliary cube pos+yaw
-  head. Needs a batched render backend; nyx works for smoke tests only
-  (~1 step/s at B=32) — training-scale collection waits on the madrona batch
-  renderer (gs-madrona wheel is CUDA 12.4; Blackwell needs a cu128 build).
+  head. Rides the madrona batch renderer (img-v2 trained at B=256); frames
+  come composited over live splat backgrounds with per-reset camera
+  randomization (arena defaults).
 
 Two teachers (``--teacher``):
 - ``waypoint``: the scripted LiftPolicy (closed-loop, replans at reset).
@@ -84,15 +84,20 @@ class Config:
     grip_coef: float = 0.1            # BCE weight on the gripper logit (labels are 0/1)
     aug_pad: int = 4                  # DrQ random-shift padding, px (0 = off)
     # record every kth visited state in image mode (labels stay per-step for
-    # control; adjacent 30Hz frames are near-duplicates and RAM is the binding
-    # constraint at B >= 256: ~36KB/sample at 3x64x64)
+    # control; 1 = keep every frame — the aggregate lives on disk, not RAM)
     frame_stride: int = 1
-    # splat background plates composited behind static cameras wherever madrona's
-    # segmentation says sky (scripts/make_plates.py); None = raw batch frames
+    # image-mode dataset store: flat-binary memmap per key under
+    # <data_dir>/<exp_name> (~36KB/sample rgb at 3x64x64 -> ~5.5GB/round at
+    # B=1024 stride 1; point at the big NVMe, not /home)
+    data_dir: Path = Path("/data/fast/xarm-dagger")
+    num_workers: int = 8              # BC DataLoader workers (0 = main process)
+    # legacy PNG background plates (scripts/make_plates.py); None = the arena's
+    # own live splat compositing in render_views, which also covers the wrist cam
     plates_dir: Path | None = None
-    # madrona rasterizer for image obs (the light calibration was matched under
-    # it); False = raytracer (2.7x faster, real shadows, different visual domain)
-    batch_rasterizer: bool = True
+    # madrona rasterizer instead of the raytracer; the raytracer is the suite
+    # default and the domain the realigned splat/cameras target (rasterizer =
+    # img-v2's light-calibrated legacy domain)
+    batch_rasterizer: bool = False
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
@@ -106,6 +111,9 @@ class Config:
     # 15cm x 15cm spawn box around the home TCP (x=0.34, y=0)
     cube_x_range: tuple[float, float] = (0.275, 0.425)
     cube_y_range: tuple[float, float] = (-0.075, 0.075)
+    # per-reset exo-cam + wrist-mount pose resampling (arena default; pin for
+    # fixed-rig eval/play)
+    randomize_cameras: bool = True
     horizon: int = 200
     control_freq: float = 30.0
     noslip_iterations: int = 10
@@ -136,6 +144,69 @@ def aux_targets(obs: dict) -> np.ndarray:
         [np.asarray(obs["cube_pos"], dtype=np.float32),
          np.sin(yaw4)[:, None], np.cos(yaw4)[:, None]], axis=-1
     )
+
+
+class MemmapStore:
+    """Append-only on-disk dataset: one flat <key>.bin per key + manifest.json.
+
+    Rows are fixed-size, so sample i of a key is one memmap slice; the OS page
+    cache is the only caching layer. Single writer, append per recorded step,
+    flush() publishes the manifest for readers.
+    """
+
+    def __init__(self, root: Path):
+        import shutil
+
+        self.root = root
+        shutil.rmtree(root, ignore_errors=True)  # fresh run owns its dir
+        root.mkdir(parents=True, exist_ok=True)
+        self._fh: dict = {}
+        self.meta: dict[str, dict] = {}
+
+    def append(self, key: str, arr: np.ndarray) -> None:
+        meta = self.meta.setdefault(
+            key, {"dtype": str(arr.dtype), "shape": list(arr.shape[1:]), "n": 0})
+        if key not in self._fh:
+            self._fh[key] = (self.root / f"{key}.bin").open("ab")
+        arr.tofile(self._fh[key])
+        meta["n"] += arr.shape[0]
+
+    def flush(self) -> None:
+        for fh in self._fh.values():
+            fh.flush()
+        (self.root / "manifest.json").write_text(json.dumps(self.meta))
+
+    def reader(self, key: str) -> np.memmap:
+        meta = self.meta[key]
+        return np.memmap(self.root / f"{key}.bin", dtype=meta["dtype"],
+                         mode="r", shape=(meta["n"], *meta["shape"]))
+
+    def __len__(self) -> int:
+        return self.meta["act"]["n"] if "act" in self.meta else 0
+
+
+class MemmapDataset(torch.utils.data.Dataset):
+    """Random-access snapshot of a MemmapStore. Holds only the root path and
+    manifest, so it pickles cheaply into spawned DataLoader workers; each
+    worker opens its own memmap handles on first use."""
+
+    def __init__(self, root: Path, keys: tuple[str, ...]):
+        self.root, self.keys = root, keys
+        self.meta = json.loads((root / "manifest.json").read_text())
+        self.n = self.meta[keys[0]]["n"]
+        self._maps: dict[str, np.memmap] | None = None
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i: int):
+        if self._maps is None:
+            self._maps = {
+                k: np.memmap(self.root / f"{k}.bin", dtype=m["dtype"], mode="r",
+                             shape=(m["n"], *m["shape"]))
+                for k in self.keys if (m := self.meta[k])
+            }
+        return tuple(torch.from_numpy(np.array(self._maps[k][i])) for k in self.keys)
 
 
 class Student(nn.Module):
@@ -306,6 +377,7 @@ def build_env(cfg: Config, render: bool = False):
         renderer_config=(BatchConfig(use_rasterizer=cfg.batch_rasterizer) if image
                          else NyxConfig(spp=cfg.spp) if with_cams else None),
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
+        randomize_cameras=cfg.randomize_cameras,
         horizon=cfg.horizon, n_envs=cfg.n_envs,
         control_freq=cfg.control_freq,
         noslip_iterations=cfg.noslip_iterations,
@@ -365,10 +437,10 @@ class Trainer:
         self.ema = copy.deepcopy(self.student)
         self.optim = torch.optim.Adam(self.student.parameters(), lr=cfg.lr)
         self.rng = np.random.default_rng(cfg.seed)
-        # aggregated DAgger dataset, one chunk appended per recorded step.
-        # image mode keeps rgb as uint8 on cpu (36KB/step at 3x64x64); at
-        # madrona scale (B >= 256) this wants a disk-backed ring instead.
+        # aggregated DAgger dataset. image mode appends every recorded step to
+        # the on-disk MemmapStore; state mode stays in RAM (tiny rows).
         self._chunks: dict[str, list[np.ndarray]] = {}
+        self.store = MemmapStore(cfg.data_dir / cfg.exp_name) if self.image else None
         self._stats_set = False
         self.best_success = -1.0
         self._start = time.time()
@@ -396,13 +468,14 @@ class Trainer:
         self._chunks.setdefault(key, []).append(arr)
 
     def _record(self, obs, teacher_a: np.ndarray, live: np.ndarray) -> None:
-        self._append("act", teacher_a[live].astype(np.float32, copy=True))
         if self.image:
             prop, rgb = self._student_obs(obs)
-            self._append("prop", prop[live].copy())
-            self._append("rgb", rgb[live].copy())
-            self._append("aux", aux_targets(obs)[live].copy())
+            self.store.append("act", teacher_a[live].astype(np.float32))
+            self.store.append("prop", np.ascontiguousarray(prop[live]))
+            self.store.append("rgb", np.ascontiguousarray(rgb[live]))
+            self.store.append("aux", np.ascontiguousarray(aux_targets(obs)[live]))
         else:
+            self._append("act", teacher_a[live].astype(np.float32, copy=True))
             self._append("obs", obs[live].astype(np.float32, copy=True))
 
     # -- collection --------------------------------------------------------------
@@ -469,40 +542,49 @@ class Trainer:
 
     def _train_bc_image(self) -> dict:
         cfg = self.cfg
-        rgb = torch.from_numpy(np.concatenate(self._chunks["rgb"]))          # cpu uint8
-        prop = torch.from_numpy(np.concatenate(self._chunks["prop"])).to(self.device)
-        Y = torch.from_numpy(np.concatenate(self._chunks["act"])).to(self.device)
-        aux_y = torch.from_numpy(np.concatenate(self._chunks["aux"])).to(self.device)
-        self._freeze_stats(prop)
-        n = rgb.shape[0]
+        self.store.flush()
+        ds = MemmapDataset(self.store.root, ("rgb", "prop", "act", "aux"))
+        if not self._stats_set:
+            self._freeze_stats(
+                torch.from_numpy(np.asarray(self.store.reader("prop"))).to(self.device))
+        g = torch.Generator().manual_seed(int(self.rng.integers(2**31)))
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
+            num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
+            persistent_workers=cfg.num_workers > 0,
+            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
+        )
         stats = {"bc_loss": 0.0, "grip_bce": 0.0, "aux_mse": 0.0}
         for _ in range(cfg.epochs_per_round):
-            # explicit cpu: gs.init makes cuda the default device, but rgb is cpu
-            perm = torch.randperm(n, device="cpu")
             sums = {k: 0.0 for k in stats}
             batches = 0
-            for i in range(0, n, cfg.batch_size):
-                idx = perm[i : i + cfg.batch_size]
-                x = rgb[idx].to(self.device, non_blocking=True).float() / 255.0 - 0.5
-                if cfg.aug_pad > 0:
-                    nv = x.shape[0] * x.shape[1]
-                    x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
-                pred, aux = self.student(x, prop[idx.to(self.device)])
-                y = Y[idx.to(self.device)]
-                joints = F.mse_loss(pred[:, :-1], y[:, :-1])
-                grip = F.binary_cross_entropy_with_logits(pred[:, -1], y[:, -1])
-                aux_l = F.mse_loss(aux, aux_y[idx.to(self.device)])
-                loss = joints + cfg.grip_coef * grip + cfg.aux_pose_coef * aux_l
-                loss.backward()
-                self.optim.step()
-                self.optim.zero_grad(set_to_none=True)
-                self._ema_update()
-                sums["bc_loss"] += joints.item()
-                sums["grip_bce"] += grip.item()
-                sums["aux_mse"] += aux_l.item()
-                batches += 1
+            # explicit cpu: gs.init makes cuda the torch default device, but the
+            # loader's sampler/collate must build cpu tensors
+            with torch.device("cpu"):
+                for rgb, prop, y, aux_y in loader:
+                    x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
+                    prop = prop.to(self.device, non_blocking=True)
+                    y = y.to(self.device, non_blocking=True)
+                    aux_y = aux_y.to(self.device, non_blocking=True)
+                    if cfg.aug_pad > 0:
+                        nv = x.shape[0] * x.shape[1]
+                        x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
+                    pred, aux = self.student(x, prop)
+                    joints = F.mse_loss(pred[:, :-1], y[:, :-1])
+                    grip = F.binary_cross_entropy_with_logits(pred[:, -1], y[:, -1])
+                    aux_l = F.mse_loss(aux, aux_y)
+                    loss = joints + cfg.grip_coef * grip + cfg.aux_pose_coef * aux_l
+                    loss.backward()
+                    self.optim.step()
+                    self.optim.zero_grad(set_to_none=True)
+                    self._ema_update()
+                    sums["bc_loss"] += joints.item()
+                    sums["grip_bce"] += grip.item()
+                    sums["aux_mse"] += aux_l.item()
+                    batches += 1
             stats = {k: v / max(batches, 1) for k, v in sums.items()}
-        return {"samples": n, **stats}
+        del loader  # release persistent workers before the next collect
+        return {"samples": len(ds), **stats}
 
     @torch.no_grad()
     def _ema_update(self) -> None:
