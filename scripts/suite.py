@@ -36,20 +36,12 @@ class Config:
     policy: Literal["random", "waypoint"] = "random"
     steps_per_segment: int = 20
     noslip_iterations: int = 10
-    render_backend: Literal["raster", "nyx", "batch"] = "raster"
+    render_backend: Literal["raster", "nyx", "batch"] = "batch"
     spp: int = 8                    # nyx samples per pixel
     batch_rasterizer: bool = False  # batch backend: rasterizer instead of the raytracer
-    # batch backend: per-env static-cam pose jitter, metres (seeded from --seed)
-    cam_pos_noise: float = 0.0
-    cam_lookat_noise: float = 0.0
     # composite splat background plates behind static cams (batch backend only;
     # generate with scripts/make_plates.py)
     plates_dir: Path | None = None
-    # live gsplat backgrounds rendered per env at reset (batch backend only);
-    # follows jittered cams, unlike baked plates
-    splat_bg: bool = False
-    # re-splat every N policy steps (0 = only on reset)
-    resplat_every: int = 0
     # drop splat gaussians below this opacity (speed; <=0.15 looks intact)
     prune_opacity: float = 0.15
     camera_res: tuple[int, int] = (640, 480)  # batch: keep VRAM in mind at high n_envs
@@ -92,11 +84,6 @@ def main(cfg: Config) -> None:
             NyxConfig(spp=cfg.spp) if cfg.render_backend == "nyx"
             else BatchConfig(
                 use_rasterizer=cfg.batch_rasterizer,
-                cam_pos_noise=cfg.cam_pos_noise,
-                cam_lookat_noise=cfg.cam_lookat_noise,
-                cam_noise_seed=cfg.seed,
-                splat_bg=cfg.splat_bg,
-                splat_resplat_every=cfg.resplat_every,
                 splat_prune_opacity=cfg.prune_opacity,
             )
             if cfg.render_backend == "batch" else None

@@ -32,25 +32,9 @@ class BatchConfig:
         BatchLight(dir=(-0.4, -0.4, -0.8), intensity=1.7, castshadow=True),
         BatchLight(dir=(0.5, 0.3, -0.6), intensity=0.85),
     )
-    # per-env static-camera jitter (domain randomization): each env's static
-    # cams get a uniform offset in [-noise, noise] per axis added to the spec's
-    # pos/lookat, sampled once at build. Batch cams hold one pose per env, so
-    # this is free; attached cams ride their link and are untouched. Background
-    # plates baked at the default pose (make_plates.py) misalign under jitter.
-    cam_pos_noise: float = 0.0  # metres
-    cam_lookat_noise: float = 0.0  # metres
-    cam_noise_seed: int | None = None
-    # live splat backgrounds: rasterize the arena splat with gsplat at reset and
-    # composite it wherever segmentation reads background — per-env, so it
-    # follows jittered static cams (baked plates can't). Wrist cams get their
-    # reset-pose view; it drifts as the arm moves, but wrist frames rarely show
-    # background pixels.
-    splat_bg: bool = False
-    splat_chunk: int = 128  # cameras per gsplat rasterization call
-    # re-rasterize backgrounds for all cams every N policy steps (counted
-    # globally, not per env). 0 = only on reset — correct while cameras are
-    # static within an episode; >0 is what per-step camera motion needs.
-    splat_resplat_every: int = 0
+    # splat-background perf knobs (whether/when to composite is arena policy:
+    # Arena.splat_bg / Arena.splat_resplat_every)
+    splat_chunk: int = 1024  # cameras per gsplat rasterization call
     # drop gaussians below this opacity at load: render cost is linear in
     # count, and <=0.15 keeps plates visually intact (see gsplat_plates.py)
     splat_prune_opacity: float = 0.15

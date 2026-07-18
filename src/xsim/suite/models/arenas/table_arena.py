@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import genesis as gs
+import numpy as np
 
 from xsim.suite.models.arenas.arena import Arena
+from xsim.suite.models.cam_space import ShellLookatSampler
 from xsim.suite.models.cameras import CameraSpec, SplatAsset, view_from_c2w_cv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[5]
@@ -34,14 +36,14 @@ _TABLE_CAMERAS = (
     view_from_c2w_cv("side", SIDE_C2W_CV, fov_deg=LOGITECH_FOV_DEG),
 )
 
-# Splat -> world alignment: align_ransac.py seed refined by scripts/icp_splat.py
-# (ICP of splat centers against the table slab + PlateMount mesh); scans are
-# metric so scale is pinned at 1.0.
-_CLEAN_SPLAT = _PROJECT_ROOT / "assets" / "lab_clean.ply"
+# World-frame splat: scripts/clean_splat.py bakes the solved alignment
+# (align_ransac.py seed -> scripts/icp_splat.py annealed trimmed ICP) into the
+# PLY and crops the table volume, so the asset pose is identity. The pre-bake
+# solve lives in clean_splat.py/git history if the raw scan needs re-cropping.
 DEFAULT_SPLAT = SplatAsset(
-    uri=_CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply"),
-    pos=(-0.2711, 0.7629, 0.1824),
-    quat_xyzw=(-0.542208, 0.464004, -0.464180, 0.524641),
+    uri=_PROJECT_ROOT / "assets" / "lab_aligned.ply",
+    pos=(0.0, 0.0, 0.0),
+    quat_xyzw=(0.0, 0.0, 0.0, 1.0),
     scale=1.0,
 )
 
@@ -60,20 +62,54 @@ class TableArena(Arena):
     color: tuple[float, float, float] = (0.13, 0.14, 0.17)
     slab: bool = True
     slab_height: float = 0.72
+    # render no table at all (collision plane stays): batch compositing fills
+    # the table pixels with the scanned splat table instead. Backends without
+    # splat compositing (raster) show no table.
+    transparent: bool = True
     cameras: tuple[CameraSpec, ...] = _TABLE_CAMERAS
     splat: SplatAsset | None = DEFAULT_SPLAT
+    splat_bg: bool = True
+    # attached/wrist cams drift mid-episode; static cams tolerate any cadence
+    splat_resplat_every: int = 3
+    # exocentric cams sampled per env/episode; False pins the calibrated rig
+    # (real-robot eval parity). Sampled cams keep the rig names/FOV so obs keys
+    # and downstream pipelines don't change.
+    randomize_cameras: bool = True
+
+    def __post_init__(self) -> None:
+        if self.randomize_cameras:
+            for spec in _TABLE_CAMERAS:
+                if any(c.name == spec.name for c in self.cameras):
+                    self.set_camera(self.cam_sampler(spec.name))
+
+    def cam_sampler(self, name: str = "rand", fov_deg: float = LOGITECH_FOV_DEG) -> ShellLookatSampler:
+        """Pose sampler bounded by the calibrated rig: sphere through the
+        farthest rig camera plus 10% headroom, floored at the table top, capped
+        at the highest rig camera; the -1 ft x floor keeps cameras out of the
+        wall behind the robot. Lookats cover the cube spawn region."""
+        cam_pos = [np.asarray(c.pos) for c in _TABLE_CAMERAS]
+        cx = self.center_xy[0]
+        return ShellLookatSampler(
+            name=name,
+            fov_deg=fov_deg,
+            radius=1.1 * max(float(np.linalg.norm(p)) for p in cam_pos),
+            x_range=(-0.3048, max(float(p[0]) for p in cam_pos)),
+            z_range=(self.top_z, max(float(p[2]) for p in cam_pos)),
+            lookat_lo=(cx - 0.15, -0.15, self.top_z + 0.01),
+            lookat_hi=(cx + 0.15, 0.15, self.top_z + 0.20),
+        )
 
     def add_to(self, scene: gs.Scene) -> None:
         surface = gs.surfaces.Plastic(color=self.color, roughness=0.8)
         scene.add_entity(
             gs.morphs.Plane(
                 pos=(0.0, 0.0, self.top_z),
-                visualization=not self.slab,
+                visualization=not self.slab and not self.transparent,
                 collision=True,
             ),
             surface=surface,
         )
-        if self.slab:
+        if self.slab and not self.transparent:
             # Stands in for the real cart body; occludes the under-table region.
             scene.add_entity(
                 gs.morphs.Box(

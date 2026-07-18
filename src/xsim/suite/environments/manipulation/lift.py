@@ -34,9 +34,11 @@ class Lift(ManipulationEnv):
         success_max_speed: float = 0.10,
         success_eef_xy_radius: float = 0.08,
         reward_shaping: bool = False,
+        randomize_cameras: bool = True,
         placement_initializer: UniformRandomSampler | None = None,
         **kwargs,
     ):
+        self.randomize_cameras = randomize_cameras
         self.cube_size = cube_size
         self.cube_color = cube_color
         self.lift_height = lift_height
@@ -51,7 +53,7 @@ class Lift(ManipulationEnv):
         self._success_hold = np.zeros(self.n_envs, dtype=np.int64)
 
     def _load_model(self) -> None:
-        self.arena = TableArena()
+        self.arena = TableArena(randomize_cameras=self.randomize_cameras)
         s = self.cube_size
         self.cube = BoxObject(
             "cube", size=(s, s, s), color=self.cube_color, friction=2.0

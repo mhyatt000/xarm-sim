@@ -10,7 +10,14 @@ import gymnasium as gym
 import numpy as np
 
 from xsim.suite.environments.base import GenesisEnv
-from xsim.suite.models.cameras import CameraSpec
+from xsim.suite.models.cam_space import CamSampler
+from xsim.suite.models.cameras import (
+    CameraSpec,
+    T_GL_TO_CV,
+    invert_rigid,
+    rots_from_quat_wxyz,
+    viewmats_cv,
+)
 from xsim.suite.models.robots import create_robot_model
 from xsim.suite.renderers import BatchConfig, NyxConfig
 from xsim.suite.robots import Robot
@@ -37,7 +44,7 @@ class RobotEnv(GenesisEnv):
         camera_names: list[str] | None = None,
         camera_res: tuple[int, int] = (640, 480),
         fov_deg: float = 42.0,
-        render_backend: Literal["raster", "nyx", "batch"] = "raster",
+        render_backend: Literal["raster", "nyx", "batch"] = "batch",
         renderer_config: NyxConfig | BatchConfig | None = None,
         **kwargs,
     ):
@@ -49,16 +56,22 @@ class RobotEnv(GenesisEnv):
         self.render_backend = render_backend
         self.renderer_config = renderer_config
         self.cams: dict[str, object] = {}
-        self._camera_specs: dict[str, CameraSpec] = {}
+        self._camera_specs: dict[str, CameraSpec | CamSampler] = {}
         self._camera_owner: dict[str, object] = {}  # spec name -> robot entity (None = static)
-        self._rig_attached: set[str] = set()
-        # live splat backgrounds (BatchConfig.splat_bg): renderer, per-cam bound
+        self._rig_attached: set[str] = set()  # spec-mounted cams using genesis attach()
+        # live splat backgrounds (Arena.splat_bg): renderer, per-cam bound
         # poses, and the per-env frames composited in render_views
         self._splat_bg = None
-        self._static_cam_poses: dict[str, tuple] = {}  # name -> (pos, lookat, up)
-        self._attached_rigs: dict[str, tuple] = {}  # name -> (link, offset_T)
+        # name -> per-env ((n, 3) pos, (n, 3) lookat, (n, 3) up); n = n_envs on
+        # batch, 1 elsewhere (raster cams hold env 0's pose)
+        self._static_cam_poses: dict[str, tuple] = {}
+        # name -> (link, GL link->cam offset): (4, 4) for spec mounts, (n, 4, 4)
+        # for sampled mounts (genesis attach() takes one offset, so per-env
+        # offsets are re-posed manually in _sync_attached_cams)
+        self._attached_rigs: dict[str, tuple] = {}
         self._splat_bg_frames: dict[str, np.ndarray] = {}
         self._splat_steps = 0  # global step count driving splat_resplat_every
+        self._render_stale = False  # reset moved cameras/state without advancing scene.t
         super().__init__(**kwargs)
 
     # -- cameras -----------------------------------------------------------------
@@ -70,7 +83,7 @@ class RobotEnv(GenesisEnv):
             return gs.options.renderers.BatchRenderer(use_rasterizer=cfg.use_rasterizer)
         return None
 
-    def _declared_cameras(self) -> list[tuple[CameraSpec, object]]:
+    def _declared_cameras(self) -> list[tuple[CameraSpec | CamSampler, object]]:
         """(spec, owning robot entity) pairs; arena cams have no owner."""
         declared = [(spec, None) for spec in self.model.arena.cameras]
         for robot in self.robots:
@@ -94,10 +107,16 @@ class RobotEnv(GenesisEnv):
             return
 
         if self.render_backend == "nyx":
+            sampled = [s.name for s in self._camera_specs.values() if isinstance(s, CamSampler)]
+            if sampled:
+                raise ValueError(
+                    f"cameras {sampled} are CamSamplers, unsupported on the nyx "
+                    "backend: sensors take their pose at sensor creation"
+                )
             from xsim.suite.renderers.nyx import build_lights, camera_options, make_light_field
 
             cfg = self.renderer_config or NyxConfig()
-            splat = cfg.splat or getattr(self.model.arena, "splat", None)
+            splat = cfg.splat or self.model.arena.splat
             light_fields = (make_light_field(splat),) if (cfg.use_splat and splat) else ()
             lights = build_lights(cfg)
             for i, spec in enumerate(self._camera_specs.values()):
@@ -112,9 +131,11 @@ class RobotEnv(GenesisEnv):
                 )
         else:
             for spec in self._camera_specs.values():
+                # samplers have no fixed pose; real poses land at _bind_cameras
                 self.cams[spec.name] = self.scene.add_camera(
                     res=self.camera_res, fov=spec.fov_deg or self.fov_deg, GUI=False,
-                    pos=spec.pos or (1.0, 0.0, 0.5), lookat=spec.lookat or (0.0, 0.0, 0.0),
+                    pos=getattr(spec, "pos", None) or (1.0, 0.0, 0.5),
+                    lookat=getattr(spec, "lookat", None) or (0.0, 0.0, 0.0),
                     near=0.02, far=50.0,  # default near clips the wrist cam's own gripper
                     # batch (madrona) cameras render every env; raster is single-env
                     **({} if self.render_backend == "batch" else {"env_idx": 0}),
@@ -131,7 +152,7 @@ class RobotEnv(GenesisEnv):
 
     def _bind_cameras(self) -> None:
         """Post-build: pose static cams (incl. their up vector) and attach mounted ones."""
-        jitter = self._static_cam_jitter()
+        self._resolve_static_poses()
         for name, spec in self._camera_specs.items():
             cam = self.cams[name]
             if spec.attach_link is not None:
@@ -140,101 +161,134 @@ class RobotEnv(GenesisEnv):
                 # every render, so there is nothing to bind or sync for them
                 if hasattr(cam, "attach"):
                     link = self._camera_owner[name].get_link(spec.attach_link)
-                    offset = np.asarray(spec.attach_offset, dtype=np.float64)
-                    cam.attach(link, offset)
-                    self._rig_attached.add(name)
-                    self._attached_rigs[name] = (link, offset)
+                    if isinstance(spec, CamSampler):
+                        n = self.n_envs if self.render_backend == "batch" else 1
+                        self._attached_rigs[name] = (link, self._sample_rig_offsets(spec, n))
+                    else:
+                        offset = np.asarray(spec.attach_offset, dtype=np.float64)
+                        cam.attach(link, offset)
+                        self._rig_attached.add(name)
+                        self._attached_rigs[name] = (link, offset)
             elif hasattr(cam, "set_pose"):
-                pos, lookat = jitter(spec) if jitter else (spec.pos, spec.lookat)
-                cam.set_pose(pos=pos, lookat=lookat, up=spec.up)
-                self._static_cam_poses[name] = (
-                    pos if pos is not None else (1.0, 0.0, 0.5),  # add_camera defaults
-                    lookat if lookat is not None else (0.0, 0.0, 0.0),
-                    spec.up,
-                )
+                self._push_cam_pose(name, *self._static_cam_poses[name])
             else:
                 cam.update_camera_pose(pos=spec.pos, lookat=spec.lookat, up=spec.up)
         self._sync_attached_cams()
 
-    def _static_cam_jitter(self) -> Callable | None:
-        """Per-env pose jitter for static cams — batch backend only, where each
-        camera holds one pose per env. Returns spec -> ((n_envs, 3) pos,
-        (n_envs, 3) lookat), or None when jitter is off."""
-        if self.render_backend != "batch":
-            return None
-        cfg = self.renderer_config or BatchConfig()
-        if not (cfg.cam_pos_noise or cfg.cam_lookat_noise):
-            return None
-        rng = np.random.default_rng(cfg.cam_noise_seed)
-
-        def jitter(spec: CameraSpec):
-            # None pos/lookat keep the pose given at add_camera; only jitter
-            # what the spec actually pins down
-            shape = (self.n_envs, 3)
-            pos, lookat = spec.pos, spec.lookat
-            if pos is not None:
-                pos = np.asarray(pos) + rng.uniform(
-                    -cfg.cam_pos_noise, cfg.cam_pos_noise, shape
+    def _resolve_static_poses(self) -> None:
+        """Per-env pose arrays for every static camera — the only static-cam
+        representation: fixed specs tile their single pose, samplers draw one
+        per env."""
+        n = self.n_envs if self.render_backend == "batch" else 1
+        for name, spec in self._camera_specs.items():
+            if spec.attach_link is not None:
+                continue
+            if isinstance(spec, CamSampler):
+                self._static_cam_poses[name] = spec.sample(self.np_random, n)
+            else:
+                self._static_cam_poses[name] = tuple(
+                    np.tile(np.asarray(v, dtype=np.float64), (n, 1))
+                    for v in (
+                        spec.pos or (1.0, 0.0, 0.5),  # add_camera defaults
+                        spec.lookat or (0.0, 0.0, 0.0),
+                        spec.up,
+                    )
                 )
-            if lookat is not None:
-                lookat = np.asarray(lookat) + rng.uniform(
-                    -cfg.cam_lookat_noise, cfg.cam_lookat_noise, shape
-                )
-            return pos, lookat
 
-        return jitter
+    def _push_cam_pose(self, name: str, pos, lookat, up) -> None:
+        # always full arrays, never envs_idx: genesis set_pose(envs_idx=...)
+        # has an inverted membership check; raster cams take a single pose
+        if self.render_backend == "batch":
+            self.cams[name].set_pose(pos=pos, lookat=lookat, up=up)
+        else:
+            self.cams[name].set_pose(pos=pos[0], lookat=lookat[0], up=up[0])
+
+    def _sample_rig_offsets(self, spec: CamSampler, n: int) -> np.ndarray:
+        """(n, 4, 4) link->camera offsets in the OpenGL convention genesis
+        attach offsets use, from link-frame sampled poses."""
+        pos, lookat, up = spec.sample(self.np_random, n)
+        return invert_rigid(viewmats_cv(pos, lookat, up)) @ T_GL_TO_CV
+
+    def _link_T(self, link, idx=None) -> np.ndarray:
+        quat = np.atleast_2d(_np(link.get_quat()))
+        pos = np.atleast_2d(_np(link.get_pos()))
+        if idx is not None:
+            quat, pos = quat[idx], pos[idx]
+        T = np.tile(np.eye(4), (len(quat), 1, 1))
+        T[:, :3, :3] = rots_from_quat_wxyz(quat)
+        T[:, :3, 3] = pos
+        return T
+
+    def _resample_cameras(self, envs_idx=None) -> None:
+        idx = np.arange(self.n_envs) if envs_idx is None else np.atleast_1d(envs_idx)
+        for name, spec in self._camera_specs.items():
+            if not (isinstance(spec, CamSampler) and spec.resample_on_reset):
+                continue
+            if spec.attach_link is None:
+                pos, lookat, up = self._static_cam_poses[name]
+                rows = idx[idx < len(pos)]  # non-batch cams hold env 0's pose only
+                if not len(rows):
+                    continue
+                pos[rows], lookat[rows], up[rows] = spec.sample(self.np_random, len(rows))
+                self._push_cam_pose(name, pos, lookat, up)
+            else:
+                link, offset = self._attached_rigs[name]
+                rows = idx[idx < len(offset)]
+                if len(rows):
+                    offset[rows] = self._sample_rig_offsets(spec, len(rows))
 
     def _setup_splat_bg(self) -> None:
-        cfg = self.renderer_config
-        if not (self.render_backend == "batch" and getattr(cfg, "splat_bg", False)):
-            return
-        splat = getattr(self.model.arena, "splat", None)
-        if splat is None:
+        arena = self.model.arena
+        if not (self.render_backend == "batch" and arena.splat_bg and arena.splat is not None):
             return
         from xsim.suite.renderers.splat_bg import SplatBackground
 
+        cfg = self.renderer_config or BatchConfig()
         self._splat_bg = SplatBackground(
-            splat, chunk=cfg.splat_chunk, prune_opacity=cfg.splat_prune_opacity
+            arena.splat, chunk=cfg.splat_chunk, prune_opacity=cfg.splat_prune_opacity
         )
 
     def _render_splat_bg(self, envs_idx=None, force: bool = False) -> None:
-        """Refresh per-env splat background frames for every camera. Static cams
-        render once (their per-env poses are fixed at build) unless ``force``;
-        attached cams re-render the reset envs from their current link pose —
-        the backdrop drifts as the arm moves, but wrist frames rarely show
-        background."""
+        """Refresh per-env splat background frames for every camera. Fixed static
+        cams render once — a (1, H, W, 3) frame that broadcasts across envs —
+        unless ``force``; sampled static cams keep an (n_envs, H, W, 3) buffer
+        whose reset rows are refreshed; attached cams re-render the reset envs
+        from their current link pose — the backdrop drifts as the arm moves, but
+        wrist frames rarely show background."""
         if self._splat_bg is None:
             return
-        from xsim.suite.models.cameras import T_GL_TO_CV
-        from xsim.suite.renderers.splat_bg import (
-            invert_rigid, rots_from_quat_wxyz, viewmats_cv,
-        )
-
         idx = np.arange(self.n_envs) if envs_idx is None else np.atleast_1d(envs_idx)
         for name, spec in self._camera_specs.items():
             K = self.intrinsics(name)
             if spec.attach_link is None:
-                pose = self._static_cam_poses.get(name)
-                if pose is None or (name in self._splat_bg_frames and not force):
+                pos, lookat, up = self._static_cam_poses[name]
+                fixed = not isinstance(spec, CamSampler) or not spec.resample_on_reset
+                if fixed and name in self._splat_bg_frames and not force:
                     continue
-                # unjittered specs give one shared pose -> a (1, H, W, 3) frame
-                # that broadcasts across envs in the composite
-                self._splat_bg_frames[name] = self._splat_bg.render(
-                    viewmats_cv(*pose), K, self.camera_res
+                if not isinstance(spec, CamSampler):
+                    self._splat_bg_frames[name] = self._splat_bg.render(
+                        viewmats_cv(pos[:1], lookat[:1], up[:1]), K, self.camera_res
+                    )
+                    continue
+                buf = self._splat_bg_frames.get(name)
+                # first render fills every env: build-time poses are all live
+                rows = idx if buf is not None else np.arange(len(pos))
+                frames = self._splat_bg.render(
+                    viewmats_cv(pos[rows], lookat[rows], up[rows]), K, self.camera_res
                 )
+                if buf is None:
+                    self._splat_bg_frames[name] = frames
+                else:
+                    buf[rows] = frames
             else:
                 rig = self._attached_rigs.get(name)
                 if rig is None:
                     continue
                 link, offset = rig
-                link_T = np.tile(np.eye(4), (len(idx), 1, 1))
-                link_T[:, :3, :3] = rots_from_quat_wxyz(
-                    np.atleast_2d(_np(link.get_quat()))[idx]
-                )
-                link_T[:, :3, 3] = np.atleast_2d(_np(link.get_pos()))[idx]
+                off = offset[idx] if offset.ndim == 3 else offset
                 # attach offsets are OpenGL link->cam transforms; gsplat wants
                 # OpenCV world->cam
-                vm = invert_rigid(link_T @ (offset @ T_GL_TO_CV))
+                vm = invert_rigid(self._link_T(link, idx) @ (off @ T_GL_TO_CV))
                 frames = self._splat_bg.render(vm, K, self.camera_res)
                 buf = self._splat_bg_frames.get(name)
                 if buf is None:
@@ -246,6 +300,12 @@ class RobotEnv(GenesisEnv):
     def _sync_attached_cams(self) -> None:
         for name in self._rig_attached:
             self.cams[name].move_to_attach()
+        for name, (link, offset) in self._attached_rigs.items():
+            if offset.ndim == 2:  # attach()ed above
+                continue
+            c2w = self._link_T(link)[: len(offset)] @ offset  # OpenGL cam-to-world
+            pos = c2w[:, :3, 3]
+            self._push_cam_pose(name, pos, pos - c2w[:, :3, 2], c2w[:, :3, 1])
 
     def _post_sim_step(self) -> None:
         self._sync_attached_cams()
@@ -256,6 +316,11 @@ class RobotEnv(GenesisEnv):
         stacks instead of env 0's frame — nyx and batch backends only, which
         render every env anyway; raster cameras are built on env 0."""
         out = {}
+        # the batch renderer caches frames until scene.t advances, so a reset
+        # (new camera poses, new state, same t) must force one fresh pass; the
+        # cache is shared across cameras, so only the first render needs it
+        force = self._render_stale and self.render_backend == "batch"
+        self._render_stale = False
         for name, cam in self.cams.items():
             bg = self._splat_bg_frames.get(name)
             if hasattr(cam, "render"):  # raster or batch camera
@@ -266,12 +331,15 @@ class RobotEnv(GenesisEnv):
                     )
                 if bg is not None:
                     # splat backdrop wherever madrona rendered no geometry
-                    rgb_t, _, seg_t, _ = cam.render(rgb=True, segmentation=True)
+                    rgb_t, _, seg_t, _ = cam.render(
+                        rgb=True, segmentation=True, force_render=force
+                    )
                     rgb = np.where(
                         (_np(seg_t) == 0)[..., None], bg, _np(rgb_t)[..., :3]
                     )
                 else:
-                    rgb = cam.render(rgb=True)[0]
+                    rgb = cam.render(rgb=True, force_render=force)[0]
+                force = False
             else:
                 rgb = cam.read().rgb if all_envs else cam.read(envs_idx=0).rgb
             rgb = rgb.detach().cpu().numpy() if hasattr(rgb, "detach") else np.asarray(rgb)
@@ -343,12 +411,14 @@ class RobotEnv(GenesisEnv):
         super()._reset_internal(envs_idx)
         for robot in self.robots:
             robot.reset(envs_idx)
+        self._resample_cameras(envs_idx)
         self._sync_attached_cams()  # wrist cam follows the freshly reset arm
         self._render_splat_bg(envs_idx)
+        self._render_stale = True
 
     def step(self, action):
         out = super().step(action)
-        every = getattr(self.renderer_config, "splat_resplat_every", 0)
+        every = self.model.arena.splat_resplat_every
         if self._splat_bg is not None and every > 0:
             self._splat_steps += 1
             if self._splat_steps % every == 0:

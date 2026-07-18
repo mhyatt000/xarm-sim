@@ -17,7 +17,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from xsim.suite.models.cameras import SplatAsset
+from xsim.suite.models.cameras import (  # noqa: F401 — re-exported for scripts
+    SplatAsset,
+    invert_rigid,
+    quat_mul_wxyz,
+    rot_from_quat_xyzw,
+    rots_from_quat_wxyz,
+    viewmats_cv,
+)
 
 SH_C0 = 0.28209479177387814
 
@@ -74,45 +81,6 @@ def read_ply_vertices(path: Path) -> np.ndarray:
         return np.fromfile(f, dtype=np.dtype(fields), count=count)
 
 
-def rot_from_quat_xyzw(q) -> np.ndarray:
-    x, y, z, w = np.asarray(q, dtype=np.float64)
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-        ]
-    )
-
-
-def rots_from_quat_wxyz(q: np.ndarray) -> np.ndarray:
-    """(B, 4) wxyz -> (B, 3, 3)."""
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    return np.stack(
-        [
-            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-            np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-            np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
-        ],
-        axis=-2,
-    )
-
-
-def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Hamilton product; q1 is (4,), q2 is (N, 4), both wxyz."""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-    return np.stack(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        axis=-1,
-    )
-
-
 def load_world_splat(
     asset: SplatAsset, ply: Path | None = None, device: str = "cuda"
 ) -> dict[str, torch.Tensor]:
@@ -135,30 +103,6 @@ def load_world_splat(
     to = lambda a: torch.from_numpy(np.ascontiguousarray(a)).float().to(device)
     return dict(means=to(means), quats=to(quats), scales=to(scales),
                 opacities=to(opacities), colors=to(colors))
-
-
-def viewmats_cv(pos, lookat, up) -> np.ndarray:
-    """Batched world->camera in the OpenCV optical frame (x right, y down,
-    +z forward): (B, 3) or (3,) pos/lookat/up -> (B, 4, 4)."""
-    pos, lookat, up = np.atleast_2d(pos, lookat, up)
-    z = lookat - pos
-    z = z / np.linalg.norm(z, axis=-1, keepdims=True)
-    x = np.cross(z, np.broadcast_to(up, z.shape))
-    x = x / np.linalg.norm(x, axis=-1, keepdims=True)
-    y = np.cross(z, x)
-    T = np.tile(np.eye(4), (len(z), 1, 1))
-    T[:, :3, :3] = np.stack([x, y, z], axis=-2)
-    T[:, :3, 3] = -(T[:, :3, :3] @ pos[..., None])[..., 0]
-    return T
-
-
-def invert_rigid(T: np.ndarray) -> np.ndarray:
-    """(B, 4, 4) rigid transforms -> batched inverse."""
-    R = T[:, :3, :3]
-    out = np.tile(np.eye(4), (len(T), 1, 1))
-    out[:, :3, :3] = R.transpose(0, 2, 1)
-    out[:, :3, 3] = -(R.transpose(0, 2, 1) @ T[:, :3, 3, None])[..., 0]
-    return out
 
 
 class SplatBackground:
