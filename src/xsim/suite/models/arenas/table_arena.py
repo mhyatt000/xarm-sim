@@ -40,8 +40,8 @@ _TABLE_CAMERAS = (
 _CLEAN_SPLAT = _PROJECT_ROOT / "assets" / "lab_clean.ply"
 DEFAULT_SPLAT = SplatAsset(
     uri=_CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply"),
-    pos=(-0.2513, 0.767, 0.1847),
-    quat_xyzw=(-0.526301, 0.471493, -0.470877, 0.528183),
+    pos=(-0.2711, 0.7629, 0.1824),
+    quat_xyzw=(-0.542208, 0.464004, -0.464180, 0.524641),
     scale=1.0,
 )
 
