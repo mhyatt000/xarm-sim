@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from xsim.suite.models.cam_space import MountSampler
 from xsim.suite.models.cameras import CameraSpec, look_offset_T
 from xsim.suite.models.mounts import Mount, PlateMount
 from xsim.suite.models.robots.robot_model import RobotModel
@@ -20,15 +21,27 @@ _DEFAULT_ARM_QPOS = tuple(math.radians(v) for v in (0.0, -26.2, 0.0, 13.5, 0.0, 
 REALSENSE_FOV_DEG = 42.5
 # Side-mounted wrist RealSense, matched frame-by-frame against the real stream
 # (candidate "P1" of the 2026-07-02 mount sweep, carried over from task_env.py).
+_WRIST_OFFSET = look_offset_T(
+    back=0.14, side=0.085, lift=-0.03, pitch_deg=-5.0, yaw_deg=25.0, roll_deg=-90.0
+)
 _XARM7_CAMERAS = (
-    CameraSpec(
-        "wrist",
-        fov_deg=REALSENSE_FOV_DEG,
-        attach_link="link_tcp",
-        attach_offset=look_offset_T(
-            back=0.14, side=0.085, lift=-0.03, pitch_deg=-5.0, yaw_deg=25.0, roll_deg=-90.0
-        ),
-    ),
+    CameraSpec("wrist", fov_deg=REALSENSE_FOV_DEG, attach_link="link_tcp",
+               attach_offset=_WRIST_OFFSET),
+)
+# Randomized mount, link_tcp frame (derivation + plot: scripts/cam_wrist.py):
+# cone apex = gripper base (URDF joint_tcp origin: 0.172 m behind the TCP),
+# axis = common perpendicular of the fingertip line and the base->TCP line
+# (exactly +x at qpos 0), lookats in the 4 cm ball around the TCP. The
+# committed bracket sits at r = 0.096 m, 27 deg off-axis — inside the cone,
+# just under the 10 cm shell floor. Up copied from the committed mount so
+# sampled frames roll like the real camera.
+_WRIST_MOUNT = MountSampler(
+    name="wrist",
+    fov_deg=REALSENSE_FOV_DEG,
+    attach_link="link_tcp",
+    up=tuple(row[1] for row in _WRIST_OFFSET[:3]),
+    apex=(0.0, 0.0, -0.172),
+    axis=(1.0, 0.0, 0.0),
 )
 
 
@@ -51,3 +64,11 @@ class XArm7(RobotModel):
     # the real arm bolts onto a 5x8 in baseplate; TableArena.top_z = -0.01
     # already prices in its 1 cm thickness, this adds the visible body
     mount: Mount | None = field(default_factory=PlateMount)
+    # wrist mount sampled per env/episode; False pins the committed bracket
+    randomize_wrist: bool = True
+
+    def __post_init__(self) -> None:
+        if self.randomize_wrist:
+            self.cameras = tuple(
+                _WRIST_MOUNT if c.name == "wrist" else c for c in self.cameras
+            )

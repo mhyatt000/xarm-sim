@@ -32,6 +32,64 @@ class CamSampler:
 
 
 @dataclass(frozen=True, kw_only=True)
+class MountSampler(CamSampler):
+    """Randomized rigid mount, sampled in the attach link's frame: positions
+    uniform in a spherical shell about ``apex`` restricted to a cone around
+    ``axis``, lookats uniform in a ball. The spec, verbatim (derivation and
+    plot: scripts/cam_wrist.py):
+
+        consider robot points eef gripper finger tip right and left. the
+        finger tip, NOT the knuckles. consider also TCP. line A is the line
+        from right to left tip. line B is from EEF to TCP. C intersects A,B
+        and is perpendicular to both (orthogonal). D is colinear to C but
+        intersects EEF. 11cm along D (away from EEF) is the cam pos center.
+        create a cone by rotating a line 30 degrees from D (centerline) but
+        still intersecting with D at EEF. the space the camera can occupy is
+        from 10cm to 12cm within that cone. the lookat is sampled from sphere
+        8cm diameter centered at TCP.
+
+    ``apex`` is EEF and ``axis`` is D; the shell floor is dropped to 9 cm so
+    the sampled space contains the committed physical bracket (r = 9.6 cm,
+    27 deg off-axis — inside the cone but under the verbatim 10 cm floor)."""
+
+    apex: tuple[float, float, float]
+    axis: tuple[float, float, float]  # cone centerline (line D), need not be unit
+    half_angle_deg: float = 30.0
+    r_range: tuple[float, float] = (0.09, 0.12)
+    lookat_center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lookat_radius: float = 0.04
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        axis = np.asarray(self.axis, dtype=np.float64)
+        axis /= np.linalg.norm(axis)
+        cos_t = rng.uniform(np.cos(np.radians(self.half_angle_deg)), 1.0, n)
+        phi = rng.uniform(0.0, 2 * np.pi, n)
+        sin_t = np.sqrt(1.0 - cos_t**2)
+        u = np.array([0.0, 0.0, 1.0])
+        u = u - (u @ axis) * axis
+        if np.linalg.norm(u) < 1e-9:  # axis parallel to z: any perpendicular works
+            u = np.array([1.0, 0.0, 0.0])
+        u /= np.linalg.norm(u)
+        v = np.cross(axis, u)
+        dirs = (
+            cos_t[:, None] * axis
+            + sin_t[:, None] * (np.cos(phi)[:, None] * u + np.sin(phi)[:, None] * v)
+        )
+        r_lo, r_hi = self.r_range
+        r = np.cbrt(rng.uniform(r_lo**3, r_hi**3, n))  # uniform in shell volume
+        pos = np.asarray(self.apex) + r[:, None] * dirs
+
+        d = rng.normal(size=(n, 3))
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        lookat = np.asarray(self.lookat_center) + self.lookat_radius * np.cbrt(
+            rng.uniform(size=(n, 1))
+        ) * d
+        return pos, lookat, np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
+
+
+@dataclass(frozen=True, kw_only=True)
 class ShellLookatSampler(CamSampler):
     """Positions in a chopped-sphere shell around the origin, lookats in a box.
 
