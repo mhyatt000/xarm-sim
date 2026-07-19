@@ -62,7 +62,11 @@ import torch.nn.functional as F
 import tyro
 from rich import print
 
-from xsim.suite.algo.distributed import Distributed
+from xsim.algo import (
+    Collector, Distributed, FlowImageStudent, ImageStudent, MLPTeacher,
+    Student, image_proprio_keys, rand_shift,
+)
+from xsim.data import MemmapDataset, read_key
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -154,327 +158,14 @@ class Config:
     horizon: int = 200
     control_freq: float = 30.0
     noslip_iterations: int = 10
-    # play mode: load a checkpoint, roll the student out once (seeded, nyx-rendered),
-    # write an all-envs grid video (green border = success tick, red = timeout) and
-    # a per-env spawn/outcome table; no training
+    # play mode (scripts/play.py; shares this Config): load a checkpoint, roll
+    # the student out once (seeded), write an all-envs grid video (green border
+    # = success tick, red = timeout) and a per-env spawn/outcome table
     play: Path | None = None
     play_video: Path | None = None    # default: <checkpoint dir>/rollout.mp4
     cameras: tuple[str, ...] = ("low", "side", "wrist")
     spp: int = 8
     video_max_width: int = 1280       # per-camera grid width cap, px
-
-
-def image_proprio_keys(keys) -> list[str]:
-    """Image-student proprio: non-privileged keys, minus joint velocities.
-    Sim velocity profiles (Genesis PD at 30 Hz) don't transfer to the real
-    arm — the img-v5 IRL sensitivity probe showed vel as the strongest input —
-    so the image student never sees them. State-mode students/teachers keep
-    the full flat obs including vel."""
-    return [k for k in keys if "cube" not in k and "vel" not in k]
-
-
-def flat(obs: dict, keys: list[str]) -> np.ndarray:
-    """Concatenate dict obs values for ``keys`` into (n_envs, D) float32."""
-    b = np.asarray(obs[keys[0]]).shape[0]
-    return np.concatenate(
-        [np.asarray(obs[k], dtype=np.float32).reshape(b, -1) for k in keys], axis=-1
-    )
-
-
-def aux_targets(obs: dict) -> np.ndarray:
-    """Privileged aux regression targets: cube pos + (sin, cos) of 4*yaw
-    (the cube has 90-degree rotational symmetry)."""
-    q = np.asarray(obs["cube_quat"], dtype=np.float32)
-    yaw4 = 4.0 * 2.0 * np.arctan2(q[:, 3], q[:, 0])
-    return np.concatenate(
-        [np.asarray(obs["cube_pos"], dtype=np.float32),
-         np.sin(yaw4)[:, None], np.cos(yaw4)[:, None]], axis=-1
-    )
-
-
-class MemmapStore:
-    """Append-only on-disk dataset: one flat <key>.bin per key + manifest.json.
-
-    Rows are fixed-size, so sample i of a key is one memmap slice; the OS page
-    cache is the only caching layer. Single writer, append per recorded step,
-    flush() publishes the manifest for readers.
-    """
-
-    def __init__(self, root: Path):
-        import shutil
-
-        self.root = root
-        shutil.rmtree(root, ignore_errors=True)  # fresh run owns its dir
-        root.mkdir(parents=True, exist_ok=True)
-        self._fh: dict = {}
-        self.meta: dict[str, dict] = {}
-
-    def append(self, key: str, arr: np.ndarray) -> None:
-        meta = self.meta.setdefault(
-            key, {"dtype": str(arr.dtype), "shape": list(arr.shape[1:]), "n": 0})
-        if key not in self._fh:
-            self._fh[key] = (self.root / f"{key}.bin").open("ab")
-        arr.tofile(self._fh[key])
-        meta["n"] += arr.shape[0]
-
-    def flush(self) -> None:
-        for fh in self._fh.values():
-            fh.flush()
-        (self.root / "manifest.json").write_text(json.dumps(self.meta))
-
-    def reader(self, key: str) -> np.memmap:
-        meta = self.meta[key]
-        return np.memmap(self.root / f"{key}.bin", dtype=meta["dtype"],
-                         mode="r", shape=(meta["n"], *meta["shape"]))
-
-    def __len__(self) -> int:
-        return self.meta["act"]["n"] if "act" in self.meta else 0
-
-
-class MemmapDataset(torch.utils.data.Dataset):
-    """Random-access snapshot of a MemmapStore. Holds only the root path and
-    manifest, so it pickles cheaply into spawned DataLoader workers; each
-    worker opens its own memmap handles on first use."""
-
-    def __init__(self, root: Path, keys: tuple[str, ...]):
-        self.root, self.keys = root, keys
-        self.meta = json.loads((root / "manifest.json").read_text())
-        self.n = self.meta[keys[0]]["n"]
-        self._maps: dict[str, np.memmap] | None = None
-
-    def __len__(self) -> int:
-        return self.n
-
-    def __getitem__(self, i: int):
-        if self._maps is None:
-            self._maps = {
-                k: np.memmap(self.root / f"{k}.bin", dtype=m["dtype"], mode="r",
-                             shape=(m["n"], *m["shape"]))
-                for k in self.keys if (m := self.meta[k])
-            }
-        return tuple(torch.from_numpy(np.array(self._maps[k][i])) for k in self.keys)
-
-
-class Student(nn.Module):
-    """MLP over the GymWrapper's flat obs -> absolute [j0..j6, g] action.
-
-    Obs normalization stats and action limits live in buffers so a checkpoint
-    is self-contained.
-    """
-
-    def __init__(self, obs_dim: int, act_dim: int, hidden: int,
-                 act_low: np.ndarray, act_high: np.ndarray):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, act_dim),
-        )
-        self.obs_mean = nn.Buffer(torch.zeros(obs_dim))
-        self.obs_std = nn.Buffer(torch.ones(obs_dim))
-        self.act_low = nn.Buffer(torch.as_tensor(act_low, dtype=torch.float32))
-        self.act_high = nn.Buffer(torch.as_tensor(act_high, dtype=torch.float32))
-
-    def set_obs_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        self.obs_mean.copy_(mean)
-        self.obs_std.copy_(std.clamp_min(1e-6))
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net((obs - self.obs_mean) / self.obs_std)
-
-    @torch.no_grad()
-    def act(self, obs: np.ndarray) -> np.ndarray:
-        device = self.obs_mean.device
-        x = torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device)
-        a = self(x).clamp(self.act_low, self.act_high)
-        return a.cpu().numpy()
-
-
-def rand_shift(x: torch.Tensor, pad: int) -> torch.Tensor:
-    """DrQ-style random shift: replicate-pad then translate up to +-pad px,
-    one offset per sample. x: (N, C, H, W) float."""
-    n, _, h, w = x.shape
-    shift = torch.randint(-pad, pad + 1, (n, 2), device=x.device, dtype=torch.float32)
-    theta = torch.zeros(n, 2, 3, device=x.device)
-    theta[:, 0, 0] = 1.0
-    theta[:, 1, 1] = 1.0
-    theta[:, 0, 2] = 2.0 * shift[:, 0] / w
-    theta[:, 1, 2] = 2.0 * shift[:, 1] / h
-    xp = F.pad(x, (pad,) * 4, mode="replicate")
-    grid = F.affine_grid(theta, (n, x.shape[1], h + 2 * pad, w + 2 * pad),
-                         align_corners=False)
-    return F.grid_sample(xp, grid, align_corners=False)[:, :, pad:-pad, pad:-pad]
-
-
-class ImageStudent(nn.Module):
-    """CNN over (V, 3, H, W) rgb + MLP over proprio -> [j0..j6, gripper logit],
-    plus an auxiliary cube pos+yaw head off the fused trunk.
-
-    ``shared`` encoder folds V into the batch dim and adds a learned per-view
-    embedding (new views = new embedding rows, encoder untouched); ``separate``
-    trains V independent CNNs. The gripper is a logit trained with BCE (labels
-    are 0/1) and snapped to the extremes at act() — an MSE-hedged half-open
-    command is the one action error this task cannot absorb.
-    """
-
-    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
-                 act_low: np.ndarray, act_high: np.ndarray,
-                 encoder: str = "shared", hidden: int = 256, feat_dim: int = 64):
-        super().__init__()
-        self.n_views = n_views
-        self.shared = encoder == "shared"
-        c = hw // 16  # four stride-2 convs
-
-        def make_enc() -> nn.Sequential:
-            return nn.Sequential(
-                nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(),
-                nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(),
-                nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(),
-                nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(),
-                nn.Flatten(),
-                nn.Linear(32 * c * c, feat_dim), nn.LayerNorm(feat_dim), nn.Tanh(),
-            )
-
-        if self.shared:
-            self.encoder = make_enc()
-            self.view_emb = nn.Parameter(torch.zeros(n_views, feat_dim))
-        else:
-            self.encoders = nn.ModuleList([make_enc() for _ in range(n_views)])
-        self.prop_net = nn.Sequential(nn.Linear(proprio_dim, 128), nn.ReLU())
-        self.trunk = nn.Sequential(
-            nn.Linear(n_views * feat_dim + 128, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-        )
-        self.head = nn.Linear(hidden, act_dim)
-        self.aux_head = nn.Linear(hidden, 5)  # cube xyz + sin/cos of 4*yaw
-        self.prop_mean = nn.Buffer(torch.zeros(proprio_dim))
-        self.prop_std = nn.Buffer(torch.ones(proprio_dim))
-        self.act_low = nn.Buffer(torch.as_tensor(act_low, dtype=torch.float32))
-        self.act_high = nn.Buffer(torch.as_tensor(act_high, dtype=torch.float32))
-
-    def set_obs_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        self.prop_mean.copy_(mean)
-        self.prop_std.copy_(std.clamp_min(1e-6))
-
-    def features(self, rgb: torch.Tensor, prop: torch.Tensor) -> torch.Tensor:
-        """Fused trunk feature. rgb: (N, V, 3, H, W) float in [-0.5, 0.5];
-        prop: (N, P) raw."""
-        n = rgb.shape[0]
-        if self.shared:
-            f = self.encoder(rgb.reshape(n * self.n_views, *rgb.shape[2:]))
-            f = f.reshape(n, self.n_views, -1) + self.view_emb
-        else:
-            f = torch.stack(
-                [enc(rgb[:, i]) for i, enc in enumerate(self.encoders)], dim=1)
-        p = self.prop_net((prop - self.prop_mean) / self.prop_std)
-        return self.trunk(torch.cat([f.reshape(n, -1), p], dim=-1))
-
-    def forward(self, rgb: torch.Tensor, prop: torch.Tensor):
-        h = self.features(rgb, prop)
-        return self.head(h), self.aux_head(h)
-
-    @torch.no_grad()
-    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-        prop, rgb = obs
-        device = self.prop_mean.device
-        x = torch.from_numpy(np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
-        p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
-        a, _ = self(x, p)
-        joints = a[:, :-1].clamp(self.act_low[:-1], self.act_high[:-1])
-        grip = (torch.sigmoid(a[:, -1:]) > 0.5).float()
-        return torch.cat([joints, grip], dim=-1).cpu().numpy()
-
-
-def time_features(t: torch.Tensor) -> torch.Tensor:
-    """Fourier features of flow time t in [0, 1]. t: (N, 1) -> (N, 16)."""
-    ang = t * (math.pi * 2.0 ** torch.arange(8, device=t.device))
-    return torch.cat([ang.sin(), ang.cos()], dim=-1)
-
-
-class FlowImageStudent(ImageStudent):
-    """ImageStudent trunk + a rectified-flow head over a ``chunk``-step plan.
-
-    ``vel_net`` predicts the denoising velocity field v(x_t, t | h) in
-    normalized action-chunk space — the straight noise->data direction of
-    rectified flow, not joint-space velocity. act() Euler-integrates it from
-    N(0, I) and returns a (B, chunk, act_dim) plan of absolute joint targets;
-    the gripper stays a smooth [0, 1] value (clamped, never thresholded).
-    Action normalization stats live in buffers so a checkpoint stays
-    self-contained.
-    """
-
-    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
-                 act_low: np.ndarray, act_high: np.ndarray,
-                 encoder: str = "shared", hidden: int = 256, feat_dim: int = 64,
-                 chunk: int = 50, flow_steps: int = 10):
-        super().__init__(proprio_dim, act_dim, n_views, hw, act_low, act_high,
-                         encoder, hidden, feat_dim)
-        del self.head  # the flow head replaces the direct regression head
-        self.chunk, self.flow_steps, self.act_dim = chunk, flow_steps, act_dim
-        d = chunk * act_dim
-        self.vel_net = nn.Sequential(
-            nn.Linear(hidden + d + 16, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, d),
-        )
-        self.act_mean = nn.Buffer(torch.zeros(act_dim))
-        self.act_std = nn.Buffer(torch.ones(act_dim))
-
-    def set_act_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        self.act_mean.copy_(mean)
-        self.act_std.copy_(std.clamp_min(1e-6))
-
-    def velocity(self, h: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """h: (N, hidden); x: (N, chunk*act_dim) normalized; t: (N, 1)."""
-        return self.vel_net(torch.cat([h, x, time_features(t)], dim=-1))
-
-    def forward(self, rgb: torch.Tensor, prop: torch.Tensor,
-                x_t: torch.Tensor, t: torch.Tensor):
-        """Training forward: one call touches every parameter, so the DDP wrap
-        syncs gradients (calling features/velocity on the raw module would
-        bypass it). Returns (v_pred, aux_pred, h)."""
-        h = self.features(rgb, prop)
-        return self.velocity(h, x_t, t), self.aux_head(h), h
-
-    def sample(self, h: torch.Tensor) -> torch.Tensor:
-        """Integrate noise -> plan; returns (N, chunk, act_dim) in action units."""
-        n = h.shape[0]
-        x = torch.randn(n, self.chunk * self.act_dim, device=h.device)
-        dt = 1.0 / self.flow_steps
-        for k in range(self.flow_steps):
-            t = torch.full((n, 1), k * dt, device=h.device)
-            x = x + dt * self.velocity(h, x, t)
-        a = x.reshape(n, self.chunk, self.act_dim) * self.act_std + self.act_mean
-        return a.clamp(self.act_low, self.act_high)
-
-    @torch.no_grad()
-    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-        prop, rgb = obs
-        device = self.prop_mean.device
-        x = torch.from_numpy(np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
-        p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
-        return self.sample(self.features(x, p)).cpu().numpy()
-
-
-class MLPTeacher:
-    """Frozen state-mode Student checkpoint as a DAgger teacher. Structure is
-    inferred from the checkpoint; input is the sorted-key flat state vector
-    (GymWrapper's layout)."""
-
-    def __init__(self, ckpt: Path, device: torch.device):
-        sd = torch.load(ckpt, map_location="cpu")
-        obs_dim, hidden = sd["net.0.weight"].shape[1], sd["net.0.weight"].shape[0]
-        act_dim = sd["net.4.weight"].shape[0]
-        self.net = Student(obs_dim, act_dim, hidden,
-                           sd["act_low"].numpy(), sd["act_high"].numpy())
-        self.net.load_state_dict(sd)
-        self.net.eval().to(device)
-
-    def reset(self, obs=None) -> None:
-        pass
-
-    def act(self, state_flat: np.ndarray) -> np.ndarray:
-        return self.net.act(state_flat)
 
 
 def build_env(cfg: Config, render: bool = False):
@@ -531,6 +222,30 @@ def env_spec(cfg: Config, env) -> dict:
     return spec
 
 
+def make_teacher(cfg: Config, env, device: torch.device):
+    """Teacher wiring stays in the script: scripted teachers come from the
+    suite (env-side), the mlp teacher from a checkpoint."""
+    from xsim.suite.policies import LiftExpertPolicy, LiftPolicy
+
+    base = env.unwrapped
+    if cfg.teacher == "waypoint":
+        return LiftPolicy(base, steps_per_segment=cfg.steps_per_segment,
+                          cartesian=cfg.cartesian)
+    if cfg.teacher == "expert":
+        return LiftExpertPolicy(base, cartesian=cfg.cartesian)
+    if cfg.teacher.startswith("mlp:"):
+        return MLPTeacher(Path(cfg.teacher[4:]), device)
+    raise ValueError(f"unknown teacher {cfg.teacher!r}")
+
+
+def make_collector(cfg: Config, store_root: Path | None,
+                   seed_offset: int = 0) -> Collector:
+    env = build_env(cfg)
+    device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
+    return Collector(cfg, env, make_teacher(cfg, env, device),
+                     store_root=store_root, seed_offset=seed_offset)
+
+
 def build_student(cfg: Config, spec_or_env, device: torch.device):
     spec = spec_or_env if isinstance(spec_or_env, dict) else env_spec(cfg, spec_or_env)
     if cfg.policy == "state":
@@ -548,230 +263,6 @@ def build_student(cfg: Config, spec_or_env, device: torch.device):
         return FlowImageStudent(**kwargs, chunk=cfg.chunk,
                                 flow_steps=cfg.flow_steps).to(device)
     return ImageStudent(**kwargs).to(device)
-
-
-# ---------------------------------------------------------------------------------------
-# video tiling (eval rollouts + play mode)
-# ---------------------------------------------------------------------------------------
-
-BORDER = {0: (150, 150, 150), 1: (0, 200, 0), 2: (220, 30, 30)}  # live/success/fail
-
-
-def _grid(frames: np.ndarray, status: np.ndarray, max_width: int) -> np.ndarray:
-    """(B,H,W,3) -> near-square grid, tiles bordered by per-env status."""
-    import cv2
-
-    b, h, w, _ = frames.shape
-    cols = math.ceil(math.sqrt(b))
-    rows = math.ceil(b / cols)
-    tw = max(2, max_width // cols) // 2 * 2
-    th = max(2, round(h * tw / w)) // 2 * 2
-    interp = cv2.INTER_AREA if tw <= w else cv2.INTER_NEAREST
-    canvas = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
-    t = max(2, tw // 64)
-    for i in range(b):
-        r, c = divmod(i, cols)
-        tile = cv2.resize(frames[i], (tw, th), interpolation=interp)
-        tile[:t], tile[-t:], tile[:, :t], tile[:, -t:] = (BORDER[int(status[i])],) * 4
-        canvas[r * th : (r + 1) * th, c * tw : (c + 1) * tw] = tile
-    return canvas
-
-
-class VideoSink:
-    """Streamed h264 mp4 writer: RGB uint8 frames piped to an ffmpeg
-    subprocess, opened lazily on the first frame so callers never hold a full
-    rollout of grids in RAM. h264 (not cv2's mp4v) so the wandb web UI can
-    play the video inline."""
-
-    def __init__(self, path: Path, fps: float):
-        self.path, self.fps = path, fps
-        self._p = None
-
-    def add(self, frame: np.ndarray) -> None:
-        if self._p is None:
-            import shutil
-            import subprocess
-
-            exe = shutil.which("ffmpeg")
-            if exe is None:
-                import imageio_ffmpeg
-
-                exe = imageio_ffmpeg.get_ffmpeg_exe()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            h, w = frame.shape[:2]
-            self._p = subprocess.Popen(
-                [exe, "-y", "-loglevel", "error", "-f", "rawvideo",
-                 "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", f"{self.fps}",
-                 "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                 str(self.path)],
-                stdin=subprocess.PIPE)
-        self._p.stdin.write(frame.tobytes())
-
-    def close(self) -> None:
-        if self._p is not None:
-            self._p.stdin.close()
-            self._p.wait()
-
-
-def read_key(root: Path, key: str) -> np.memmap:
-    """Reader for one key of a flushed MemmapStore dir (works across processes:
-    only the manifest and bin file are touched)."""
-    meta = json.loads((root / "manifest.json").read_text())[key]
-    return np.memmap(root / f"{key}.bin", dtype=meta["dtype"], mode="r",
-                     shape=(meta["n"], *meta["shape"]))
-
-
-class Collector:
-    """One process's collection stack: env + teacher + recording.
-
-    The single-process trainer owns one directly; with --collect-gpus each
-    spawned _collect_worker owns one pinned to its GPU.
-    """
-
-    def __init__(self, cfg: Config, store_root: Path | None, seed_offset: int = 0):
-        from xsim.suite.policies import LiftPolicy
-
-        self.cfg = cfg
-        self.image = cfg.policy == "image"
-        self.flow = cfg.loss == "flow"
-        if self.flow:
-            if not self.image:
-                raise ValueError("loss='flow' currently rides the image student")
-            if cfg.frame_stride != 1:
-                raise ValueError("flow chunk labels need every step: frame_stride=1")
-            if not 1 <= cfg.replan <= cfg.chunk:
-                raise ValueError("need 1 <= replan <= chunk")
-        self.env = build_env(cfg)
-        base = self.env.unwrapped
-        self.state_keys = sorted(base.single_observation_space.spaces)
-        self.proprio_keys = image_proprio_keys(self.state_keys)
-        self.device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
-        self.spec = env_spec(cfg, self.env)
-        if cfg.teacher == "waypoint":
-            self.teacher = LiftPolicy(
-                base, steps_per_segment=cfg.steps_per_segment, cartesian=cfg.cartesian)
-        elif cfg.teacher == "expert":
-            from xsim.suite.policies import LiftExpertPolicy
-
-            self.teacher = LiftExpertPolicy(base, cartesian=cfg.cartesian)
-        elif cfg.teacher.startswith("mlp:"):
-            self.teacher = MLPTeacher(Path(cfg.teacher[4:]), self.device)
-        else:
-            raise ValueError(f"unknown teacher {cfg.teacher!r}")
-        self.rng = np.random.default_rng(cfg.seed + seed_offset)
-        self.store = MemmapStore(store_root) if (self.image and store_root) else None
-        self._chunks: dict[str, list[np.ndarray]] = {}
-
-    # -- obs adapters --------------------------------------------------------------
-    def _teacher_obs(self, obs):
-        """Sorted-key flat state (the waypoint teacher ignores it)."""
-        return flat(obs, self.state_keys) if self.image else obs
-
-    def _student_obs(self, obs):
-        if self.image:
-            return flat(obs, self.proprio_keys), obs["rgb"]
-        return obs
-
-    def _record(self, obs, teacher_a: np.ndarray, live: np.ndarray) -> None:
-        if self.image:
-            prop, rgb = self._student_obs(obs)
-            self.store.append("act", teacher_a[live].astype(np.float32))
-            self.store.append("prop", np.ascontiguousarray(prop[live]))
-            self.store.append("rgb", np.ascontiguousarray(rgb[live]))
-            self.store.append("aux", np.ascontiguousarray(aux_targets(obs)[live]))
-        else:
-            self._chunks.setdefault("act", []).append(
-                teacher_a[live].astype(np.float32, copy=True))
-            self._chunks.setdefault("obs", []).append(
-                obs[live].astype(np.float32, copy=True))
-
-    def pop_chunks(self) -> dict[str, np.ndarray] | None:
-        """Drain state-mode recordings (the shard->trainer pipe payload)."""
-        if not self._chunks:
-            return None
-        out = {k: np.concatenate(v) for k, v in self._chunks.items()}
-        self._chunks.clear()
-        return out
-
-    def _append_chunk_labels(self, acts: np.ndarray, lives: np.ndarray) -> None:
-        """Stitched chunk labels: for each recorded row (env e live at tick t),
-        the next ``chunk`` per-step teacher labels along the visited trajectory,
-        the final pre-death label repeated past episode end (hold pose). Rows
-        append in _record's tick-major live-masked order, so chunk.bin stays
-        row-aligned with rgb.bin. acts: (T, B, A); lives: (T, B)."""
-        last = lives.sum(axis=0) - 1  # (B,) each env's final live tick
-        ar = np.arange(self.cfg.chunk)
-        for t in range(acts.shape[0]):
-            envs = np.flatnonzero(lives[t])
-            idx = np.minimum(t + ar[None, :], last[envs, None])  # (n_live, chunk)
-            self.store.append("chunk", acts[idx, envs[:, None]])
-
-    def rollout(self, beta: float, record: bool, student: nn.Module,
-                seed: int | None = None, video_path: Path | None = None) -> dict:
-        """One synchronous env-batch episode; per-env Bernoulli(beta) picks the
-        teacher's action over the student's — per step, or per replan window in
-        flow mode, where the student emits a chunk executed receding-horizon.
-        Every visited state is labeled with the teacher action when ``record``
-        is on. ``video_path`` (image mode) streams the policy's own frames as a
-        play-style bordered grid mp4."""
-        env, B, cfg = self.env, self.cfg.n_envs, self.cfg
-        obs, _ = env.reset(seed=seed)
-        self.teacher.reset()
-        live = np.ones(B, dtype=bool)
-        success = np.zeros(B, dtype=bool)
-        ep_len = np.zeros(B, dtype=np.int64)
-        tick = 0
-        plan = use_teacher = None
-        acts_hist: list[np.ndarray] = []  # flow: per-tick teacher labels for stitching
-        live_hist: list[np.ndarray] = []
-        sink = status = None
-        if video_path is not None:
-            sink = VideoSink(video_path, 1.0 / env.unwrapped.control_dt)
-            status = np.zeros(B, dtype=np.int64)  # 0 live, 1 success, 2 fail
-
-        def snap(o) -> None:
-            rgb = o["rgb"].transpose(0, 1, 3, 4, 2)  # (B, V, H, W, 3)
-            sink.add(np.concatenate(
-                [_grid(rgb[:, i], status, cfg.video_max_width)
-                 for i in range(rgb.shape[1])], axis=1))
-
-        if sink is not None:
-            snap(obs)
-        while live.any():
-            teacher_a = self.teacher.act(self._teacher_obs(obs))
-            if beta >= 1.0:
-                action = teacher_a
-            else:
-                if self.flow:
-                    if tick % cfg.replan == 0:
-                        plan = student.act(self._student_obs(obs))  # (B, chunk, A)
-                        use_teacher = self.rng.random(B) < beta
-                    student_a = plan[:, tick % cfg.replan]
-                else:
-                    student_a = student.act(self._student_obs(obs))
-                    use_teacher = self.rng.random(B) < beta
-                action = np.where(use_teacher[:, None], teacher_a, student_a)
-            if record and (not self.image or tick % cfg.frame_stride == 0):
-                self._record(obs, teacher_a, live)
-                if self.flow:
-                    acts_hist.append(teacher_a.astype(np.float32, copy=True))
-                    live_hist.append(live.copy())
-            tick += 1
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated | truncated
-            if sink is not None:
-                status[live & done & info["success"]] = 1
-                status[live & done & ~info["success"]] = 2
-            success |= live & info["success"]
-            ep_len += live
-            live &= ~done
-            if sink is not None:
-                snap(obs)
-        if sink is not None:
-            sink.close()
-        if record and self.flow:
-            self._append_chunk_labels(np.stack(acts_hist), np.stack(live_hist))
-        return {"success": float(success.mean()), "ep_len": float(ep_len.mean())}
 
 
 class Trainer:
@@ -797,11 +288,11 @@ class Trainer:
         # identical init weights on every rank (DDP requirement), then
         # per-rank env reset spacing and beta/shuffle streams
         torch.manual_seed(cfg.seed)
-        self.collector = Collector(
+        self.collector = make_collector(
             cfg, store_root=self.store_root if self.image else None,
             seed_offset=100003 * self.dist.rank)
         self.device = self.collector.device
-        self.student = build_student(cfg, self.collector.spec, self.device)
+        self.student = build_student(cfg, self.collector.env, self.device)
         self.net = self.dist.wrap(self.student)  # BC fwd/bwd path
         self.ema = copy.deepcopy(self.student)
         self.optim = torch.optim.Adam(self.student.parameters(), lr=cfg.lr)
@@ -1045,76 +536,9 @@ class Trainer:
             print(f"\\[done] best eval success: {self.best_success:.0%}")
 
 
-# ---------------------------------------------------------------------------------------
-# play mode
-# ---------------------------------------------------------------------------------------
-
-
-def play(cfg: Config) -> None:
-    env = build_env(cfg, render=True)
-    B = cfg.n_envs
-    image = cfg.policy == "image"
-    device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
-    student = build_student(cfg, env, device)
-    student.load_state_dict(torch.load(cfg.play, map_location=device))
-    student.eval()
-    state_keys = sorted(env.unwrapped.single_observation_space.spaces)
-    proprio_keys = image_proprio_keys(state_keys)
-
-    obs, _ = env.reset(seed=cfg.eval_seed)
-    spawn = np.asarray(env.unwrapped.cube.get_pos(), dtype=np.float64).copy()
-    q = np.asarray(env.unwrapped.cube.get_quat(), dtype=np.float64)
-    spawn_yaw = 2.0 * np.arctan2(q[:, 3], q[:, 0])
-    status = np.zeros(B, dtype=np.int64)  # 0 live, 1 success, 2 fail
-    ep_len = np.zeros(B, dtype=np.int64)
-    live = np.ones(B, dtype=bool)
-    out = cfg.play_video or cfg.play.parent / "rollout.mp4"
-    sink = VideoSink(out, 1.0 / env.unwrapped.control_dt)
-
-    def snap(obs) -> None:
-        if image:  # reuse the policy's own frames (image_hw px, upscaled)
-            rgb = obs["rgb"].transpose(0, 1, 3, 4, 2)  # (B, V, H, W, 3)
-            views = [rgb[:, i] for i in range(rgb.shape[1])]
-        else:
-            d = env.unwrapped.render_views(all_envs=True)
-            views = [d[k] for k in sorted(d)]
-        sink.add(np.concatenate(
-            [_grid(v, status, cfg.video_max_width) for v in views], axis=1))
-
-    snap(obs)
-    flow = cfg.loss == "flow"
-    tick, plan = 0, None
-    while live.any():
-        so = (flat(obs, proprio_keys), obs["rgb"]) if image else obs
-        if flow:
-            if tick % cfg.replan == 0:
-                plan = student.act(so)
-            a = plan[:, tick % cfg.replan]
-        else:
-            a = student.act(so)
-        tick += 1
-        obs, reward, terminated, truncated, info = env.step(a)
-        done = terminated | truncated
-        status[live & done & info["success"]] = 1
-        status[live & done & ~info["success"]] = 2
-        ep_len += live
-        live &= ~done
-        snap(obs)
-
-    sink.close()
-
-    print(f"\ncheckpoint: {cfg.play}   success {int((status == 1).sum())}/{B}")
-    print(f"{'env':>3} {'outcome':>8} {'len':>4} {'cube_x':>7} {'cube_y':>7} {'yaw_deg':>8}")
-    for i in range(B):
-        print(f"{i:>3} {'success' if status[i] == 1 else 'FAIL':>8} {ep_len[i]:>4} "
-              f"{spawn[i, 0]:>7.3f} {spawn[i, 1]:>7.3f} {np.degrees(spawn_yaw[i]):>8.1f}")
-    print(f"video -> {out}")
-
-
 def main(cfg: Config) -> None:
     if cfg.play is not None:
-        play(cfg)
-        return
+        raise SystemExit("play mode moved: uv run python scripts/play.py --play <ckpt.pt> ...")
     if int(os.environ.get("RANK", 0)) == 0:
         (cfg.out / cfg.exp_name).mkdir(parents=True, exist_ok=True)
         with (cfg.out / cfg.exp_name / "config.json").open("w") as f:

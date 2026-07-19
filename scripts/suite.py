@@ -12,7 +12,6 @@ from __future__ import annotations
 from tqdm import tqdm
 
 from dataclasses import dataclass
-import math
 from pathlib import Path
 from typing import Literal
 
@@ -22,6 +21,7 @@ import tyro
 import xsim.suite as suite
 from xsim.suite.policies import LiftPolicy
 from xsim.suite.renderers import BatchConfig, NyxConfig
+from xsim.utils.video import tile_grid
 
 
 @dataclass
@@ -50,24 +50,6 @@ class Config:
     # otherwise the video shows env 0
     video_all_envs: bool = True
     video_max_width: int = 2048     # per-camera grid width cap, px
-
-
-def tile_grid(frames: np.ndarray, max_width: int) -> np.ndarray:
-    """(B, H, W, 3) -> near-square grid canvas, tiles resized to fit max_width."""
-    import cv2
-
-    b, h, w, _ = frames.shape
-    cols = math.ceil(math.sqrt(b))
-    rows = math.ceil(b / cols)
-    tw = max(2, min(w, max_width // cols)) // 2 * 2
-    th = max(2, round(h * tw / w)) // 2 * 2
-    canvas = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
-    for i in range(b):
-        r, c = divmod(i, cols)
-        canvas[r * th : (r + 1) * th, c * tw : (c + 1) * tw] = cv2.resize(
-            frames[i], (tw, th), interpolation=cv2.INTER_AREA
-        )
-    return canvas
 
 
 def main(cfg: Config) -> None:
