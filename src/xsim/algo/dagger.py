@@ -150,13 +150,16 @@ class Collector:
                     labels.astype(np.float32, copy=True))
 
     def rollout(self, beta: float, record: bool, student: nn.Module,
-                seed: int | None = None, video_path: Path | None = None) -> dict:
+                seed: int | None = None, video_path: Path | None = None,
+                on_metrics=None) -> dict:
         """One synchronous env-batch episode; per-env Bernoulli(beta) picks the
         teacher's action over the student's — per step, or per replan window in
         flow mode, where the student emits a chunk executed receding-horizon.
         Every visited state is labeled with the teacher action when ``record``
         is on. ``video_path`` (image mode) streams the policy's own frames as a
-        play-style bordered grid mp4."""
+        play-style bordered grid mp4. ``on_metrics`` receives windowed t/*
+        means + live-env count every cfg.tick_log_every ticks (live streaming;
+        the returned stats keep the full-rollout means)."""
         env, B, cfg = self.env, self.n_envs, self.cfg
         timer = Timer()
         with timer("reset"):
@@ -171,6 +174,9 @@ class Collector:
         tick = 0
         plan = use_teacher = None
         teacher_a = None
+        stream_k = getattr(cfg, "tick_log_every", 0) or 0
+        prev_times: dict[str, float] = {}
+        prev_counts: dict[str, int] = {}
         acts_hist: list[np.ndarray] = []  # flow: per-tick teacher labels for stitching
         live_hist: list[np.ndarray] = []
         sink = status = None
@@ -225,6 +231,15 @@ class Collector:
             if sink is not None:
                 with timer("video"):
                     snap(obs)
+            if on_metrics is not None and stream_k and tick % stream_k == 0:
+                # windowed means since the last emission, without resetting the
+                # rollout-total accumulators behind the returned stats
+                win = {f"t/{k}": round(
+                    (timer.times[k] - prev_times.get(k, 0.0))
+                    / max(1, timer.counts[k] - prev_counts.get(k, 0)), 4)
+                    for k in timer.counts if k != "reset"}
+                prev_times, prev_counts = dict(timer.times), dict(timer.counts)
+                on_metrics({**win, "live": int(live.sum())})
         if sink is not None:
             sink.close()
         if record and self.flow:

@@ -176,6 +176,9 @@ class Config:
     # stream bc losses to wandb every n optimizer steps (windowed mean over the
     # last n, x-axis bc/step; rank 0's local values). 0 = per-round summaries only
     log_every: int = 1000
+    # stream rollout phase timings (roll/t_*, + live env count) to wandb every
+    # n env ticks during collect/eval, x-axis roll/tick. 0 = per-rollout means only
+    tick_log_every: int = 25
     # env. n_envs is PER RANK: under torchrun each rank owns n_envs envs and a
     # DDP replica, so a rollout visits world_size * n_envs envs (and batch_size
     # is likewise per rank). Launch via torchrun for multi-GPU; no flag needed.
@@ -387,6 +390,8 @@ class Trainer:
             # the per-round log() calls over wandb's global step counter
             self.wandb.define_metric("bc/step")
             self.wandb.define_metric("bc/*", step_metric="bc/step")
+            self.wandb.define_metric("roll/tick")
+            self.wandb.define_metric("roll/*", step_metric="roll/tick")
         store_base = cfg.data_dir / cfg.exp_name
         self.store_root = (store_base / f"shard_{self.dist.rank}"
                            if self.dist.enabled else store_base)
@@ -418,6 +423,7 @@ class Trainer:
         self._win: dict[str, float] = {}
         self._win_n = 0
         self._fk_chain: FKChain | None = None
+        self._roll_tick = 0  # env ticks across rollouts (roll/tick wandb axis)
         self._start = time.time()
 
     def _fk(self) -> FKChain:
@@ -472,6 +478,14 @@ class Trainer:
         color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
         print(f"[{color}]\\[{kind}][/] {pretty}")
 
+    def _rollout_metrics(self, d: dict) -> None:
+        """Windowed rollout timings from the collector (rank 0 only — other
+        ranks have wandb None and pass no callback). t/ keys become roll/t_*."""
+        self._roll_tick += self.cfg.tick_log_every
+        self.wandb.log({
+            **{"roll/" + k.replace("t/", "t_"): v for k, v in d.items()},
+            "roll/tick": self._roll_tick})
+
     def _step_metrics(self, vals: dict[str, float]) -> None:
         """Per-optimizer-step loss stream: windowed mean to wandb every
         cfg.log_every steps. Rank 0's local values — no cross-rank sync in the
@@ -498,7 +512,8 @@ class Trainer:
         stats = collector.rollout(
             beta=beta, record=record, student=student,
             seed=None if seed is None else seed + 100003 * self.dist.rank,
-            video_path=video_path)
+            video_path=video_path,
+            on_metrics=self._rollout_metrics if self.wandb is not None else None)
         if record and not self.image:
             payload = collector.pop_chunks()
             if payload:
