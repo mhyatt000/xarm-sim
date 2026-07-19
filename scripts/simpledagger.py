@@ -524,7 +524,7 @@ def env_spec(cfg: Config, env) -> dict:
         spec["obs_dim"] = env.single_observation_space.shape[0]
     else:
         base_spaces = env.unwrapped.single_observation_space.spaces
-        proprio_keys = sorted(k for k in base_spaces if "cube" not in k)
+        proprio_keys = image_proprio_keys(sorted(base_spaces))
         spec["proprio_dim"] = sum(
             int(np.prod(base_spaces[k].shape)) for k in proprio_keys)
         spec["n_views"] = len(env.views)
