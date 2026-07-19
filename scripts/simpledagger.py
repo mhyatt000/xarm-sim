@@ -25,6 +25,10 @@ Two teachers (``--teacher``):
 
     uv run python scripts/simpledagger.py --n-envs 4096 --batch-size 4096
     uv run python scripts/simpledagger.py --policy image --teacher mlp:outputs/dagger/b4096-v7/best.pt
+    # multi-GPU: one rank per GPU, each owning n_envs envs AND a DDP replica
+    # (Genesis binds one GPU per process, so ranks collect and train symmetrically)
+    uv run torchrun --standalone --nproc-per-node=4 scripts/simpledagger.py --policy image --n-envs 2048
+    # multi-host: torchrun --nnodes=2 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=host0:29500 ...
 """
 
 from __future__ import annotations
@@ -33,12 +37,14 @@ import copy
 from dataclasses import asdict, dataclass
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Literal
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 import tyro
@@ -101,7 +107,9 @@ class Config:
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
-    # env
+    # env. n_envs is PER RANK: under torchrun each rank owns n_envs envs and a
+    # DDP replica, so a rollout visits world_size * n_envs envs (and batch_size
+    # is likewise per rank). Launch via torchrun for multi-GPU; no flag needed.
     n_envs: int = 16
     backend: Literal["gpu", "cpu"] = "gpu"
     # EE-pose actions via CartesianActionWrapper (wrapper owns IK). Joint space is
@@ -392,40 +400,64 @@ def build_env(cfg: Config, render: bool = False):
     return GymWrapper(env)
 
 
-def build_student(cfg: Config, env, device: torch.device):
+def env_spec(cfg: Config, env) -> dict:
+    """The picklable space facts build_student needs, so collector shards can
+    ship them to a trainer process that never builds an env."""
     act_space = env.get_wrapper_attr("single_action_space")
+    spec = {"act_dim": act_space.shape[0],
+            "act_low": act_space.low, "act_high": act_space.high}
+    if cfg.policy == "state":
+        spec["obs_dim"] = env.single_observation_space.shape[0]
+    else:
+        base_spaces = env.unwrapped.single_observation_space.spaces
+        proprio_keys = sorted(k for k in base_spaces if "cube" not in k)
+        spec["proprio_dim"] = sum(
+            int(np.prod(base_spaces[k].shape)) for k in proprio_keys)
+        spec["n_views"] = len(env.views)
+    return spec
+
+
+def build_student(cfg: Config, spec_or_env, device: torch.device):
+    spec = spec_or_env if isinstance(spec_or_env, dict) else env_spec(cfg, spec_or_env)
     if cfg.policy == "state":
         return Student(
-            obs_dim=env.single_observation_space.shape[0],
-            act_dim=act_space.shape[0], hidden=cfg.hidden_dim,
-            act_low=act_space.low, act_high=act_space.high,
+            obs_dim=spec["obs_dim"], act_dim=spec["act_dim"], hidden=cfg.hidden_dim,
+            act_low=spec["act_low"], act_high=spec["act_high"],
         ).to(device)
-    base_spaces = env.unwrapped.single_observation_space.spaces
-    proprio_keys = sorted(k for k in base_spaces if "cube" not in k)
-    proprio_dim = sum(int(np.prod(base_spaces[k].shape)) for k in proprio_keys)
     return ImageStudent(
-        proprio_dim=proprio_dim, act_dim=act_space.shape[0],
-        n_views=len(env.views), hw=cfg.image_hw,
-        act_low=act_space.low, act_high=act_space.high,
+        proprio_dim=spec["proprio_dim"], act_dim=spec["act_dim"],
+        n_views=spec["n_views"], hw=cfg.image_hw,
+        act_low=spec["act_low"], act_high=spec["act_high"],
         encoder=cfg.encoder, hidden=cfg.hidden_dim, feat_dim=cfg.feat_dim,
     ).to(device)
 
 
-class Trainer:
-    def __init__(self, cfg: Config):
+def read_key(root: Path, key: str) -> np.memmap:
+    """Reader for one key of a flushed MemmapStore dir (works across processes:
+    only the manifest and bin file are touched)."""
+    meta = json.loads((root / "manifest.json").read_text())[key]
+    return np.memmap(root / f"{key}.bin", dtype=meta["dtype"], mode="r",
+                     shape=(meta["n"], *meta["shape"]))
+
+
+class Collector:
+    """One process's collection stack: env + teacher + recording.
+
+    The single-process trainer owns one directly; with --collect-gpus each
+    spawned _collect_worker owns one pinned to its GPU.
+    """
+
+    def __init__(self, cfg: Config, store_root: Path | None, seed_offset: int = 0):
         from xsim.suite.policies import LiftPolicy
 
         self.cfg = cfg
         self.image = cfg.policy == "image"
-        self.work_dir = cfg.out / cfg.exp_name
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_path = self.work_dir / "metrics.jsonl"
-
         self.env = build_env(cfg)
         base = self.env.unwrapped
         self.state_keys = sorted(base.single_observation_space.spaces)
         self.proprio_keys = [k for k in self.state_keys if "cube" not in k]
         self.device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
+        self.spec = env_spec(cfg, self.env)
         if cfg.teacher == "waypoint":
             self.teacher = LiftPolicy(
                 base, steps_per_segment=cfg.steps_per_segment, cartesian=cfg.cartesian)
@@ -433,26 +465,9 @@ class Trainer:
             self.teacher = MLPTeacher(Path(cfg.teacher[4:]), self.device)
         else:
             raise ValueError(f"unknown teacher {cfg.teacher!r}")
-        self.student = build_student(cfg, self.env, self.device)
-        self.ema = copy.deepcopy(self.student)
-        self.optim = torch.optim.Adam(self.student.parameters(), lr=cfg.lr)
-        self.rng = np.random.default_rng(cfg.seed)
-        # aggregated DAgger dataset. image mode appends every recorded step to
-        # the on-disk MemmapStore; state mode stays in RAM (tiny rows).
+        self.rng = np.random.default_rng(cfg.seed + seed_offset)
+        self.store = MemmapStore(store_root) if (self.image and store_root) else None
         self._chunks: dict[str, list[np.ndarray]] = {}
-        self.store = MemmapStore(cfg.data_dir / cfg.exp_name) if self.image else None
-        self._stats_set = False
-        self.best_success = -1.0
-        self._start = time.time()
-
-    def log(self, kind: str, d: dict) -> None:
-        d = {"kind": kind, "elapsed_s": round(time.time() - self._start, 1), **d}
-        with self.metrics_path.open("a") as f:
-            f.write(json.dumps(d) + "\n")
-        pretty = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
-                          for k, v in d.items() if k != "kind")
-        color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
-        print(f"[{color}]\\[{kind}][/] {pretty}")
 
     # -- obs adapters --------------------------------------------------------------
     def _teacher_obs(self, obs):
@@ -464,9 +479,6 @@ class Trainer:
             return flat(obs, self.proprio_keys), obs["rgb"]
         return obs
 
-    def _append(self, key: str, arr: np.ndarray) -> None:
-        self._chunks.setdefault(key, []).append(arr)
-
     def _record(self, obs, teacher_a: np.ndarray, live: np.ndarray) -> None:
         if self.image:
             prop, rgb = self._student_obs(obs)
@@ -475,17 +487,25 @@ class Trainer:
             self.store.append("rgb", np.ascontiguousarray(rgb[live]))
             self.store.append("aux", np.ascontiguousarray(aux_targets(obs)[live]))
         else:
-            self._append("act", teacher_a[live].astype(np.float32, copy=True))
-            self._append("obs", obs[live].astype(np.float32, copy=True))
+            self._chunks.setdefault("act", []).append(
+                teacher_a[live].astype(np.float32, copy=True))
+            self._chunks.setdefault("obs", []).append(
+                obs[live].astype(np.float32, copy=True))
 
-    # -- collection --------------------------------------------------------------
-    def rollout(self, beta: float, record: bool, seed: int | None = None,
-                student: nn.Module | None = None) -> dict:
+    def pop_chunks(self) -> dict[str, np.ndarray] | None:
+        """Drain state-mode recordings (the shard->trainer pipe payload)."""
+        if not self._chunks:
+            return None
+        out = {k: np.concatenate(v) for k, v in self._chunks.items()}
+        self._chunks.clear()
+        return out
+
+    def rollout(self, beta: float, record: bool, student: nn.Module,
+                seed: int | None = None) -> dict:
         """One synchronous env-batch episode; per-env, per-step Bernoulli(beta)
         picks the teacher's action over the student's. Every visited state is
         labeled with the teacher action when ``record`` is on."""
         env, B = self.env, self.cfg.n_envs
-        student = student or self.student
         obs, _ = env.reset(seed=seed)
         self.teacher.reset()
         live = np.ones(B, dtype=bool)
@@ -510,10 +530,141 @@ class Trainer:
             live &= ~done
         return {"success": float(success.mean()), "ep_len": float(ep_len.mean())}
 
+
+class Distributed:
+    """Process-group facade keeping all DP/DDP mechanics in one place.
+
+    Under torchrun (RANK/WORLD_SIZE env set) each rank pins its GPU — this must
+    construct BEFORE gs.init, since Genesis reads torch.cuda.current_device() —
+    joins the nccl group, and wraps the student in DDP. Without torchrun every
+    method degrades to a single-process no-op, so the trainer never branches.
+    """
+
+    def __init__(self):
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world = int(os.environ.get("WORLD_SIZE", 1))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.enabled = self.world > 1
+        if self.enabled:
+            # mask, don't set_device: Genesis's quadrants runtime allocates on
+            # physical GPU 0 no matter the current torch device, so each rank
+            # must see exactly one GPU (its LOCAL_RANK'th visible one)
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = (
+                visible.split(",")[self.local_rank] if visible
+                else str(self.local_rank))
+            dist.init_process_group("nccl")
+
+    @property
+    def main(self) -> bool:
+        return self.rank == 0
+
+    def wrap(self, module: nn.Module) -> nn.Module:
+        """DDP-wrap for the BC forward/backward; act()/EMA keep using the raw
+        module, whose parameters DDP shares and keeps in sync."""
+        if not self.enabled:
+            return module
+        # device 0 = this rank's only visible GPU (see __init__ masking)
+        return nn.parallel.DistributedDataParallel(module, device_ids=[0])
+
+    def mean(self, value: float) -> float:
+        if not self.enabled:
+            return value
+        t = torch.tensor([value], dtype=torch.float64, device="cuda")
+        dist.all_reduce(t)
+        return float(t.item()) / self.world
+
+    def min_int(self, value: int) -> int:
+        """Ranks record different sample counts (episode lengths vary), so BC
+        must run the same number of optimizer steps everywhere or the gradient
+        all-reduce deadlocks; callers truncate to this."""
+        if not self.enabled:
+            return value
+        t = torch.tensor([value], dtype=torch.int64, device="cuda")
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t.item())
+
+    def obs_stats(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Global mean/std over every rank's samples (stats live in checkpoint
+        buffers, so they must match across replicas)."""
+        n = torch.tensor([float(x.shape[0])], device=x.device)
+        s, sq = x.sum(dim=0), (x * x).sum(dim=0)
+        if self.enabled:
+            for t in (n, s, sq):
+                dist.all_reduce(t)
+        mean = s / n
+        var = (sq / n - mean * mean).clamp_min(0.0)
+        return mean, var.sqrt()
+
+    def close(self) -> None:
+        if self.enabled:
+            dist.barrier()
+            dist.destroy_process_group()
+
+
+class Trainer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.image = cfg.policy == "image"
+        self.work_dir = cfg.out / cfg.exp_name
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = self.work_dir / "metrics.jsonl"
+
+        self.dist = Distributed()  # pins this rank's GPU; must precede gs.init
+        store_base = cfg.data_dir / cfg.exp_name
+        self.store_root = (store_base / f"shard_{self.dist.rank}"
+                           if self.dist.enabled else store_base)
+        # identical init weights on every rank (DDP requirement), then
+        # per-rank env reset spacing and beta/shuffle streams
+        torch.manual_seed(cfg.seed)
+        self.collector = Collector(
+            cfg, store_root=self.store_root if self.image else None,
+            seed_offset=100003 * self.dist.rank)
+        self.device = self.collector.device
+        self.student = build_student(cfg, self.collector.spec, self.device)
+        self.net = self.dist.wrap(self.student)  # BC fwd/bwd path
+        self.ema = copy.deepcopy(self.student)
+        self.optim = torch.optim.Adam(self.student.parameters(), lr=cfg.lr)
+        torch.manual_seed(cfg.seed + 7919 * self.dist.rank)  # loader/aug streams
+        self.rng = np.random.default_rng(cfg.seed + 7919 * self.dist.rank)
+        # aggregated DAgger dataset. image mode appends every recorded step to
+        # this rank's on-disk MemmapStore; state mode stays in RAM (tiny rows).
+        self._chunks: dict[str, list[np.ndarray]] = {}
+        self._stats_set = False
+        self.best_success = -1.0
+        self._start = time.time()
+
+    def log(self, kind: str, d: dict) -> None:
+        if not self.dist.main:
+            return
+        d = {"kind": kind, "elapsed_s": round(time.time() - self._start, 1), **d}
+        with self.metrics_path.open("a") as f:
+            f.write(json.dumps(d) + "\n")
+        pretty = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                          for k, v in d.items() if k != "kind")
+        color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
+        print(f"[{color}]\\[{kind}][/] {pretty}")
+
+    # -- collection --------------------------------------------------------------
+    def _rollouts(self, beta: float, record: bool, student: nn.Module,
+                  seed: int | None = None) -> dict:
+        """One env-batch episode on this rank, stats averaged across ranks.
+        Rank reset seeds are spaced so no two ranks replay the same spawns."""
+        stats = self.collector.rollout(
+            beta=beta, record=record, student=student,
+            seed=None if seed is None else seed + 100003 * self.dist.rank)
+        if record and not self.image:
+            payload = self.collector.pop_chunks()
+            if payload:
+                for k, arr in payload.items():
+                    self._chunks.setdefault(k, []).append(arr)
+        return {"success": self.dist.mean(stats["success"]),
+                "ep_len": self.dist.mean(stats["ep_len"])}
+
     # -- bc ----------------------------------------------------------------------
     def _freeze_stats(self, x: torch.Tensor) -> None:
         if not self._stats_set:
-            self.student.set_obs_stats(x.mean(dim=0), x.std(dim=0))
+            self.student.set_obs_stats(*self.dist.obs_stats(x))
             self._stats_set = True
 
     def train_bc(self) -> dict:
@@ -525,28 +676,30 @@ class Trainer:
         Y = torch.from_numpy(np.concatenate(self._chunks["act"])).to(self.device)
         self._freeze_stats(X)
         n = X.shape[0]
+        steps = self.dist.min_int(math.ceil(n / cfg.batch_size))
         last_loss = 0.0
         for _ in range(cfg.epochs_per_round):
             perm = torch.randperm(n, device=self.device)
             losses = []
-            for i in range(0, n, cfg.batch_size):
-                idx = perm[i : i + cfg.batch_size]
-                loss = F.mse_loss(self.student(X[idx]), Y[idx])
+            for s in range(steps):
+                idx = perm[s * cfg.batch_size : (s + 1) * cfg.batch_size]
+                loss = F.mse_loss(self.net(X[idx]), Y[idx])
                 loss.backward()
                 self.optim.step()
                 self.optim.zero_grad(set_to_none=True)
                 self._ema_update()
                 losses.append(loss.item())
-            last_loss = float(np.mean(losses))
-        return {"samples": n, "bc_loss": last_loss}
+            last_loss = self.dist.mean(float(np.mean(losses)))
+        samples = int(self.dist.mean(float(n)) * self.dist.world)
+        return {"samples": samples, "bc_loss": last_loss}
 
     def _train_bc_image(self) -> dict:
         cfg = self.cfg
-        self.store.flush()
-        ds = MemmapDataset(self.store.root, ("rgb", "prop", "act", "aux"))
+        self.collector.store.flush()
+        ds = MemmapDataset(self.store_root, ("rgb", "prop", "act", "aux"))
         if not self._stats_set:
-            self._freeze_stats(
-                torch.from_numpy(np.asarray(self.store.reader("prop"))).to(self.device))
+            self._freeze_stats(torch.from_numpy(
+                np.asarray(read_key(self.store_root, "prop"))).to(self.device))
         g = torch.Generator().manual_seed(int(self.rng.integers(2**31)))
         loader = torch.utils.data.DataLoader(
             ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
@@ -554,6 +707,7 @@ class Trainer:
             persistent_workers=cfg.num_workers > 0,
             multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
         )
+        steps = self.dist.min_int(len(loader))
         stats = {"bc_loss": 0.0, "grip_bce": 0.0, "aux_mse": 0.0}
         for _ in range(cfg.epochs_per_round):
             sums = {k: 0.0 for k in stats}
@@ -562,6 +716,8 @@ class Trainer:
             # loader's sampler/collate must build cpu tensors
             with torch.device("cpu"):
                 for rgb, prop, y, aux_y in loader:
+                    if batches >= steps:
+                        break
                     x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
                     prop = prop.to(self.device, non_blocking=True)
                     y = y.to(self.device, non_blocking=True)
@@ -569,7 +725,7 @@ class Trainer:
                     if cfg.aug_pad > 0:
                         nv = x.shape[0] * x.shape[1]
                         x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
-                    pred, aux = self.student(x, prop)
+                    pred, aux = self.net(x, prop)
                     joints = F.mse_loss(pred[:, :-1], y[:, :-1])
                     grip = F.binary_cross_entropy_with_logits(pred[:, -1], y[:, -1])
                     aux_l = F.mse_loss(aux, aux_y)
@@ -582,9 +738,10 @@ class Trainer:
                     sums["grip_bce"] += grip.item()
                     sums["aux_mse"] += aux_l.item()
                     batches += 1
-            stats = {k: v / max(batches, 1) for k, v in sums.items()}
+            stats = {k: self.dist.mean(v / max(batches, 1)) for k, v in sums.items()}
         del loader  # release persistent workers before the next collect
-        return {"samples": len(ds), **stats}
+        samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
+        return {"samples": samples, **stats}
 
     @torch.no_grad()
     def _ema_update(self) -> None:
@@ -596,8 +753,8 @@ class Trainer:
 
     # -- loop --------------------------------------------------------------------
     def evaluate(self) -> dict:
-        stats = [self.rollout(beta=0.0, record=False, seed=self.cfg.eval_seed + b,
-                              student=self.ema)
+        stats = [self._rollouts(beta=0.0, record=False, student=self.ema,
+                                seed=self.cfg.eval_seed + b)
                  for b in range(self.cfg.eval_batches)]
         return {
             "eval_success": float(np.mean([s["success"] for s in stats])),
@@ -613,17 +770,23 @@ class Trainer:
             for g in self.optim.param_groups:
                 g["lr"] = lr
             for _ in range(cfg.episodes_per_round):
-                stats = self.rollout(beta=beta, record=True,
-                                     seed=cfg.seed + rnd if rnd == 0 else None)
+                stats = self._rollouts(beta=beta, record=True, student=self.student,
+                                       seed=cfg.seed + rnd if rnd == 0 else None)
                 self.log("collect", {"round": rnd, "beta": beta, **stats})
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate()
             self.log("eval", {"round": rnd, **eval_metrics})
-            torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
-            if eval_metrics["eval_success"] >= self.best_success:
-                self.best_success = eval_metrics["eval_success"]
-                torch.save(self.ema.state_dict(), self.work_dir / "best.pt")
-        print(f"\\[done] best eval success: {self.best_success:.0%}")
+            if self.dist.main:
+                torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
+                # per-round snapshot so any training fraction can be replayed
+                torch.save(self.ema.state_dict(),
+                           self.work_dir / f"round_{rnd + 1:02d}.pt")
+                if eval_metrics["eval_success"] >= self.best_success:
+                    self.best_success = eval_metrics["eval_success"]
+                    torch.save(self.ema.state_dict(), self.work_dir / "best.pt")
+        self.dist.close()
+        if self.dist.main:
+            print(f"\\[done] best eval success: {self.best_success:.0%}")
 
 
 # ---------------------------------------------------------------------------------------
@@ -717,10 +880,10 @@ def main(cfg: Config) -> None:
     if cfg.play is not None:
         play(cfg)
         return
-    torch.manual_seed(cfg.seed)
-    (cfg.out / cfg.exp_name).mkdir(parents=True, exist_ok=True)
-    with (cfg.out / cfg.exp_name / "config.json").open("w") as f:
-        json.dump(json.loads(json.dumps(asdict(cfg), default=str)), f, indent=2)
+    if int(os.environ.get("RANK", 0)) == 0:
+        (cfg.out / cfg.exp_name).mkdir(parents=True, exist_ok=True)
+        with (cfg.out / cfg.exp_name / "config.json").open("w") as f:
+            json.dump(json.loads(json.dumps(asdict(cfg), default=str)), f, indent=2)
     Trainer(cfg).train()
 
 
