@@ -50,6 +50,7 @@ dependencies = [
     "webpolicy",
     "zarr>=3.1.6",
     "gsplat>=1.4.0",
+    "wandb>=0.28.1",
 ]
 
 [dependency-groups]

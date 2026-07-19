@@ -18,13 +18,26 @@ Two students (``--policy``):
   come composited over live splat backgrounds with per-reset camera
   randomization (arena defaults).
 
-Two teachers (``--teacher``):
-- ``waypoint``: the scripted LiftPolicy (closed-loop, replans at reset).
+Three teachers (``--teacher``):
+- ``waypoint``: the scripted LiftPolicy (closed-loop anchor, but segment pacing
+  rides a shared clock — labels are NOT a function of state; unfittable from
+  randomized starts without vel, see img-v8).
+- ``expert``: LiftExpertPolicy — reactive FSM, phase from live state, tracks a
+  fumbled cube and recovers. The label is a function of observable state.
 - ``mlp:<ckpt.pt>``: a frozen state-mode Student checkpoint (labels any state,
   no clock; capped at that policy's own success rate).
 
+Two loss schemes (``--loss``), orthogonal to the obs mode:
+- ``mse``: per-step regression (the students above, unchanged).
+- ``flow`` (image student, v9): rectified-flow matching over a ``--chunk``-step
+  plan of absolute joint actions, executed receding-horizon (``--replan``).
+  Chunk labels are the per-step teacher labels stitched along the visited
+  trajectory (an approximation under beta-mixing); the gripper stays a smooth
+  [0, 1] value.
+
     uv run python scripts/simpledagger.py --n-envs 4096 --batch-size 4096
     uv run python scripts/simpledagger.py --policy image --teacher mlp:outputs/dagger/b4096-v7/best.pt
+    uv run python scripts/simpledagger.py --policy image --loss flow --teacher mlp:outputs/dagger/b4096-v7/best.pt
     # multi-GPU: one rank per GPU, each owning n_envs envs AND a DDP replica
     # (Genesis binds one GPU per process, so ranks collect and train symmetrically)
     uv run torchrun --standalone --nproc-per-node=4 scripts/simpledagger.py --policy image --n-envs 2048
@@ -88,8 +101,13 @@ class Config:
     encoder: Literal["shared", "separate"] = "shared"  # one CNN + per-view embedding, or V CNNs
     feat_dim: int = 64                # per-view feature size
     aux_pose_coef: float = 0.1        # aux cube pos+yaw loss weight (0 = off; sim-only supervision)
-    grip_coef: float = 0.1            # BCE weight on the gripper logit (labels are 0/1)
+    grip_coef: float = 0.1            # BCE weight on the gripper logit (mse loss only; flow keeps grip continuous)
     aug_pad: int = 4                  # DrQ random-shift padding, px (0 = off)
+    # loss scheme (orthogonal to --policy; flow currently rides the image student)
+    loss: Literal["mse", "flow"] = "mse"
+    chunk: int = 50                   # flow: action-chunk length (stitched teacher labels)
+    replan: int = 10                  # flow: student actions executed per inference (<= chunk)
+    flow_steps: int = 10              # flow: Euler steps integrating the denoising velocity at act()
     # record every kth visited state in image mode (labels stay per-step for
     # control; 1 = keep every frame — the aggregate lives on disk, not RAM)
     frame_stride: int = 1
@@ -108,6 +126,10 @@ class Config:
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
+    eval_video: bool = True           # tile the first eval rollout (image mode) -> eval_rNN.mp4
+    # wandb (rank 0 only under torchrun): every log() line streams as
+    # <kind>/<key>, eval videos attach per round; --wandb-project None = off
+    wandb_project: str | None = "xarm-sim"
     # env. n_envs is PER RANK: under torchrun each rank owns n_envs envs and a
     # DDP replica, so a rollout visits world_size * n_envs envs (and batch_size
     # is likewise per rank). Launch via torchrun for multi-GPU; no flag needed.
@@ -117,9 +139,15 @@ class Config:
     # the performance default: v7 (joints) 93% vs v6b (poses, quat-canonical) 73%
     # at equal budget.
     cartesian: bool = False
-    # 15cm x 15cm spawn box around the home TCP (x=0.34, y=0)
-    cube_x_range: tuple[float, float] = (0.275, 0.425)
-    cube_y_range: tuple[float, float] = (-0.075, 0.075)
+    # cube spawn: x 200-400mm, y +-1ft minus the cube half-extent (table is
+    # exactly 2ft wide, y +-0.3048; +-0.288 keeps the 1.25in cube fully on it)
+    cube_x_range: tuple[float, float] = (0.20, 0.40)
+    cube_y_range: tuple[float, float] = (-0.288, 0.288)
+    # per-reset arm start: TCP uniform in this box (x 100-400mm, y +-1ft,
+    # z table-top..300mm), home orientation, IK-seated; None = home pose only
+    init_tcp_box: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = (
+        (0.10, 0.40), (-0.3048, 0.3048), (-0.01, 0.30)
+    )
     # per-reset exo-cam + wrist-mount pose resampling (arena default; pin for
     # fixed-rig eval/play)
     randomize_cameras: bool = True
@@ -134,6 +162,15 @@ class Config:
     cameras: tuple[str, ...] = ("low", "side", "wrist")
     spp: int = 8
     video_max_width: int = 1280       # per-camera grid width cap, px
+
+
+def image_proprio_keys(keys) -> list[str]:
+    """Image-student proprio: non-privileged keys, minus joint velocities.
+    Sim velocity profiles (Genesis PD at 30 Hz) don't transfer to the real
+    arm — the img-v5 IRL sensitivity probe showed vel as the strongest input —
+    so the image student never sees them. State-mode students/teachers keep
+    the full flat obs including vel."""
+    return [k for k in keys if "cube" not in k and "vel" not in k]
 
 
 def flat(obs: dict, keys: list[str]) -> np.ndarray:
@@ -319,8 +356,9 @@ class ImageStudent(nn.Module):
         self.prop_mean.copy_(mean)
         self.prop_std.copy_(std.clamp_min(1e-6))
 
-    def forward(self, rgb: torch.Tensor, prop: torch.Tensor):
-        """rgb: (N, V, 3, H, W) float in [-0.5, 0.5]; prop: (N, P) raw."""
+    def features(self, rgb: torch.Tensor, prop: torch.Tensor) -> torch.Tensor:
+        """Fused trunk feature. rgb: (N, V, 3, H, W) float in [-0.5, 0.5];
+        prop: (N, P) raw."""
         n = rgb.shape[0]
         if self.shared:
             f = self.encoder(rgb.reshape(n * self.n_views, *rgb.shape[2:]))
@@ -329,7 +367,10 @@ class ImageStudent(nn.Module):
             f = torch.stack(
                 [enc(rgb[:, i]) for i, enc in enumerate(self.encoders)], dim=1)
         p = self.prop_net((prop - self.prop_mean) / self.prop_std)
-        h = self.trunk(torch.cat([f.reshape(n, -1), p], dim=-1))
+        return self.trunk(torch.cat([f.reshape(n, -1), p], dim=-1))
+
+    def forward(self, rgb: torch.Tensor, prop: torch.Tensor):
+        h = self.features(rgb, prop)
         return self.head(h), self.aux_head(h)
 
     @torch.no_grad()
@@ -342,6 +383,77 @@ class ImageStudent(nn.Module):
         joints = a[:, :-1].clamp(self.act_low[:-1], self.act_high[:-1])
         grip = (torch.sigmoid(a[:, -1:]) > 0.5).float()
         return torch.cat([joints, grip], dim=-1).cpu().numpy()
+
+
+def time_features(t: torch.Tensor) -> torch.Tensor:
+    """Fourier features of flow time t in [0, 1]. t: (N, 1) -> (N, 16)."""
+    ang = t * (math.pi * 2.0 ** torch.arange(8, device=t.device))
+    return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+
+class FlowImageStudent(ImageStudent):
+    """ImageStudent trunk + a rectified-flow head over a ``chunk``-step plan.
+
+    ``vel_net`` predicts the denoising velocity field v(x_t, t | h) in
+    normalized action-chunk space — the straight noise->data direction of
+    rectified flow, not joint-space velocity. act() Euler-integrates it from
+    N(0, I) and returns a (B, chunk, act_dim) plan of absolute joint targets;
+    the gripper stays a smooth [0, 1] value (clamped, never thresholded).
+    Action normalization stats live in buffers so a checkpoint stays
+    self-contained.
+    """
+
+    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
+                 act_low: np.ndarray, act_high: np.ndarray,
+                 encoder: str = "shared", hidden: int = 256, feat_dim: int = 64,
+                 chunk: int = 50, flow_steps: int = 10):
+        super().__init__(proprio_dim, act_dim, n_views, hw, act_low, act_high,
+                         encoder, hidden, feat_dim)
+        del self.head  # the flow head replaces the direct regression head
+        self.chunk, self.flow_steps, self.act_dim = chunk, flow_steps, act_dim
+        d = chunk * act_dim
+        self.vel_net = nn.Sequential(
+            nn.Linear(hidden + d + 16, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, d),
+        )
+        self.act_mean = nn.Buffer(torch.zeros(act_dim))
+        self.act_std = nn.Buffer(torch.ones(act_dim))
+
+    def set_act_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.act_mean.copy_(mean)
+        self.act_std.copy_(std.clamp_min(1e-6))
+
+    def velocity(self, h: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """h: (N, hidden); x: (N, chunk*act_dim) normalized; t: (N, 1)."""
+        return self.vel_net(torch.cat([h, x, time_features(t)], dim=-1))
+
+    def forward(self, rgb: torch.Tensor, prop: torch.Tensor,
+                x_t: torch.Tensor, t: torch.Tensor):
+        """Training forward: one call touches every parameter, so the DDP wrap
+        syncs gradients (calling features/velocity on the raw module would
+        bypass it). Returns (v_pred, aux_pred, h)."""
+        h = self.features(rgb, prop)
+        return self.velocity(h, x_t, t), self.aux_head(h), h
+
+    def sample(self, h: torch.Tensor) -> torch.Tensor:
+        """Integrate noise -> plan; returns (N, chunk, act_dim) in action units."""
+        n = h.shape[0]
+        x = torch.randn(n, self.chunk * self.act_dim, device=h.device)
+        dt = 1.0 / self.flow_steps
+        for k in range(self.flow_steps):
+            t = torch.full((n, 1), k * dt, device=h.device)
+            x = x + dt * self.velocity(h, x, t)
+        a = x.reshape(n, self.chunk, self.act_dim) * self.act_std + self.act_mean
+        return a.clamp(self.act_low, self.act_high)
+
+    @torch.no_grad()
+    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+        prop, rgb = obs
+        device = self.prop_mean.device
+        x = torch.from_numpy(np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
+        p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
+        return self.sample(self.features(x, p)).cpu().numpy()
 
 
 class MLPTeacher:
@@ -386,6 +498,7 @@ def build_env(cfg: Config, render: bool = False):
         renderer_config=(BatchConfig(use_rasterizer=cfg.batch_rasterizer) if image
                          else NyxConfig(spp=cfg.spp) if with_cams else None),
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
+        init_tcp_box=cfg.init_tcp_box,
         randomize_cameras=cfg.randomize_cameras,
         horizon=cfg.horizon, n_envs=cfg.n_envs,
         control_freq=cfg.control_freq,
@@ -425,12 +538,79 @@ def build_student(cfg: Config, spec_or_env, device: torch.device):
             obs_dim=spec["obs_dim"], act_dim=spec["act_dim"], hidden=cfg.hidden_dim,
             act_low=spec["act_low"], act_high=spec["act_high"],
         ).to(device)
-    return ImageStudent(
+    kwargs = dict(
         proprio_dim=spec["proprio_dim"], act_dim=spec["act_dim"],
         n_views=spec["n_views"], hw=cfg.image_hw,
         act_low=spec["act_low"], act_high=spec["act_high"],
         encoder=cfg.encoder, hidden=cfg.hidden_dim, feat_dim=cfg.feat_dim,
-    ).to(device)
+    )
+    if cfg.loss == "flow":
+        return FlowImageStudent(**kwargs, chunk=cfg.chunk,
+                                flow_steps=cfg.flow_steps).to(device)
+    return ImageStudent(**kwargs).to(device)
+
+
+# ---------------------------------------------------------------------------------------
+# video tiling (eval rollouts + play mode)
+# ---------------------------------------------------------------------------------------
+
+BORDER = {0: (150, 150, 150), 1: (0, 200, 0), 2: (220, 30, 30)}  # live/success/fail
+
+
+def _grid(frames: np.ndarray, status: np.ndarray, max_width: int) -> np.ndarray:
+    """(B,H,W,3) -> near-square grid, tiles bordered by per-env status."""
+    import cv2
+
+    b, h, w, _ = frames.shape
+    cols = math.ceil(math.sqrt(b))
+    rows = math.ceil(b / cols)
+    tw = max(2, max_width // cols) // 2 * 2
+    th = max(2, round(h * tw / w)) // 2 * 2
+    interp = cv2.INTER_AREA if tw <= w else cv2.INTER_NEAREST
+    canvas = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
+    t = max(2, tw // 64)
+    for i in range(b):
+        r, c = divmod(i, cols)
+        tile = cv2.resize(frames[i], (tw, th), interpolation=interp)
+        tile[:t], tile[-t:], tile[:, :t], tile[:, -t:] = (BORDER[int(status[i])],) * 4
+        canvas[r * th : (r + 1) * th, c * tw : (c + 1) * tw] = tile
+    return canvas
+
+
+class VideoSink:
+    """Streamed h264 mp4 writer: RGB uint8 frames piped to an ffmpeg
+    subprocess, opened lazily on the first frame so callers never hold a full
+    rollout of grids in RAM. h264 (not cv2's mp4v) so the wandb web UI can
+    play the video inline."""
+
+    def __init__(self, path: Path, fps: float):
+        self.path, self.fps = path, fps
+        self._p = None
+
+    def add(self, frame: np.ndarray) -> None:
+        if self._p is None:
+            import shutil
+            import subprocess
+
+            exe = shutil.which("ffmpeg")
+            if exe is None:
+                import imageio_ffmpeg
+
+                exe = imageio_ffmpeg.get_ffmpeg_exe()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            h, w = frame.shape[:2]
+            self._p = subprocess.Popen(
+                [exe, "-y", "-loglevel", "error", "-f", "rawvideo",
+                 "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", f"{self.fps}",
+                 "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 str(self.path)],
+                stdin=subprocess.PIPE)
+        self._p.stdin.write(frame.tobytes())
+
+    def close(self) -> None:
+        if self._p is not None:
+            self._p.stdin.close()
+            self._p.wait()
 
 
 def read_key(root: Path, key: str) -> np.memmap:
@@ -453,15 +633,27 @@ class Collector:
 
         self.cfg = cfg
         self.image = cfg.policy == "image"
+        self.flow = cfg.loss == "flow"
+        if self.flow:
+            if not self.image:
+                raise ValueError("loss='flow' currently rides the image student")
+            if cfg.frame_stride != 1:
+                raise ValueError("flow chunk labels need every step: frame_stride=1")
+            if not 1 <= cfg.replan <= cfg.chunk:
+                raise ValueError("need 1 <= replan <= chunk")
         self.env = build_env(cfg)
         base = self.env.unwrapped
         self.state_keys = sorted(base.single_observation_space.spaces)
-        self.proprio_keys = [k for k in self.state_keys if "cube" not in k]
+        self.proprio_keys = image_proprio_keys(self.state_keys)
         self.device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
         self.spec = env_spec(cfg, self.env)
         if cfg.teacher == "waypoint":
             self.teacher = LiftPolicy(
                 base, steps_per_segment=cfg.steps_per_segment, cartesian=cfg.cartesian)
+        elif cfg.teacher == "expert":
+            from xsim.suite.policies import LiftExpertPolicy
+
+            self.teacher = LiftExpertPolicy(base, cartesian=cfg.cartesian)
         elif cfg.teacher.startswith("mlp:"):
             self.teacher = MLPTeacher(Path(cfg.teacher[4:]), self.device)
         else:
@@ -501,34 +693,84 @@ class Collector:
         self._chunks.clear()
         return out
 
+    def _append_chunk_labels(self, acts: np.ndarray, lives: np.ndarray) -> None:
+        """Stitched chunk labels: for each recorded row (env e live at tick t),
+        the next ``chunk`` per-step teacher labels along the visited trajectory,
+        the final pre-death label repeated past episode end (hold pose). Rows
+        append in _record's tick-major live-masked order, so chunk.bin stays
+        row-aligned with rgb.bin. acts: (T, B, A); lives: (T, B)."""
+        last = lives.sum(axis=0) - 1  # (B,) each env's final live tick
+        ar = np.arange(self.cfg.chunk)
+        for t in range(acts.shape[0]):
+            envs = np.flatnonzero(lives[t])
+            idx = np.minimum(t + ar[None, :], last[envs, None])  # (n_live, chunk)
+            self.store.append("chunk", acts[idx, envs[:, None]])
+
     def rollout(self, beta: float, record: bool, student: nn.Module,
-                seed: int | None = None) -> dict:
-        """One synchronous env-batch episode; per-env, per-step Bernoulli(beta)
-        picks the teacher's action over the student's. Every visited state is
-        labeled with the teacher action when ``record`` is on."""
-        env, B = self.env, self.cfg.n_envs
+                seed: int | None = None, video_path: Path | None = None) -> dict:
+        """One synchronous env-batch episode; per-env Bernoulli(beta) picks the
+        teacher's action over the student's — per step, or per replan window in
+        flow mode, where the student emits a chunk executed receding-horizon.
+        Every visited state is labeled with the teacher action when ``record``
+        is on. ``video_path`` (image mode) streams the policy's own frames as a
+        play-style bordered grid mp4."""
+        env, B, cfg = self.env, self.cfg.n_envs, self.cfg
         obs, _ = env.reset(seed=seed)
         self.teacher.reset()
         live = np.ones(B, dtype=bool)
         success = np.zeros(B, dtype=bool)
         ep_len = np.zeros(B, dtype=np.int64)
         tick = 0
+        plan = use_teacher = None
+        acts_hist: list[np.ndarray] = []  # flow: per-tick teacher labels for stitching
+        live_hist: list[np.ndarray] = []
+        sink = status = None
+        if video_path is not None:
+            sink = VideoSink(video_path, 1.0 / env.unwrapped.control_dt)
+            status = np.zeros(B, dtype=np.int64)  # 0 live, 1 success, 2 fail
+
+        def snap(o) -> None:
+            rgb = o["rgb"].transpose(0, 1, 3, 4, 2)  # (B, V, H, W, 3)
+            sink.add(np.concatenate(
+                [_grid(rgb[:, i], status, cfg.video_max_width)
+                 for i in range(rgb.shape[1])], axis=1))
+
+        if sink is not None:
+            snap(obs)
         while live.any():
             teacher_a = self.teacher.act(self._teacher_obs(obs))
             if beta >= 1.0:
                 action = teacher_a
             else:
-                student_a = student.act(self._student_obs(obs))
-                use_teacher = self.rng.random(B) < beta
+                if self.flow:
+                    if tick % cfg.replan == 0:
+                        plan = student.act(self._student_obs(obs))  # (B, chunk, A)
+                        use_teacher = self.rng.random(B) < beta
+                    student_a = plan[:, tick % cfg.replan]
+                else:
+                    student_a = student.act(self._student_obs(obs))
+                    use_teacher = self.rng.random(B) < beta
                 action = np.where(use_teacher[:, None], teacher_a, student_a)
-            if record and (not self.image or tick % self.cfg.frame_stride == 0):
+            if record and (not self.image or tick % cfg.frame_stride == 0):
                 self._record(obs, teacher_a, live)
+                if self.flow:
+                    acts_hist.append(teacher_a.astype(np.float32, copy=True))
+                    live_hist.append(live.copy())
             tick += 1
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
+            if sink is not None:
+                status[live & done & info["success"]] = 1
+                status[live & done & ~info["success"]] = 2
             success |= live & info["success"]
             ep_len += live
             live &= ~done
+            if sink is not None:
+                snap(obs)
+        if sink is not None:
+            sink.close()
+        if record and self.flow:
+            self._append_chunk_labels(np.stack(acts_hist), np.stack(live_hist))
         return {"success": float(success.mean()), "ep_len": float(ep_len.mean())}
 
 
@@ -536,11 +778,19 @@ class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.image = cfg.policy == "image"
+        self.flow = cfg.loss == "flow"
         self.work_dir = cfg.out / cfg.exp_name
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.work_dir / "metrics.jsonl"
 
         self.dist = Distributed()  # pins this rank's GPU; must precede gs.init
+        self.wandb = None
+        if cfg.wandb_project and self.dist.main:
+            import wandb
+
+            self.wandb = wandb.init(
+                project=cfg.wandb_project, name=cfg.exp_name,
+                config=json.loads(json.dumps(asdict(cfg), default=str)))
         store_base = cfg.data_dir / cfg.exp_name
         self.store_root = (store_base / f"shard_{self.dist.rank}"
                            if self.dist.enabled else store_base)
@@ -561,6 +811,7 @@ class Trainer:
         # this rank's on-disk MemmapStore; state mode stays in RAM (tiny rows).
         self._chunks: dict[str, list[np.ndarray]] = {}
         self._stats_set = False
+        self._act_stats_set = False
         self.best_success = -1.0
         self._start = time.time()
 
@@ -570,6 +821,8 @@ class Trainer:
         d = {"kind": kind, "elapsed_s": round(time.time() - self._start, 1), **d}
         with self.metrics_path.open("a") as f:
             f.write(json.dumps(d) + "\n")
+        if self.wandb is not None:
+            self.wandb.log({f"{kind}/{k}": v for k, v in d.items() if k != "kind"})
         pretty = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                           for k, v in d.items() if k != "kind")
         color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
@@ -577,12 +830,13 @@ class Trainer:
 
     # -- collection --------------------------------------------------------------
     def _rollouts(self, beta: float, record: bool, student: nn.Module,
-                  seed: int | None = None) -> dict:
+                  seed: int | None = None, video_path: Path | None = None) -> dict:
         """One env-batch episode on this rank, stats averaged across ranks.
         Rank reset seeds are spaced so no two ranks replay the same spawns."""
         stats = self.collector.rollout(
             beta=beta, record=record, student=student,
-            seed=None if seed is None else seed + 100003 * self.dist.rank)
+            seed=None if seed is None else seed + 100003 * self.dist.rank,
+            video_path=video_path)
         if record and not self.image:
             payload = self.collector.pop_chunks()
             if payload:
@@ -598,7 +852,9 @@ class Trainer:
             self._stats_set = True
 
     def train_bc(self) -> dict:
-        return self._train_bc_image() if self.image else self._train_bc_state()
+        if not self.image:
+            return self._train_bc_state()
+        return self._train_bc_flow() if self.flow else self._train_bc_image()
 
     def _train_bc_state(self) -> dict:
         cfg = self.cfg
@@ -673,6 +929,67 @@ class Trainer:
         samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
         return {"samples": samples, **stats}
 
+    def _train_bc_flow(self) -> dict:
+        cfg = self.cfg
+        self.collector.store.flush()
+        ds = MemmapDataset(self.store_root, ("rgb", "prop", "chunk", "aux"))
+        if not self._stats_set:
+            self._freeze_stats(torch.from_numpy(
+                np.asarray(read_key(self.store_root, "prop"))).to(self.device))
+        if not self._act_stats_set:
+            a = torch.from_numpy(
+                np.asarray(read_key(self.store_root, "act"))).to(self.device)
+            self.student.set_act_stats(*self.dist.obs_stats(a))
+            self._act_stats_set = True
+        g = torch.Generator().manual_seed(int(self.rng.integers(2**31)))
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
+            num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
+            persistent_workers=cfg.num_workers > 0,
+            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
+        )
+        steps = self.dist.min_int(len(loader))
+        stats = {"flow_loss": 0.0, "a0_mse": 0.0, "aux_mse": 0.0}
+        for _ in range(cfg.epochs_per_round):
+            sums = {k: 0.0 for k in stats}
+            batches = 0
+            # explicit cpu: gs.init makes cuda the torch default device, but the
+            # loader's sampler/collate must build cpu tensors
+            with torch.device("cpu"):
+                for rgb, prop, y, aux_y in loader:
+                    if batches >= steps:
+                        break
+                    x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
+                    prop = prop.to(self.device, non_blocking=True)
+                    y = y.to(self.device, non_blocking=True)
+                    aux_y = aux_y.to(self.device, non_blocking=True)
+                    if cfg.aug_pad > 0:
+                        nv = x.shape[0] * x.shape[1]
+                        x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
+                    n = y.shape[0]
+                    a = ((y - self.student.act_mean) / self.student.act_std).reshape(n, -1)
+                    eps = torch.randn_like(a)
+                    t = torch.rand(n, 1, device=self.device)
+                    x_t = (1.0 - t) * eps + t * a
+                    v_pred, aux, h = self.net(x, prop, x_t, t)
+                    fm = F.mse_loss(v_pred, a - eps)
+                    aux_l = F.mse_loss(aux, aux_y)
+                    loss = fm + cfg.aux_pose_coef * aux_l
+                    loss.backward()
+                    self.optim.step()
+                    self.optim.zero_grad(set_to_none=True)
+                    self._ema_update()
+                    with torch.no_grad():  # diagnostic comparable to mse bc_loss
+                        a0 = self.student.sample(h.detach())[:, 0]
+                        sums["a0_mse"] += F.mse_loss(a0, y[:, 0]).item()
+                    sums["flow_loss"] += fm.item()
+                    sums["aux_mse"] += aux_l.item()
+                    batches += 1
+            stats = {k: self.dist.mean(v / max(batches, 1)) for k, v in sums.items()}
+        del loader  # release persistent workers before the next collect
+        samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
+        return {"samples": samples, **stats}
+
     @torch.no_grad()
     def _ema_update(self) -> None:
         d = self.cfg.ema_decay
@@ -682,10 +999,17 @@ class Trainer:
             be.copy_(b)
 
     # -- loop --------------------------------------------------------------------
-    def evaluate(self) -> dict:
+    def evaluate(self, rnd: int) -> dict:
+        video = (self.work_dir / f"eval_r{rnd:02d}.mp4"
+                 if self.image and self.cfg.eval_video and self.dist.main else None)
         stats = [self._rollouts(beta=0.0, record=False, student=self.ema,
-                                seed=self.cfg.eval_seed + b)
+                                seed=self.cfg.eval_seed + b,
+                                video_path=video if b == 0 else None)
                  for b in range(self.cfg.eval_batches)]
+        if video is not None and self.wandb is not None:
+            import wandb
+
+            self.wandb.log({"eval/video": wandb.Video(str(video), format="mp4")})
         return {
             "eval_success": float(np.mean([s["success"] for s in stats])),
             "eval_len": float(np.mean([s["ep_len"] for s in stats])),
@@ -704,7 +1028,7 @@ class Trainer:
                                        seed=cfg.seed + rnd if rnd == 0 else None)
                 self.log("collect", {"round": rnd, "beta": beta, **stats})
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
-            eval_metrics = self.evaluate()
+            eval_metrics = self.evaluate(rnd)
             self.log("eval", {"round": rnd, **eval_metrics})
             if self.dist.main:
                 torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
@@ -715,6 +1039,8 @@ class Trainer:
                     self.best_success = eval_metrics["eval_success"]
                     torch.save(self.ema.state_dict(), self.work_dir / "best.pt")
         self.dist.close()
+        if self.wandb is not None:
+            self.wandb.finish()
         if self.dist.main:
             print(f"\\[done] best eval success: {self.best_success:.0%}")
 
@@ -723,32 +1049,8 @@ class Trainer:
 # play mode
 # ---------------------------------------------------------------------------------------
 
-BORDER = {0: (150, 150, 150), 1: (0, 200, 0), 2: (220, 30, 30)}  # live/success/fail
-
-
-def _grid(frames: np.ndarray, status: np.ndarray, max_width: int) -> np.ndarray:
-    """(B,H,W,3) -> near-square grid, tiles bordered by per-env status."""
-    import cv2
-
-    b, h, w, _ = frames.shape
-    cols = math.ceil(math.sqrt(b))
-    rows = math.ceil(b / cols)
-    tw = max(2, max_width // cols) // 2 * 2
-    th = max(2, round(h * tw / w)) // 2 * 2
-    interp = cv2.INTER_AREA if tw <= w else cv2.INTER_NEAREST
-    canvas = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
-    t = max(2, tw // 64)
-    for i in range(b):
-        r, c = divmod(i, cols)
-        tile = cv2.resize(frames[i], (tw, th), interpolation=interp)
-        tile[:t], tile[-t:], tile[:, :t], tile[:, -t:] = (BORDER[int(status[i])],) * 4
-        canvas[r * th : (r + 1) * th, c * tw : (c + 1) * tw] = tile
-    return canvas
-
 
 def play(cfg: Config) -> None:
-    import cv2
-
     env = build_env(cfg, render=True)
     B = cfg.n_envs
     image = cfg.policy == "image"
@@ -757,7 +1059,7 @@ def play(cfg: Config) -> None:
     student.load_state_dict(torch.load(cfg.play, map_location=device))
     student.eval()
     state_keys = sorted(env.unwrapped.single_observation_space.spaces)
-    proprio_keys = [k for k in state_keys if "cube" not in k]
+    proprio_keys = image_proprio_keys(state_keys)
 
     obs, _ = env.reset(seed=cfg.eval_seed)
     spawn = np.asarray(env.unwrapped.cube.get_pos(), dtype=np.float64).copy()
@@ -766,7 +1068,8 @@ def play(cfg: Config) -> None:
     status = np.zeros(B, dtype=np.int64)  # 0 live, 1 success, 2 fail
     ep_len = np.zeros(B, dtype=np.int64)
     live = np.ones(B, dtype=bool)
-    frames = []
+    out = cfg.play_video or cfg.play.parent / "rollout.mp4"
+    sink = VideoSink(out, 1.0 / env.unwrapped.control_dt)
 
     def snap(obs) -> None:
         if image:  # reuse the policy's own frames (image_hw px, upscaled)
@@ -775,12 +1078,21 @@ def play(cfg: Config) -> None:
         else:
             d = env.unwrapped.render_views(all_envs=True)
             views = [d[k] for k in sorted(d)]
-        frames.append(np.concatenate(
+        sink.add(np.concatenate(
             [_grid(v, status, cfg.video_max_width) for v in views], axis=1))
 
     snap(obs)
+    flow = cfg.loss == "flow"
+    tick, plan = 0, None
     while live.any():
-        a = student.act((flat(obs, proprio_keys), obs["rgb"]) if image else obs)
+        so = (flat(obs, proprio_keys), obs["rgb"]) if image else obs
+        if flow:
+            if tick % cfg.replan == 0:
+                plan = student.act(so)
+            a = plan[:, tick % cfg.replan]
+        else:
+            a = student.act(so)
+        tick += 1
         obs, reward, terminated, truncated, info = env.step(a)
         done = terminated | truncated
         status[live & done & info["success"]] = 1
@@ -789,14 +1101,7 @@ def play(cfg: Config) -> None:
         live &= ~done
         snap(obs)
 
-    out = cfg.play_video or cfg.play.parent / "rollout.mp4"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(out), cv2.VideoWriter_fourcc(*"mp4v"),
-        1.0 / env.unwrapped.control_dt, (frames[0].shape[1], frames[0].shape[0]))
-    for f in frames:
-        writer.write(f[:, :, ::-1])
-    writer.release()
+    sink.close()
 
     print(f"\ncheckpoint: {cfg.play}   success {int((status == 1).sum())}/{B}")
     print(f"{'env':>3} {'outcome':>8} {'len':>4} {'cube_x':>7} {'cube_y':>7} {'yaw_deg':>8}")
