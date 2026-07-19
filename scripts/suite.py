@@ -1,11 +1,12 @@
 """Debug runner for the xsim.suite layered envs.
 
-Builds a registered env by name and steps either random actions or the
-scripted waypoint lift policy — a quick check that model composition,
-controllers, policies, and the episode loop hold together.
+Builds a registered env by name and steps random actions, the scripted
+waypoint lift policy, or the reactive FSM lift expert — a quick check that
+model composition, controllers, policies, and the episode loop hold together.
 
     uv run python scripts/suite.py [--env Lift] [--steps 5] [--seed 0] [--n-envs 16]
     uv run python scripts/suite.py --policy waypoint --steps 200 --seed 0
+    uv run python scripts/suite.py --policy expert --steps 200 --n-envs 16 --video expert.mp4
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import numpy as np
 import tyro
 
 import xsim.suite as suite
-from xsim.suite.policies import LiftPolicy
+from xsim.suite.policies import LiftExpertPolicy, LiftPolicy
 from xsim.suite.renderers import BatchConfig, NyxConfig
 from xsim.utils.video import tile_grid
 
@@ -33,7 +34,7 @@ class Config:
     horizon: int = 300
     n_envs: int = 1
     show_viewer: bool = False
-    policy: Literal["random", "waypoint"] = "random"
+    policy: Literal["random", "waypoint", "expert"] = "random"
     steps_per_segment: int = 20
     noslip_iterations: int = 10
     render_backend: Literal["raster", "nyx", "batch"] = "batch"
@@ -117,6 +118,9 @@ def main(cfg: Config) -> None:
     policy = None
     if cfg.policy == "waypoint":
         policy = LiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
+        policy.reset(obs)
+    elif cfg.policy == "expert":
+        policy = LiftExpertPolicy(env)
         policy.reset(obs)
     record()
     for i in tqdm(range(cfg.steps)):
