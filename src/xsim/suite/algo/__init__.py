@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from xsim.suite.algo.cfgrl import CFGRLAgent, CFGRLConfig
+from xsim.suite.algo.distributed import Distributed
 from xsim.suite.algo.gcbc import GCBCAgent, GCBCConfig
 from xsim.suite.algo.gcdataset import GCDataset, GCDatasetConfig, to_torch
 from xsim.suite.algo.gcfbc import GCFBCAgent, GCFBCConfig
@@ -26,6 +27,7 @@ if _TDMPC2_ROOT not in sys.path:
 __all__ = [
     "CFGRLAgent",
     "CFGRLConfig",
+    "Distributed",
     "GCBCAgent",
     "GCBCConfig",
     "GCDataset",
