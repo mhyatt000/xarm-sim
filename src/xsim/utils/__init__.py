@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from xsim.utils.timer import Timer
 from xsim.utils.video import BORDER, VideoSink, tile_grid
 
-__all__ = ["BORDER", "VideoSink", "tile_grid"]
+__all__ = ["BORDER", "Timer", "VideoSink", "tile_grid"]

@@ -159,7 +159,12 @@ class Config:
     # img-v2's light-calibrated legacy domain)
     batch_rasterizer: bool = False
     # eval
-    eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
+    eval_batches: int = 1             # student-only eval rollouts per round (eval_envs each)
+    # dedicated small eval env sharing the train env's Genesis context: eval
+    # only needs enough episodes for a stable-ish success estimate + the wandb
+    # video, and a small env skips rendering thousands of cams per eval tick.
+    # PER RANK (x world_size episodes per eval rollout). 0 = eval on the train env.
+    eval_envs: int = 32
     eval_seed: int = 51_000
     eval_video: bool = True           # tile the first eval rollout (image mode) -> eval_rNN.mp4
     # tile only the first k envs into rollout videos (the rollout itself keeps
@@ -242,7 +247,7 @@ class Config:
         )
 
 
-def build_env(cfg: Config, render: bool = False):
+def build_env(cfg: Config, render: bool = False, n_envs: int | None = None):
     import genesis as gs
 
     from xsim.suite import make
@@ -253,8 +258,11 @@ def build_env(cfg: Config, render: bool = False):
 
     image = cfg.policy == "image"
     with_cams = render or image
-    gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
-            precision="32", logging_level="warning")
+    # one Genesis context per process; a second build_env (the small eval env)
+    # shares it
+    if not gs._initialized:
+        gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
+                precision="32", logging_level="warning")
     env = make(
         "Lift", robots="XArm7",
         camera_names=list(cfg.cameras) if with_cams else [],
@@ -267,7 +275,7 @@ def build_env(cfg: Config, render: bool = False):
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
         init_tcp_box=cfg.init_tcp_box,
         randomize_cameras=cfg.randomize_cameras,
-        horizon=cfg.horizon, n_envs=cfg.n_envs,
+        horizon=cfg.horizon, n_envs=n_envs if n_envs is not None else cfg.n_envs,
         control_freq=cfg.control_freq,
         noslip_iterations=cfg.noslip_iterations,
     )
@@ -326,11 +334,11 @@ def make_teacher(cfg: Config, env, device: torch.device):
 
 
 def make_collector(cfg: Config, store_root: Path | None,
-                   seed_offset: int = 0) -> Collector:
-    env = build_env(cfg)
+                   seed_offset: int = 0, n_envs: int | None = None) -> Collector:
+    env = build_env(cfg, n_envs=n_envs)
     device = torch.device("cuda" if cfg.backend == "gpu" else "cpu")
     return Collector(cfg, env, make_teacher(cfg, env, device),
-                     store_root=store_root, seed_offset=seed_offset)
+                     store_root=store_root, seed_offset=seed_offset, n_envs=n_envs)
 
 
 def build_student(cfg: Config, spec_or_env, device: torch.device):
@@ -388,6 +396,11 @@ class Trainer:
         self.collector = make_collector(
             cfg, store_root=self.store_root if self.image else None,
             seed_offset=100003 * self.dist.rank)
+        # eval rides its own small env (shared Genesis context): success noise
+        # scales as 1/sqrt(episodes), but eval wall time scales with envs
+        self.eval_collector = (make_collector(
+            cfg, store_root=None, seed_offset=100003 * self.dist.rank + 1,
+            n_envs=cfg.eval_envs) if cfg.eval_envs > 0 else self.collector)
         self.device = self.collector.device
         self.student = build_student(cfg, self.collector.env, self.device)
         self.net = self.dist.wrap(self.student)  # BC fwd/bwd path
@@ -476,20 +489,24 @@ class Trainer:
 
     # -- collection --------------------------------------------------------------
     def _rollouts(self, beta: float, record: bool, student: nn.Module,
-                  seed: int | None = None, video_path: Path | None = None) -> dict:
+                  seed: int | None = None, video_path: Path | None = None,
+                  collector: Collector | None = None) -> dict:
         """One env-batch episode on this rank, stats averaged across ranks.
-        Rank reset seeds are spaced so no two ranks replay the same spawns."""
-        stats = self.collector.rollout(
+        Rank reset seeds are spaced so no two ranks replay the same spawns.
+        Rank 0's local per-tick phase timings (t/*) pass through."""
+        collector = collector or self.collector
+        stats = collector.rollout(
             beta=beta, record=record, student=student,
             seed=None if seed is None else seed + 100003 * self.dist.rank,
             video_path=video_path)
         if record and not self.image:
-            payload = self.collector.pop_chunks()
+            payload = collector.pop_chunks()
             if payload:
                 for k, arr in payload.items():
                     self._chunks.setdefault(k, []).append(arr)
         return {"success": self.dist.mean(stats["success"]),
-                "ep_len": self.dist.mean(stats["ep_len"])}
+                "ep_len": self.dist.mean(stats["ep_len"]),
+                **{k: v for k, v in stats.items() if k.startswith("t/")}}
 
     # -- bc ----------------------------------------------------------------------
     def _freeze_stats(self, x: torch.Tensor) -> None:
@@ -747,7 +764,8 @@ class Trainer:
                  if self.image and self.cfg.eval_video and self.dist.main else None)
         stats = [self._rollouts(beta=0.0, record=False, student=self.ema,
                                 seed=self.cfg.eval_seed + b,
-                                video_path=video if b == 0 else None)
+                                video_path=video if b == 0 else None,
+                                collector=self.eval_collector)
                  for b in range(self.cfg.eval_batches)]
         if video is not None and self.wandb is not None:
             import wandb
@@ -756,6 +774,7 @@ class Trainer:
         return {
             "eval_success": float(np.mean([s["success"] for s in stats])),
             "eval_len": float(np.mean([s["ep_len"] for s in stats])),
+            **{k: v for k, v in stats[0].items() if k.startswith("t/")},
         }
 
     def train(self) -> None:

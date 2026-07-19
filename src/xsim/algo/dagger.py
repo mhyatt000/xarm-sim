@@ -16,6 +16,7 @@ from torch import nn
 
 from xsim.algo.nets import Student
 from xsim.data import MemmapStore
+from xsim.utils.timer import Timer
 from xsim.utils.video import VideoSink, tile_grid
 
 
@@ -78,8 +79,9 @@ class Collector:
     """
 
     def __init__(self, cfg, env, teacher, store_root: Path | None,
-                 seed_offset: int = 0):
+                 seed_offset: int = 0, n_envs: int | None = None):
         self.cfg = cfg
+        self.n_envs = n_envs if n_envs is not None else cfg.n_envs
         self.image = cfg.policy == "image"
         self.flow = cfg.loss == "flow"
         if self.flow:
@@ -155,14 +157,20 @@ class Collector:
         Every visited state is labeled with the teacher action when ``record``
         is on. ``video_path`` (image mode) streams the policy's own frames as a
         play-style bordered grid mp4."""
-        env, B, cfg = self.env, self.cfg.n_envs, self.cfg
-        obs, _ = env.reset(seed=seed)
+        env, B, cfg = self.env, self.n_envs, self.cfg
+        timer = Timer()
+        with timer("reset"):
+            obs, _ = env.reset(seed=seed)
         self.teacher.reset()
+        # eval rollouts (pure student, nothing recorded) never consume the
+        # teacher's action — skip the expert entirely
+        need_teacher = record or beta > 0.0
         live = np.ones(B, dtype=bool)
         success = np.zeros(B, dtype=bool)
         ep_len = np.zeros(B, dtype=np.int64)
         tick = 0
         plan = use_teacher = None
+        teacher_a = None
         acts_hist: list[np.ndarray] = []  # flow: per-tick teacher labels for stitching
         live_hist: list[np.ndarray] = []
         sink = status = None
@@ -181,26 +189,32 @@ class Collector:
         if sink is not None:
             snap(obs)
         while live.any():
-            teacher_a = self.teacher.act(self._teacher_obs(obs))
+            if need_teacher:
+                with timer("teacher"):
+                    teacher_a = self.teacher.act(self._teacher_obs(obs))
             if beta >= 1.0:
                 action = teacher_a
             else:
-                if self.flow:
-                    if tick % cfg.replan == 0:
-                        plan = student.act(self._student_obs(obs))  # (B, chunk, A)
+                with timer("student"):
+                    if self.flow:
+                        if tick % cfg.replan == 0:
+                            plan = student.act(self._student_obs(obs))  # (B, chunk, A)
+                            use_teacher = self.rng.random(B) < beta
+                        student_a = plan[:, tick % cfg.replan]
+                    else:
+                        student_a = student.act(self._student_obs(obs))
                         use_teacher = self.rng.random(B) < beta
-                    student_a = plan[:, tick % cfg.replan]
-                else:
-                    student_a = student.act(self._student_obs(obs))
-                    use_teacher = self.rng.random(B) < beta
-                action = np.where(use_teacher[:, None], teacher_a, student_a)
+                action = (np.where(use_teacher[:, None], teacher_a, student_a)
+                          if need_teacher else student_a)
             if record and (not self.image or tick % cfg.frame_stride == 0):
-                self._record(obs, teacher_a, live)
+                with timer("record"):
+                    self._record(obs, teacher_a, live)
                 if self.flow:
                     acts_hist.append(teacher_a.astype(np.float32, copy=True))
                     live_hist.append(live.copy())
             tick += 1
-            obs, reward, terminated, truncated, info = env.step(action)
+            with timer("env_step"):
+                obs, reward, terminated, truncated, info = env.step(action)
             done = terminated | truncated
             if sink is not None:
                 status[live & done & info["success"]] = 1
@@ -209,9 +223,15 @@ class Collector:
             ep_len += live
             live &= ~done
             if sink is not None:
-                snap(obs)
+                with timer("video"):
+                    snap(obs)
         if sink is not None:
             sink.close()
         if record and self.flow:
             self._append_chunk_labels(np.stack(acts_hist), np.stack(live_hist))
-        return {"success": float(success.mean()), "ep_len": float(ep_len.mean())}
+        # per-tick phase averages (reset is per rollout); "t/" keys ride the
+        # collect/eval log lines
+        timing = {f"t/{k}": round(v, 4)
+                  for k, v in timer.get_average_times().items()}
+        return {"success": float(success.mean()), "ep_len": float(ep_len.mean()),
+                **timing}
