@@ -88,8 +88,12 @@ class Config:
     # teacher: "waypoint" (scripted LiftPolicy) or "mlp:<checkpoint.pt>" (frozen
     # state-mode Student; labels any state, no clock)
     teacher: str = "waypoint"
-    # bc
-    epochs_per_round: int = 10
+    # bc: a fixed optimizer-step budget per round, not epochs — the aggregate
+    # grows every round, so epochs would mean linearly growing round cost; a
+    # step budget keeps rounds constant-cost and is what lr/log cadence key off.
+    # Each rank runs exactly this many steps (cycling its shard), so DDP ranks
+    # stay in lockstep regardless of shard-size imbalance.
+    steps_per_round: int = 50_000
     batch_size: int = 256
     lr: float = 1e-3
     # per-round cosine decay lr -> lr_final: late rounds (largest dataset, best
@@ -131,9 +135,15 @@ class Config:
     eval_batches: int = 1             # student-only eval rollouts per round (n_envs each)
     eval_seed: int = 51_000
     eval_video: bool = True           # tile the first eval rollout (image mode) -> eval_rNN.mp4
+    # tile only the first k envs into rollout videos (the rollout itself keeps
+    # n_envs; a 16-tile grid stays readable in wandb, 2048 does not)
+    video_envs: int = 16
     # wandb (rank 0 only under torchrun): every log() line streams as
     # <kind>/<key>, eval videos attach per round; --wandb-project None = off
     wandb_project: str | None = "xarm-sim"
+    # stream bc losses to wandb every n optimizer steps (windowed mean over the
+    # last n, x-axis bc/step; rank 0's local values). 0 = per-round summaries only
+    log_every: int = 1000
     # env. n_envs is PER RANK: under torchrun each rank owns n_envs envs and a
     # DDP replica, so a rollout visits world_size * n_envs envs (and batch_size
     # is likewise per rank). Launch via torchrun for multi-GPU; no flag needed.
@@ -282,6 +292,10 @@ class Trainer:
             self.wandb = wandb.init(
                 project=cfg.wandb_project, name=cfg.exp_name,
                 config=json.loads(json.dumps(asdict(cfg), default=str)))
+            # step-stream bc metrics get their own x-axis so they don't fight
+            # the per-round log() calls over wandb's global step counter
+            self.wandb.define_metric("bc/step")
+            self.wandb.define_metric("bc/*", step_metric="bc/step")
         store_base = cfg.data_dir / cfg.exp_name
         self.store_root = (store_base / f"shard_{self.dist.rank}"
                            if self.dist.enabled else store_base)
@@ -304,6 +318,9 @@ class Trainer:
         self._stats_set = False
         self._act_stats_set = False
         self.best_success = -1.0
+        self.bc_step = 0  # optimizer steps across rounds (bc/step wandb axis)
+        self._win: dict[str, float] = {}
+        self._win_n = 0
         self._start = time.time()
 
     def log(self, kind: str, d: dict) -> None:
@@ -318,6 +335,21 @@ class Trainer:
                           for k, v in d.items() if k != "kind")
         color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
         print(f"[{color}]\\[{kind}][/] {pretty}")
+
+    def _step_metrics(self, vals: dict[str, float]) -> None:
+        """Per-optimizer-step loss stream: windowed mean to wandb every
+        cfg.log_every steps. Rank 0's local values — no cross-rank sync in the
+        hot loop; the per-round log() summary stays globally reduced."""
+        self.bc_step += 1
+        if self.wandb is None or self.cfg.log_every <= 0:
+            return
+        for k, v in vals.items():
+            self._win[k] = self._win.get(k, 0.0) + v
+        self._win_n += 1
+        if self.bc_step % self.cfg.log_every == 0:
+            d = {f"bc/{k}": v / self._win_n for k, v in self._win.items()}
+            self.wandb.log({**d, "bc/step": self.bc_step})
+            self._win, self._win_n = {}, 0
 
     # -- collection --------------------------------------------------------------
     def _rollouts(self, beta: float, record: bool, student: nn.Module,
@@ -353,22 +385,24 @@ class Trainer:
         Y = torch.from_numpy(np.concatenate(self._chunks["act"])).to(self.device)
         self._freeze_stats(X)
         n = X.shape[0]
-        steps = self.dist.min_int(math.ceil(n / cfg.batch_size))
-        last_loss = 0.0
-        for _ in range(cfg.epochs_per_round):
-            perm = torch.randperm(n, device=self.device)
-            losses = []
-            for s in range(steps):
-                idx = perm[s * cfg.batch_size : (s + 1) * cfg.batch_size]
-                loss = F.mse_loss(self.net(X[idx]), Y[idx])
-                loss.backward()
-                self.optim.step()
-                self.optim.zero_grad(set_to_none=True)
-                self._ema_update()
-                losses.append(loss.item())
-            last_loss = self.dist.mean(float(np.mean(losses)))
+        perm, pos = torch.randperm(n, device=self.device), 0
+        losses = []
+        for _ in range(cfg.steps_per_round):
+            if pos + cfg.batch_size > n:  # reshuffle when the shard is exhausted
+                perm, pos = torch.randperm(n, device=self.device), 0
+            idx = perm[pos : pos + cfg.batch_size]
+            pos += cfg.batch_size
+            loss = F.mse_loss(self.net(X[idx]), Y[idx])
+            loss.backward()
+            self.optim.step()
+            self.optim.zero_grad(set_to_none=True)
+            self._ema_update()
+            lv = loss.item()
+            self._step_metrics({"bc_loss": lv})
+            losses.append(lv)
         samples = int(self.dist.mean(float(n)) * self.dist.world)
-        return {"samples": samples, "bc_loss": last_loss}
+        return {"samples": samples,
+                "bc_loss": self.dist.mean(float(np.mean(losses)))}
 
     def _train_bc_image(self) -> dict:
         cfg = self.cfg
@@ -384,39 +418,40 @@ class Trainer:
             persistent_workers=cfg.num_workers > 0,
             multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
         )
-        steps = self.dist.min_int(len(loader))
-        stats = {"bc_loss": 0.0, "grip_bce": 0.0, "aux_mse": 0.0}
-        for _ in range(cfg.epochs_per_round):
-            sums = {k: 0.0 for k in stats}
-            batches = 0
-            # explicit cpu: gs.init makes cuda the torch default device, but the
-            # loader's sampler/collate must build cpu tensors
-            with torch.device("cpu"):
-                for rgb, prop, y, aux_y in loader:
-                    if batches >= steps:
-                        break
-                    x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
-                    prop = prop.to(self.device, non_blocking=True)
-                    y = y.to(self.device, non_blocking=True)
-                    aux_y = aux_y.to(self.device, non_blocking=True)
-                    if cfg.aug_pad > 0:
-                        nv = x.shape[0] * x.shape[1]
-                        x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
-                    pred, aux = self.net(x, prop)
-                    joints = F.mse_loss(pred[:, :-1], y[:, :-1])
-                    grip = F.binary_cross_entropy_with_logits(pred[:, -1], y[:, -1])
-                    aux_l = F.mse_loss(aux, aux_y)
-                    loss = joints + cfg.grip_coef * grip + cfg.aux_pose_coef * aux_l
-                    loss.backward()
-                    self.optim.step()
-                    self.optim.zero_grad(set_to_none=True)
-                    self._ema_update()
-                    sums["bc_loss"] += joints.item()
-                    sums["grip_bce"] += grip.item()
-                    sums["aux_mse"] += aux_l.item()
-                    batches += 1
-            stats = {k: self.dist.mean(v / max(batches, 1)) for k, v in sums.items()}
-        del loader  # release persistent workers before the next collect
+        sums = {"bc_loss": 0.0, "grip_bce": 0.0, "aux_mse": 0.0}
+        # explicit cpu: gs.init makes cuda the torch default device, but the
+        # loader's iterator seeding and sampler/collate must build cpu tensors
+        with torch.device("cpu"):
+            it = iter(loader)
+            for _ in range(cfg.steps_per_round):
+                try:
+                    rgb, prop, y, aux_y = next(it)
+                except StopIteration:  # cycle the shard until the budget is spent
+                    it = iter(loader)
+                    rgb, prop, y, aux_y = next(it)
+                x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
+                prop = prop.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+                aux_y = aux_y.to(self.device, non_blocking=True)
+                if cfg.aug_pad > 0:
+                    nv = x.shape[0] * x.shape[1]
+                    x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
+                pred, aux = self.net(x, prop)
+                joints = F.mse_loss(pred[:, :-1], y[:, :-1])
+                grip = F.binary_cross_entropy_with_logits(pred[:, -1], y[:, -1])
+                aux_l = F.mse_loss(aux, aux_y)
+                loss = joints + cfg.grip_coef * grip + cfg.aux_pose_coef * aux_l
+                loss.backward()
+                self.optim.step()
+                self.optim.zero_grad(set_to_none=True)
+                self._ema_update()
+                vals = {"bc_loss": joints.item(), "grip_bce": grip.item(),
+                        "aux_mse": aux_l.item()}
+                self._step_metrics(vals)
+                for k, v in vals.items():
+                    sums[k] += v
+        del it, loader  # release persistent workers before the next collect
+        stats = {k: self.dist.mean(v / cfg.steps_per_round) for k, v in sums.items()}
         samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
         return {"samples": samples, **stats}
 
@@ -439,45 +474,47 @@ class Trainer:
             persistent_workers=cfg.num_workers > 0,
             multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
         )
-        steps = self.dist.min_int(len(loader))
-        stats = {"flow_loss": 0.0, "a0_mse": 0.0, "aux_mse": 0.0}
-        for _ in range(cfg.epochs_per_round):
-            sums = {k: 0.0 for k in stats}
-            batches = 0
-            # explicit cpu: gs.init makes cuda the torch default device, but the
-            # loader's sampler/collate must build cpu tensors
-            with torch.device("cpu"):
-                for rgb, prop, y, aux_y in loader:
-                    if batches >= steps:
-                        break
-                    x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
-                    prop = prop.to(self.device, non_blocking=True)
-                    y = y.to(self.device, non_blocking=True)
-                    aux_y = aux_y.to(self.device, non_blocking=True)
-                    if cfg.aug_pad > 0:
-                        nv = x.shape[0] * x.shape[1]
-                        x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
-                    n = y.shape[0]
-                    a = ((y - self.student.act_mean) / self.student.act_std).reshape(n, -1)
-                    eps = torch.randn_like(a)
-                    t = torch.rand(n, 1, device=self.device)
-                    x_t = (1.0 - t) * eps + t * a
-                    v_pred, aux, h = self.net(x, prop, x_t, t)
-                    fm = F.mse_loss(v_pred, a - eps)
-                    aux_l = F.mse_loss(aux, aux_y)
-                    loss = fm + cfg.aux_pose_coef * aux_l
-                    loss.backward()
-                    self.optim.step()
-                    self.optim.zero_grad(set_to_none=True)
-                    self._ema_update()
-                    with torch.no_grad():  # diagnostic comparable to mse bc_loss
-                        a0 = self.student.sample(h.detach())[:, 0]
-                        sums["a0_mse"] += F.mse_loss(a0, y[:, 0]).item()
-                    sums["flow_loss"] += fm.item()
-                    sums["aux_mse"] += aux_l.item()
-                    batches += 1
-            stats = {k: self.dist.mean(v / max(batches, 1)) for k, v in sums.items()}
-        del loader  # release persistent workers before the next collect
+        sums = {"flow_loss": 0.0, "a0_mse": 0.0, "aux_mse": 0.0}
+        # explicit cpu: gs.init makes cuda the torch default device, but the
+        # loader's iterator seeding and sampler/collate must build cpu tensors
+        with torch.device("cpu"):
+            it = iter(loader)
+            for _ in range(cfg.steps_per_round):
+                try:
+                    rgb, prop, y, aux_y = next(it)
+                except StopIteration:  # cycle the shard until the budget is spent
+                    it = iter(loader)
+                    rgb, prop, y, aux_y = next(it)
+                x = rgb.to(self.device, non_blocking=True).float() / 255.0 - 0.5
+                prop = prop.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+                aux_y = aux_y.to(self.device, non_blocking=True)
+                if cfg.aug_pad > 0:
+                    nv = x.shape[0] * x.shape[1]
+                    x = rand_shift(x.reshape(nv, *x.shape[2:]), cfg.aug_pad).reshape(x.shape)
+                n = y.shape[0]
+                a = ((y - self.student.act_mean) / self.student.act_std).reshape(n, -1)
+                eps = torch.randn_like(a)
+                t = torch.rand(n, 1, device=self.device)
+                x_t = (1.0 - t) * eps + t * a
+                v_pred, aux, h = self.net(x, prop, x_t, t)
+                fm = F.mse_loss(v_pred, a - eps)
+                aux_l = F.mse_loss(aux, aux_y)
+                loss = fm + cfg.aux_pose_coef * aux_l
+                loss.backward()
+                self.optim.step()
+                self.optim.zero_grad(set_to_none=True)
+                self._ema_update()
+                with torch.no_grad():  # diagnostic comparable to mse bc_loss
+                    a0 = self.student.sample(h.detach())[:, 0]
+                    a0_mse = F.mse_loss(a0, y[:, 0]).item()
+                vals = {"flow_loss": fm.item(), "a0_mse": a0_mse,
+                        "aux_mse": aux_l.item()}
+                self._step_metrics(vals)
+                for k, v in vals.items():
+                    sums[k] += v
+        del it, loader  # release persistent workers before the next collect
+        stats = {k: self.dist.mean(v / cfg.steps_per_round) for k, v in sums.items()}
         samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
         return {"samples": samples, **stats}
 

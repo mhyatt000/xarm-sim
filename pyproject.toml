@@ -55,6 +55,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "poethepoet>=0.48.0",
     "xarm-sim",
 ]
 
@@ -75,3 +76,38 @@ override-dependencies = [
 
 [tool.uv.extra-build-dependencies]
 webpolicy = ["hatchling"]
+
+# task runner: `uv run poe <task> <script> [flags...]` — extra args append to
+# the cmd, so any script + tyro flags pass through. GPUS/NNODES/RDZV come from
+# the environment, falling back to the .default values below (poe sets a
+# .default only when the var is unset, so the shell always wins); n-envs and
+# batch-size are PER RANK. CXX/CC pin gsplat's JIT to the system gcc (the
+# PATH's conda-forge gcc 15 links a libstdc++ newer than the system's).
+# scripts/host.sh and scripts/multihost.sh are standalone equivalents for
+# running without poe (same env vars and toolchain defaults).
+#   GPUS=2 poe host scripts/simpledagger.py --policy image --n-envs 2048
+#   poe multihost scripts/simpledagger.py ...   # on every node
+[tool.poe.tasks._ngpu]
+shell = "echo ${GPUS:-$(nvidia-smi -L | wc -l)}"
+
+[tool.poe.tasks.host]
+cmd = "torchrun --standalone --nproc-per-node=${NPROC}"
+uses = { NPROC = "_ngpu" }
+help = "torchrun, one rank per local GPU (GPUS=N to override)"
+
+[tool.poe.tasks.host.env]
+CXX.default = "/usr/bin/g++"
+CC.default = "/usr/bin/gcc"
+PYTORCH_CUDA_ALLOC_CONF.default = "expandable_segments:True"
+
+[tool.poe.tasks.multihost]
+cmd = "torchrun --nnodes=${NNODES} --nproc-per-node=${NPROC} --rdzv-backend=c10d --rdzv-endpoint=${RDZV}"
+uses = { NPROC = "_ngpu" }
+help = "torchrun across nodes (defaults NNODES=2, RDZV=gpu1:29500); run on every node"
+
+[tool.poe.tasks.multihost.env]
+NNODES.default = "2"
+RDZV.default = "gpu1:29500"
+CXX.default = "/usr/bin/g++"
+CC.default = "/usr/bin/gcc"
+PYTORCH_CUDA_ALLOC_CONF.default = "expandable_segments:True"

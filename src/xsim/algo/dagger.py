@@ -165,11 +165,13 @@ class Collector:
         if video_path is not None:
             sink = VideoSink(video_path, 1.0 / env.unwrapped.control_dt)
             status = np.zeros(B, dtype=np.int64)  # 0 live, 1 success, 2 fail
+        # video shows only the first k envs; the rollout itself keeps all B
+        k = min(getattr(cfg, "video_envs", B) or B, B)
 
         def snap(o) -> None:
-            rgb = o["rgb"].transpose(0, 1, 3, 4, 2)  # (B, V, H, W, 3)
+            rgb = o["rgb"][:k].transpose(0, 1, 3, 4, 2)  # (k, V, H, W, 3)
             sink.add(np.concatenate(
-                [tile_grid(rgb[:, i], cfg.video_max_width, status, upscale=True)
+                [tile_grid(rgb[:, i], cfg.video_max_width, status[:k], upscale=True)
                  for i in range(rgb.shape[1])], axis=1))
 
         if sink is not None:
