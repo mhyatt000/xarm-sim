@@ -46,10 +46,16 @@ class RobotEnv(GenesisEnv):
         fov_deg: float = 42.0,
         render_backend: Literal["raster", "nyx", "batch"] = "batch",
         renderer_config: NyxConfig | BatchConfig | None = None,
+        init_tcp_box: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+        | None = None,
         **kwargs,
     ):
         names = [robots] if isinstance(robots, str) else list(robots)
         self.robots = [Robot(create_robot_model(name)) for name in names]
+        # ((x_lo, x_hi), (y_lo, y_hi), (z_lo, z_hi)): reset seats robot 0's arm
+        # at IK(uniform TCP in this box, home orientation); None = home pose
+        self.init_tcp_box = init_tcp_box
+        self._home_ee_quat: np.ndarray | None = None
         self.camera_names = camera_names
         self.camera_res = camera_res
         self.fov_deg = fov_deg
@@ -411,10 +417,28 @@ class RobotEnv(GenesisEnv):
         super()._reset_internal(envs_idx)
         for robot in self.robots:
             robot.reset(envs_idx)
+        if self.init_tcp_box is not None:
+            self._randomize_init_tcp(envs_idx)
         self._resample_cameras(envs_idx)
         self._sync_attached_cams()  # wrist cam follows the freshly reset arm
         self._render_splat_bg(envs_idx)
         self._render_stale = True
+
+    def _randomize_init_tcp(self, envs_idx=None) -> None:
+        """Seat robot 0's arm at IK(uniform TCP in ``init_tcp_box``), keeping the
+        home orientation. IK is solved for the full batch (Genesis IK is
+        all-envs); only ``envs_idx`` rows are applied."""
+        import torch
+
+        robot = self.robots[0]
+        if self._home_ee_quat is None:  # robots were just reset -> EE is at home
+            i = 0 if envs_idx is None else int(np.atleast_1d(envs_idx)[0])
+            self._home_ee_quat = np.asarray(robot.ee_quat, dtype=np.float64)[i].copy()
+        lo, hi = np.array(self.init_tcp_box, dtype=np.float64).T  # (3,), (3,)
+        pos = self.np_random.uniform(lo, hi, size=(self.n_envs, 3))
+        pose = np.concatenate([pos, np.tile(self._home_ee_quat, (self.n_envs, 1))], axis=1)
+        q = robot.ik(torch.as_tensor(pose, dtype=torch.float32))
+        robot.set_arm_qpos(q, envs_idx)
 
     def step(self, action):
         out = super().step(action)

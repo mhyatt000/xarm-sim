@@ -122,15 +122,24 @@ class WaypointPolicy:
         return action
 
     def _action(self, pose: torch.Tensor, gripper: float) -> np.ndarray:
-        if self.cartesian:
-            p = np.asarray(pose.detach().cpu(), dtype=np.float64).copy()
-            # canonicalize the double cover: q and -q are one rotation, but MSE
-            # labels split across hemispheres regress toward the zero quat. All
-            # task grasps are qx-dominant (top-down family), so pin qx >= 0.
-            flip = p[:, 4] < 0.0
-            p[flip, 3:7] *= -1.0
-            g = np.full((p.shape[0], 1), gripper)
-            return np.concatenate([p, g], axis=-1).astype(np.float32)
-        joints = self.robot.ik(pose.to(device=gs.device, dtype=gs.tc_float))
-        g = np.full((joints.shape[0], 1), gripper)
-        return np.concatenate([joints, g], axis=-1).astype(np.float32)
+        return format_action(self.robot, pose, gripper, self.cartesian)
+
+
+def format_action(robot: Robot, pose: torch.Tensor, gripper: float | np.ndarray,
+                  cartesian: bool, ik_from_current: bool = False) -> np.ndarray:
+    """Batched env action from commanded EE poses: [j0..j6, g] via IK, or
+    [x,y,z,qw..qz,g] pose actions when ``cartesian``. ``gripper`` may be a
+    scalar or per-env (n,). ``ik_from_current`` seeds IK at the live qpos —
+    mandatory when actions double as regression labels (branch continuity)."""
+    g = np.broadcast_to(np.asarray(gripper, dtype=np.float64).reshape(-1, 1),
+                        (pose.shape[0], 1))
+    if cartesian:
+        p = np.asarray(pose.detach().cpu(), dtype=np.float64).copy()
+        # canonicalize the double cover: q and -q are one rotation, but MSE
+        # labels split across hemispheres regress toward the zero quat. All
+        # task grasps are qx-dominant (top-down family), so pin qx >= 0.
+        flip = p[:, 4] < 0.0
+        p[flip, 3:7] *= -1.0
+        return np.concatenate([p, g], axis=-1).astype(np.float32)
+    joints = robot.ik(pose.to(device=gs.device, dtype=gs.tc_float), from_current=ik_from_current)
+    return np.concatenate([joints, g], axis=-1).astype(np.float32)

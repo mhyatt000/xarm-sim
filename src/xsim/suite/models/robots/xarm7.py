@@ -14,8 +14,11 @@ from xsim.suite.models.robots.robot_model import RobotModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 
-# Low ready pose matching the real demos' start, TCP ~ (0.34, 0, 0.10) top-down.
-_DEFAULT_ARM_QPOS = tuple(math.radians(v) for v in (0.0, -26.2, 0.0, 13.5, 0.0, 25.0, 90.0))
+# The real rig's home pose (verified against the live arm 2026-07-19),
+# TCP ~ (0.324, 0, 0.288) top-down. The old (0, -26.2, 0, 13.5, 0, 25, 90)
+# low-ready start drifted from reality: real rollouts began ~5 sigma outside
+# the DAgger visit distribution and img-v5 froze at a constant action.
+_DEFAULT_ARM_QPOS = tuple(math.radians(v) for v in (0.0, -45.0, 0.0, 35.0, 0.0, 65.0, 90.0))
 
 # RealSense D435 colour at 640x480: fx ~ 617 -> vFOV ~ 42.6 (no calibration data).
 REALSENSE_FOV_DEG = 42.5

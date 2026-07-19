@@ -91,11 +91,32 @@ class Robot:
         for c in self._controllers:
             c.reset()
 
-    def ik(self, pose: torch.Tensor) -> np.ndarray:
-        """Arm joint targets (n_envs, 7) for EE poses [n_envs, 7] = [x,y,z,qw,qx,qy,qz]."""
+    def set_arm_qpos(self, q: np.ndarray, envs_idx=None) -> None:
+        """Seat the arm at ``q`` (n_envs, arm_dofs) with the gripper at its
+        defaults; ``envs_idx`` selects which of the n_envs rows are applied."""
+        qpos = self._init_qpos.unsqueeze(0).repeat(q.shape[0], 1).clone()
+        qpos[:, : self.model.arm_dofs] = torch.as_tensor(
+            q, device=gs.device, dtype=gs.tc_float
+        )
+        if envs_idx is not None:
+            qpos = qpos[torch.as_tensor(np.atleast_1d(envs_idx), device=gs.device)]
+        self.entity.set_qpos(qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=False)
+        for c in self._controllers:
+            c.reset()
+
+    def ik(self, pose: torch.Tensor, from_current: bool = False) -> np.ndarray:
+        """Arm joint targets (n_envs, 7) for EE poses [n_envs, 7] = [x,y,z,qw,qx,qy,qz].
+
+        ``from_current`` seeds the solve at each env's live qpos, returning the
+        branch nearest the arm's actual configuration — required when the
+        result is used as a per-tick regression label (home seeding can jump
+        branches, making labels discontinuous in state; see img-v8b).
+        """
         pose = pose.to(gs.device)
         init_qpos = (
-            self._init_qpos.unsqueeze(0).expand(pose.shape[0], -1)
+            None
+            if from_current
+            else self._init_qpos.unsqueeze(0).expand(pose.shape[0], -1)
             if self.model.ik_init_at_home
             else None
         )
