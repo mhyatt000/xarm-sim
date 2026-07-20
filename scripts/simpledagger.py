@@ -80,7 +80,12 @@ class Config:
     out: Path = PROJECT_ROOT / "outputs" / "dagger"
     # dagger
     episodes_per_round: int = 1       # env-batch rollouts per round (n_envs episodes each)
-    beta_rampdown_rounds: int = 5     # beta = max(floor, 1 - round/rampdown)
+    # adaptive beta (default): beta = clip(1 - beta_gain * last_eval_success,
+    # beta_floor, 1) — closed-loop on the student, so the schedule can't outrun
+    # a slow learner (img-v8c-1k died to that: beta hit 0.4 on a 6% student and
+    # the aggregate flooded with failures). 0 = legacy round-indexed rampdown.
+    beta_gain: float = 1.2
+    beta_rampdown_rounds: int = 5     # legacy: beta = max(floor, 1 - round/rampdown)
     # never collect with the pure student: beta=0 collection poisoned the aggregate
     # (b4096: 81% at beta=0.2, then 0% after beta=0)
     beta_floor: float = 0.2
@@ -798,6 +803,7 @@ class Trainer:
         offline = cfg.offline_dataset is not None and not self.image
         if offline:
             self._load_dataset(cfg.offline_dataset)
+        last_eval = 0.0  # eval_success is all-reduced, so every rank agrees on beta
         for rnd in range(cfg.rounds):
             if cfg.lr_restart_per_round:
                 # base lr is cfg.lr; the within-round cosine down to lr_final is
@@ -809,7 +815,11 @@ class Trainer:
                 for g in self.optim.param_groups:
                     g["lr"] = lr
             if not offline:
-                beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
+                if cfg.beta_gain > 0:
+                    beta = float(np.clip(1.0 - cfg.beta_gain * last_eval,
+                                         cfg.beta_floor, 1.0))
+                else:
+                    beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
                 for _ in range(cfg.episodes_per_round):
                     stats = self._rollouts(beta=beta, record=True, student=self.student,
                                            seed=cfg.seed + rnd if rnd == 0 else None)
@@ -818,6 +828,7 @@ class Trainer:
                     self._save_dataset()
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate(rnd)
+            last_eval = eval_metrics["eval_success"]
             self.log("eval", {"round": rnd, **eval_metrics})
             if self.dist.main:
                 torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
