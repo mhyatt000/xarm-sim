@@ -85,6 +85,7 @@ class Config:
     # a slow learner (img-v8c-1k died to that: beta hit 0.4 on a 6% student and
     # the aggregate flooded with failures). 0 = legacy round-indexed rampdown.
     beta_gain: float = 1.2
+    beta_smooth: int = 2              # adaptive beta reads the mean of the last k evals
     beta_rampdown_rounds: int = 5     # legacy: beta = max(floor, 1 - round/rampdown)
     # never collect with the pure student: beta=0 collection poisoned the aggregate
     # (b4096: 81% at beta=0.2, then 0% after beta=0)
@@ -100,6 +101,11 @@ class Config:
     # stay in lockstep regardless of shard-size imbalance.
     steps_per_round: int = 50_000
     batch_size: int = 256
+    # recency-weighted BC sampling (image/flow): a sample from r rounds ago is
+    # drawn with weight recency_decay^r. Uniform over a big aggregate starves
+    # recent on-policy corrections (<5% of a batch by round 20 — the v6 trap);
+    # 0.85 keeps the newest round at ~15% of every batch. 1.0 = uniform.
+    recency_decay: float = 1.0
     lr: float = 1e-3
     # per-round cosine decay lr -> lr_final: late rounds (largest dataset, best
     # policy) take refining steps instead of reshaping ones
@@ -165,11 +171,12 @@ class Config:
     batch_rasterizer: bool = False
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (eval_envs each)
-    # dedicated small eval env sharing the train env's Genesis context: eval
-    # only needs enough episodes for a stable-ish success estimate + the wandb
-    # video, and a small env skips rendering thousands of cams per eval tick.
-    # PER RANK (x world_size episodes per eval rollout). 0 = eval on the train env.
-    eval_envs: int = 32
+    # dedicated small eval env sharing the train env's Genesis context. PER RANK
+    # (x world_size episodes per eval rollout). 0 = eval on the full train env
+    # (near-zero success noise; the video still slices to video_envs tiles).
+    # A tiny env is fast but noisy and that noise leaks into adaptive beta;
+    # default 0 trades ~30s/round for a clean signal.
+    eval_envs: int = 0
     eval_seed: int = 51_000
     eval_video: bool = True           # tile the first eval rollout (image mode) -> eval_rNN.mp4
     # tile only the first k envs into rollout videos (the rollout itself keeps
@@ -421,6 +428,7 @@ class Trainer:
         # aggregated DAgger dataset. image mode appends every recorded step to
         # this rank's on-disk MemmapStore; state mode stays in RAM (tiny rows).
         self._chunks: dict[str, list[np.ndarray]] = {}
+        self._round_sizes: list[int] = []  # new samples added each round (recency)
         self._stats_set = False
         self._act_stats_set = False
         self.best_success = -1.0
@@ -538,6 +546,37 @@ class Trainer:
         if not self.image:
             return self._train_bc_state_flow() if self.flow else self._train_bc_state()
         return self._train_bc_flow() if self.flow else self._train_bc_image()
+
+    def _bc_loader(self, ds, n_new: int) -> torch.utils.data.DataLoader:
+        """DataLoader over the aggregate. recency_decay<1 draws with a
+        WeightedRandomSampler: a sample from r rounds ago gets weight
+        decay^r (round boundaries tracked as each round's new-sample count);
+        else a plain shuffle. num_samples covers the whole step budget so the
+        loop never cycles a StopIteration mid-round."""
+        cfg = self.cfg
+        self._round_sizes.append(n_new)
+        # explicit cpu: gs.init makes cuda the torch default device, so a bare
+        # Generator() here is cuda and mismatches the cpu sampler weights
+        g = torch.Generator(device="cpu").manual_seed(int(self.rng.integers(2**31)))
+        draws = cfg.steps_per_round * cfg.batch_size
+        if cfg.recency_decay < 1.0:
+            ages = np.arange(len(self._round_sizes))[::-1]  # newest round age 0
+            per_round_w = cfg.recency_decay ** ages
+            w = np.repeat(per_round_w, self._round_sizes).astype(np.float64)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                torch.from_numpy(w), num_samples=draws, replacement=True,
+                generator=g)
+            shuffle = None
+        else:
+            sampler, shuffle = None, True
+        return torch.utils.data.DataLoader(
+            ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=shuffle,
+            generator=None if sampler is not None else g,
+            num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
+            persistent_workers=cfg.num_workers > 0,
+            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
+            drop_last=True,
+        )
 
     def _train_bc_state(self) -> dict:
         cfg = self.cfg
@@ -661,17 +700,12 @@ class Trainer:
         if not self._stats_set:
             self._freeze_stats(torch.from_numpy(
                 np.asarray(read_key(self.store_root, "prop"))).to(self.device))
-        g = torch.Generator().manual_seed(int(self.rng.integers(2**31)))
-        loader = torch.utils.data.DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
-            num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
-            persistent_workers=cfg.num_workers > 0,
-            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
-        )
         sums = {"bc_loss": 0.0, "grip_bce": 0.0, "aux_mse": 0.0}
         # explicit cpu: gs.init makes cuda the torch default device, but the
-        # loader's iterator seeding and sampler/collate must build cpu tensors
+        # loader's iterator seeding and sampler (WeightedRandomSampler's
+        # multinomial) and collate must build cpu tensors
         with torch.device("cpu"):
+            loader = self._bc_loader(ds, len(ds) - sum(self._round_sizes))
             it = iter(loader)
             for _ in range(cfg.steps_per_round):
                 try:
@@ -719,17 +753,11 @@ class Trainer:
                 np.asarray(read_key(self.store_root, "act"))).to(self.device)
             self.student.set_act_stats(*self.dist.obs_stats(a))
             self._act_stats_set = True
-        g = torch.Generator().manual_seed(int(self.rng.integers(2**31)))
-        loader = torch.utils.data.DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
-            num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
-            persistent_workers=cfg.num_workers > 0,
-            multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
-        )
         sums = {"flow_loss": 0.0, "a0_mse": 0.0, "aux_mse": 0.0}
         # explicit cpu: gs.init makes cuda the torch default device, but the
         # loader's iterator seeding and sampler/collate must build cpu tensors
         with torch.device("cpu"):
+            loader = self._bc_loader(ds, len(ds) - sum(self._round_sizes))
             it = iter(loader)
             for _ in range(cfg.steps_per_round):
                 try:
@@ -803,7 +831,7 @@ class Trainer:
         offline = cfg.offline_dataset is not None and not self.image
         if offline:
             self._load_dataset(cfg.offline_dataset)
-        last_eval = 0.0  # eval_success is all-reduced, so every rank agrees on beta
+        eval_hist: list[float] = []  # eval_success is all-reduced; ranks agree on beta
         for rnd in range(cfg.rounds):
             if cfg.lr_restart_per_round:
                 # base lr is cfg.lr; the within-round cosine down to lr_final is
@@ -816,7 +844,8 @@ class Trainer:
                     g["lr"] = lr
             if not offline:
                 if cfg.beta_gain > 0:
-                    beta = float(np.clip(1.0 - cfg.beta_gain * last_eval,
+                    recent = eval_hist[-cfg.beta_smooth:] or [0.0]
+                    beta = float(np.clip(1.0 - cfg.beta_gain * float(np.mean(recent)),
                                          cfg.beta_floor, 1.0))
                 else:
                     beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
@@ -828,7 +857,7 @@ class Trainer:
                     self._save_dataset()
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate(rnd)
-            last_eval = eval_metrics["eval_success"]
+            eval_hist.append(eval_metrics["eval_success"])
             self.log("eval", {"round": rnd, **eval_metrics})
             if self.dist.main:
                 torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
