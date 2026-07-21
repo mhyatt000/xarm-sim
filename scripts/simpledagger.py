@@ -381,6 +381,33 @@ def build_student(cfg: Config, spec_or_env, device: torch.device):
     return ImageStudent(**kwargs).to(device)
 
 
+class _RecencySampler(torch.utils.data.Sampler):
+    """Two-stage recency draw: pick a round with prob proportional to
+    decay^age * round_size, then a uniform index within it. Equivalent to a
+    per-sample WeightedRandomSampler with weight decay^age, but the multinomial
+    is over #rounds categories (torch's is capped at 2^24 samples). Pure numpy,
+    so no cuda-generator entanglement with gs.init's default device."""
+
+    def __init__(self, round_sizes: np.ndarray, decay: float, draws: int,
+                 seed: int):
+        self.sizes = np.asarray(round_sizes, dtype=np.int64)
+        self.starts = np.concatenate([[0], np.cumsum(self.sizes)[:-1]])
+        ages = np.arange(len(self.sizes))[::-1]  # newest round age 0
+        w = (decay ** ages) * self.sizes
+        self.round_p = w / w.sum()
+        self.draws = draws
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.draws
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        rids = rng.choice(len(self.sizes), size=self.draws, p=self.round_p)
+        offs = (rng.random(self.draws) * self.sizes[rids]).astype(np.int64)
+        yield from (self.starts[rids] + offs).tolist()
+
+
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -548,30 +575,27 @@ class Trainer:
         return self._train_bc_flow() if self.flow else self._train_bc_image()
 
     def _bc_loader(self, ds, n_new: int) -> torch.utils.data.DataLoader:
-        """DataLoader over the aggregate. recency_decay<1 draws with a
-        WeightedRandomSampler: a sample from r rounds ago gets weight
-        decay^r (round boundaries tracked as each round's new-sample count);
-        else a plain shuffle. num_samples covers the whole step budget so the
-        loop never cycles a StopIteration mid-round."""
+        """DataLoader over the aggregate. recency_decay<1 draws two-stage: a
+        round is picked with prob proportional to (decay^age * round_size), then
+        a uniform index within it — per-sample weight is decay^age, but the draw
+        is over #rounds categories, not #samples (torch.multinomial caps at
+        2^24 categories, which a stride-1 aggregate blows past by ~round 9).
+        recency_decay=1.0 is a plain shuffle."""
         cfg = self.cfg
         self._round_sizes.append(n_new)
-        # explicit cpu: gs.init makes cuda the torch default device, so a bare
-        # Generator() here is cuda and mismatches the cpu sampler weights
-        g = torch.Generator(device="cpu").manual_seed(int(self.rng.integers(2**31)))
         draws = cfg.steps_per_round * cfg.batch_size
         if cfg.recency_decay < 1.0:
-            ages = np.arange(len(self._round_sizes))[::-1]  # newest round age 0
-            per_round_w = cfg.recency_decay ** ages
-            w = np.repeat(per_round_w, self._round_sizes).astype(np.float64)
-            sampler = torch.utils.data.WeightedRandomSampler(
-                torch.from_numpy(w), num_samples=draws, replacement=True,
-                generator=g)
+            sampler = _RecencySampler(
+                np.asarray(self._round_sizes), cfg.recency_decay, draws,
+                int(self.rng.integers(2**31)))
             shuffle = None
         else:
+            g = torch.Generator(device="cpu").manual_seed(
+                int(self.rng.integers(2**31)))
             sampler, shuffle = None, True
         return torch.utils.data.DataLoader(
             ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=shuffle,
-            generator=None if sampler is not None else g,
+            generator=None if cfg.recency_decay < 1.0 else g,
             num_workers=cfg.num_workers, pin_memory=cfg.num_workers > 0,
             persistent_workers=cfg.num_workers > 0,
             multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
