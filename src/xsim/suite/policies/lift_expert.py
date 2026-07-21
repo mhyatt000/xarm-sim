@@ -62,6 +62,18 @@ class LiftExpertPolicy:
         self,
         env: Lift,
         cartesian: bool = False,
+        # only meaningful when cartesian: "fixed" pins the grasp to a top-down
+        # quat and emits 4-dim [x,y,z, g] labels (matching CartesianActionWrapper
+        # orientation="fixed"); "yaw" keeps top-down but adds a free yaw DOF,
+        # emitting 6-dim [x,y,z, c,s, g] where (c,s) is the (qw,qy) pair of the
+        # face-aligned grasp quat; "free" keeps the 8-dim pose labels.
+        cartesian_orientation: str = "free",
+        # delta-joint labels matching DeltaActionWrapper: emit
+        # [clip((q_target - qpos)/max_delta_rad, -1, 1), 2*g - 1] instead of the
+        # absolute [j0..j6, g]. Mutually exclusive with cartesian; max_delta_rad
+        # MUST equal the wrapper's (both are fed cfg.delta_max_rad by the caller).
+        delta: bool = False,
+        max_delta_rad: float = 0.10,
         # 0.025/0.15 swept on the v8 spawn/init distribution: 98.4-99.8% at 512
         # envs; larger steps destabilize per-tick IK near the base column
         max_step: float = 0.025,   # commanded EE translation per tick, m
@@ -76,9 +88,14 @@ class LiftExpertPolicy:
         close_ticks_min: int = 12, # finger travel time before a grasp can count
         close_ticks_max: int = 30, # abort a close attempt that never seats
     ):
+        assert cartesian_orientation in ("free", "fixed", "yaw")
+        assert not (cartesian and delta), "cartesian and delta are mutually exclusive"
         self.env = env
         self.robot = env.robots[0]
         self.cartesian = cartesian
+        self.cartesian_orientation = cartesian_orientation
+        self.delta = delta
+        self.max_delta_rad = float(max_delta_rad)
         self.max_step = max_step
         self.rot_frac = rot_frac
         self.tol_xy = tol_xy
@@ -148,7 +165,20 @@ class LiftExpertPolicy:
         delta = target - ee
         dist = np.linalg.norm(delta, axis=1, keepdims=True)
         pos_cmd = ee + delta * np.minimum(1.0, self.max_step / np.maximum(dist, 1e-9))
+        if self.cartesian and self.cartesian_orientation == "fixed":
+            # orientation is pinned by the wrapper; emit only [x,y,z, g]
+            g = np.broadcast_to(np.asarray(grip, dtype=np.float64).reshape(-1, 1),
+                                (pos_cmd.shape[0], 1))
+            return np.concatenate([pos_cmd, g], axis=-1).astype(np.float32)
         grasp_quat = side_grasp_quats(2.0 * np.arctan2(q[:, 3], q[:, 0]), ee_quat)
+        if self.cartesian and self.cartesian_orientation == "yaw":
+            # top-down grasp, free yaw: emit [x,y,z, c,s, g] where (c,s) is the
+            # (qw,qy) pair of the face-aligned grasp quat wxyz=[0,cos(h),sin(h),0]
+            # (side_grasp_quats fills cand[...,1]=cos(h), cand[...,2]=sin(h)).
+            c = grasp_quat[:, 1:2]
+            s = grasp_quat[:, 2:3]
+            g = np.asarray(grip, dtype=np.float64).reshape(-1, 1)
+            return np.concatenate([pos_cmd, c, s, g], axis=-1).astype(np.float32)
         quat_cmd = _slerp(
             torch.as_tensor(ee_quat, device=gs.device, dtype=torch.float32),
             torch.as_tensor(grasp_quat, device=gs.device, dtype=torch.float32),
@@ -161,4 +191,17 @@ class LiftExpertPolicy:
         # IK seeded at the live qpos: home seeding returns far-branch joint
         # targets from randomized starts (identity-gap 0.45 rad^2, privileged
         # probe floor 0.23 on img-v8b) — labels must be continuous in state
-        return format_action(self.robot, pose, grip, self.cartesian, ik_from_current=True)
+        action = format_action(self.robot, pose, grip, self.cartesian, ik_from_current=True)
+        if self.delta:  # invert DeltaActionWrapper: absolute [j..,g] -> [-1,1]^(n+1)
+            return self._to_delta(action)
+        return action
+
+    def _to_delta(self, action: np.ndarray) -> np.ndarray:
+        """Map the expert's absolute joint action ``[j0..jn, g in [0,1]]`` into
+        DeltaActionWrapper's ``[-1, 1]^(arm+1)`` space (its exact inverse):
+        arm -> clip((q_target - qpos)/max_delta_rad, -1, 1), gripper -> 2g - 1."""
+        qpos = np.asarray(self.robot.joint_positions, dtype=np.float64)
+        n = qpos.shape[1]
+        arm = np.clip((action[:, :n] - qpos) / self.max_delta_rad, -1.0, 1.0)
+        gripper = 2.0 * np.clip(action[:, n:], 0.0, 1.0) - 1.0
+        return np.concatenate([arm, gripper], axis=-1).astype(np.float32)

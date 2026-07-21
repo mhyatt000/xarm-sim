@@ -29,8 +29,11 @@ class Lift(ManipulationEnv):
         robots: str | list[str] = "XArm7",
         cube_size: float = 0.03175,
         cube_color: tuple[float, float, float] = (0.48, 0.05, 0.04),
-        x_range: tuple[float, float] = (0.35, 0.58),
-        y_range: tuple[float, float] = (-0.15, 0.15),
+        # cube spawn: x 200-400mm, y +-1ft minus the cube half-extent (table is
+        # exactly 2ft wide, y +-0.3048; +-0.288 keeps the 1.25in cube fully on
+        # it). Matches the production training/eval distribution.
+        x_range: tuple[float, float] = (0.20, 0.40),
+        y_range: tuple[float, float] = (-0.288, 0.288),
         lift_height: float = 0.05,
         success_hold_ticks: int = 1,
         success_max_speed: float = 0.10,

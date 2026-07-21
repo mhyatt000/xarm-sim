@@ -29,11 +29,11 @@ Three teachers (``--teacher``):
 
 Two loss schemes (``--loss``), orthogonal to the obs mode:
 - ``mse``: per-step regression (the students above, unchanged).
-- ``flow`` (image student, v9): rectified-flow matching over a ``--chunk``-step
-  plan of absolute joint actions, executed receding-horizon (``--replan``).
-  Chunk labels are the per-step teacher labels stitched along the visited
-  trajectory (an approximation under beta-mixing); the gripper stays a smooth
-  [0, 1] value.
+- ``flow`` (state or image student): rectified-flow matching over a
+  ``--chunk``-step plan of absolute joint actions, executed receding-horizon
+  (``--replan``). Chunk labels are the per-step teacher labels stitched along
+  the visited trajectory (an approximation under beta-mixing); the gripper
+  stays a smooth [0, 1] value.
 
     uv run python scripts/simpledagger.py --n-envs 4096 --batch-size 4096
     uv run python scripts/simpledagger.py --policy image --teacher mlp:outputs/dagger/b4096-v7/best.pt
@@ -63,10 +63,10 @@ import tyro
 from rich import print
 
 from xsim.algo import (
-    Collector, Distributed, FlowImageStudent, ImageStudent, MLPTeacher,
-    Student, image_proprio_keys, rand_shift,
+    Collector, Distributed, FKChain, FlowImageStudent, FlowStateStudent,
+    ImageStudent, MLPTeacher, Student, image_proprio_keys, rand_shift,
 )
-from xsim.data import MemmapDataset, read_key
+from xsim.data import AugmentedDataset, MemmapDataset, read_key, sim2real_transform
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -99,6 +99,18 @@ class Config:
     # per-round cosine decay lr -> lr_final: late rounds (largest dataset, best
     # policy) take refining steps instead of reshaping ones
     lr_final: float = 1e-4
+    # state mode: replace the global across-rounds cosine with a per-step cosine
+    # that restarts every round (warm restart). Each round starts at lr and
+    # decays to lr_final over its own steps_per_round, then the next round jumps
+    # back to lr. Off = the global across-rounds cosine above (byte-identical).
+    lr_restart_per_round: bool = False
+    # state mode: after each round's collection, dump the full in-RAM aggregate
+    # (concatenated per key) to <work_dir>/dataset.npz, overwritten each round.
+    save_dataset: bool = False
+    # state mode: train offline from a saved dataset.npz instead of collecting.
+    # Loaded once into the aggregate; each round skips collection/beta and just
+    # runs train_bc + evaluate + checkpoint over the fixed data.
+    offline_dataset: Path | None = None
     hidden_dim: int = 256
     # eval/checkpoint an EMA of the student: the live net swings round-to-round
     # (b4096-v3 eval oscillated 2%-82% at stable BC loss)
@@ -110,8 +122,17 @@ class Config:
     feat_dim: int = 64                # per-view feature size
     aux_pose_coef: float = 0.1        # aux cube pos+yaw loss weight (0 = off; sim-only supervision)
     grip_coef: float = 0.1            # BCE weight on the gripper logit (mse loss only; flow keeps grip continuous)
+    # FK-space auxiliary loss on the absolute-joint state student (state+mse only):
+    # add fk_coef * MSE(pos(FK(q_pred_arm)), pos(FK(q_target_arm))) so training
+    # optimizes TCP/task error, not just joint error (joint MSE misaligns the
+    # redundant 7-DOF arm: equal joint error -> wildly unequal pose error). Only
+    # the 7 arm dims go through FK; the gripper dim keeps its usual MSE. Skipped
+    # when --cartesian (pose actions, not joints) or --loss flow. 0 = off,
+    # byte-identical to the plain joint-MSE student.
+    fk_coef: float = 0.0
+    fk_rot_coef: float = 0.0          # extra weight on the EE rotation-matrix MSE (0 = position only)
     aug_pad: int = 4                  # DrQ random-shift padding, px (0 = off)
-    # loss scheme (orthogonal to --policy; flow currently rides the image student)
+    # loss scheme (orthogonal to --policy; flow rides the state or image student)
     loss: Literal["mse", "flow"] = "mse"
     chunk: int = 50                   # flow: action-chunk length (stitched teacher labels)
     replan: int = 10                  # flow: student actions executed per inference (<= chunk)
@@ -124,6 +145,12 @@ class Config:
     # B=1024 stride 1; point at the big NVMe, not /home)
     data_dir: Path = Path("/data/fast/xarm-dagger")
     num_workers: int = 8              # BC DataLoader workers (0 = main process)
+    # sim2real photometric augmentation (albumentations) on image-mode rgb, applied
+    # per view in the DataLoader workers via AugmentedDataset; geometry-preserving
+    # (no pixel warping) so proprio/aux labels stay valid. strength scales
+    # ranges/probs (1.0 = tuned defaults, 0.5 = gentle). 0 or --no-augs = off.
+    augs: bool = False
+    aug_strength: float = 1.0
     # legacy PNG background plates (scripts/make_plates.py); None = the arena's
     # own live splat compositing in render_views, which also covers the wrist cam
     plates_dir: Path | None = None
@@ -153,6 +180,20 @@ class Config:
     # the performance default: v7 (joints) 93% vs v6b (poses, quat-canonical) 73%
     # at equal budget.
     cartesian: bool = False
+    # delta-joint actions via DeltaActionWrapper: [-1,1]^(arm+1),
+    # target = clip(qpos + a*delta_max_rad, limits); gripper affine [-1,1]->[0,1].
+    # Mutually exclusive with --cartesian (both replace the absolute-joint space);
+    # the abs-vs-delta joint-control comparison point.
+    delta: bool = False
+    delta_max_rad: float = 0.10       # per-tick joint move at |a|=1 (wrapper + teacher share this)
+    # cartesian orientation mode (only meaningful with --cartesian): "fixed" pins
+    # the EE quat to a canonical top-down grasp and shrinks the action to 4-dim
+    # [x,y,z, g], dropping the quaternion double-cover multimodality that cost the
+    # quat-canonical run (73% vs 93% joints). "yaw" keeps the gripper top-down but
+    # adds one free yaw DOF (6-dim [x,y,z, c,s, g], (c,s) a smooth 2D half-yaw
+    # encoding), restoring face-alignment to a rotated cube that "fixed" cannot
+    # reach. "free" is the 8-dim pose action.
+    cartesian_orientation: Literal["free", "fixed", "yaw"] = "free"
     # IK backend for BOTH teacher-label generation and CartesianActionWrapper
     # execution (they share robot.ik). "genesis" = the built-in sample+DLS solver
     # (default, byte-identical to prior runs). "softcost" = the batched weighted
@@ -194,13 +235,21 @@ class Config:
     spp: int = 8
     video_max_width: int = 1280       # per-camera grid width cap, px
 
+    def __post_init__(self):
+        assert not (self.cartesian and self.delta), (
+            "--cartesian and --delta both replace the absolute-joint action space; "
+            "pick one"
+        )
+
 
 def build_env(cfg: Config, render: bool = False):
     import genesis as gs
 
     from xsim.suite import make
     from xsim.suite.renderers import BatchConfig, NyxConfig
-    from xsim.suite.wrappers import CartesianActionWrapper, GymWrapper, ImageObsWrapper
+    from xsim.suite.wrappers import (
+        CartesianActionWrapper, DeltaActionWrapper, GymWrapper, ImageObsWrapper,
+    )
 
     image = cfg.policy == "image"
     with_cams = render or image
@@ -230,7 +279,9 @@ def build_env(cfg: Config, render: bool = False):
     rm.ik_w_home, rm.ik_w_limit, rm.ik_w_manip = cfg.ik_w_home, cfg.ik_w_limit, cfg.ik_w_manip
     rm.ik_iters, rm.ik_sc_damping = cfg.ik_iters, cfg.ik_damping
     if cfg.cartesian:
-        env = CartesianActionWrapper(env)
+        env = CartesianActionWrapper(env, orientation=cfg.cartesian_orientation)
+    elif cfg.delta:
+        env = DeltaActionWrapper(env, max_delta_rad=cfg.delta_max_rad)
     if image:
         plates = None
         if cfg.plates_dir is not None:
@@ -266,7 +317,9 @@ def make_teacher(cfg: Config, env, device: torch.device):
         return LiftPolicy(base, steps_per_segment=cfg.steps_per_segment,
                           cartesian=cfg.cartesian)
     if cfg.teacher == "expert":
-        return LiftExpertPolicy(base, cartesian=cfg.cartesian)
+        return LiftExpertPolicy(base, cartesian=cfg.cartesian,
+                                cartesian_orientation=cfg.cartesian_orientation,
+                                delta=cfg.delta, max_delta_rad=cfg.delta_max_rad)
     if cfg.teacher.startswith("mlp:"):
         return MLPTeacher(Path(cfg.teacher[4:]), device)
     raise ValueError(f"unknown teacher {cfg.teacher!r}")
@@ -283,6 +336,12 @@ def make_collector(cfg: Config, store_root: Path | None,
 def build_student(cfg: Config, spec_or_env, device: torch.device):
     spec = spec_or_env if isinstance(spec_or_env, dict) else env_spec(cfg, spec_or_env)
     if cfg.policy == "state":
+        if cfg.loss == "flow":
+            return FlowStateStudent(
+                obs_dim=spec["obs_dim"], act_dim=spec["act_dim"], hidden=cfg.hidden_dim,
+                act_low=spec["act_low"], act_high=spec["act_high"],
+                chunk=cfg.chunk, flow_steps=cfg.flow_steps,
+            ).to(device)
         return Student(
             obs_dim=spec["obs_dim"], act_dim=spec["act_dim"], hidden=cfg.hidden_dim,
             act_low=spec["act_low"], act_high=spec["act_high"],
@@ -345,7 +404,47 @@ class Trainer:
         self.bc_step = 0  # optimizer steps across rounds (bc/step wandb axis)
         self._win: dict[str, float] = {}
         self._win_n = 0
+        self._fk_chain: FKChain | None = None
         self._start = time.time()
+
+    def _fk(self) -> FKChain:
+        """Lazily build (and cache) the differentiable FK chain to the arm EE
+        link, on the trainer device and dtype."""
+        if self._fk_chain is None:
+            self._fk_chain = FKChain(device=self.device, dtype=torch.float32)
+        return self._fk_chain
+
+    def _maybe_restart_lr(self, i: int) -> None:
+        """Per-round warm-restart LR (state mode): set the optimizer LR for step
+        ``i`` of this round to a within-round cosine from cfg.lr down to
+        cfg.lr_final over cfg.steps_per_round steps. No-op unless enabled, so the
+        global across-rounds cosine in train() stays byte-identical when off."""
+        cfg = self.cfg
+        if not cfg.lr_restart_per_round:
+            return
+        steps = cfg.steps_per_round
+        lr_i = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (
+            1.0 + math.cos(math.pi * i / max(1, steps - 1)))
+        for g in self.optim.param_groups:
+            g["lr"] = lr_i
+
+    def _save_dataset(self) -> None:
+        """Dump the current full state-mode aggregate (concatenated per key) to a
+        compressed npz at <work_dir>/dataset.npz, overwritten each round so it
+        always holds the latest full dataset (keys: obs, act, and chunk if flow).
+        Rank 0 only; no-op with an empty aggregate."""
+        if not self.dist.main or not self._chunks:
+            return
+        data = {k: np.concatenate(v) for k, v in self._chunks.items()}
+        np.savez_compressed(self.work_dir / "dataset.npz", **data)
+
+    def _load_dataset(self, path: Path) -> None:
+        """Load a saved state-mode aggregate into the in-RAM _chunks as one
+        concatenated float32 array per key (single-element list, so the existing
+        np.concatenate(self._chunks[k]) in the train loops still works)."""
+        with np.load(path) as npz:
+            self._chunks = {k: [npz[k].astype(np.float32, copy=True)]
+                            for k in npz.files}
 
     def log(self, kind: str, d: dict) -> None:
         if not self.dist.main:
@@ -400,7 +499,7 @@ class Trainer:
 
     def train_bc(self) -> dict:
         if not self.image:
-            return self._train_bc_state()
+            return self._train_bc_state_flow() if self.flow else self._train_bc_state()
         return self._train_bc_flow() if self.flow else self._train_bc_image()
 
     def _train_bc_state(self) -> dict:
@@ -408,30 +507,120 @@ class Trainer:
         X = torch.from_numpy(np.concatenate(self._chunks["obs"])).to(self.device)
         Y = torch.from_numpy(np.concatenate(self._chunks["act"])).to(self.device)
         self._freeze_stats(X)
+        # FK-space aux loss only on the absolute-joint student: pose actions
+        # (--cartesian) aren't joints, so FK(action[:7]) would be meaningless.
+        fk_on = cfg.fk_coef > 0.0 and not cfg.cartesian
+        fk = self._fk() if fk_on else None
         n = X.shape[0]
         perm, pos = torch.randperm(n, device=self.device), 0
-        losses = []
-        for _ in range(cfg.steps_per_round):
+        losses, fk_losses = [], []
+        for i in range(cfg.steps_per_round):
+            self._maybe_restart_lr(i)
             if pos + cfg.batch_size > n:  # reshuffle when the shard is exhausted
                 perm, pos = torch.randperm(n, device=self.device), 0
             idx = perm[pos : pos + cfg.batch_size]
             pos += cfg.batch_size
-            loss = F.mse_loss(self.net(X[idx]), Y[idx])
+            pred, yb = self.net(X[idx]), Y[idx]
+            joint_mse = F.mse_loss(pred, yb)  # joint (+ gripper) MSE, unchanged
+            loss, lv, fkv = joint_mse, joint_mse.item(), 0.0
+            if fk_on:
+                na = fk.n_joints  # 7 arm dims; the gripper dim keeps plain MSE
+                m_pred = fk.matrix(pred[:, :na])
+                with torch.no_grad():  # target q is data, no grad needed
+                    m_tgt = fk.matrix(yb[:, :na])
+                fk_loss = F.mse_loss(m_pred[:, :3, 3], m_tgt[:, :3, 3])  # TCP position
+                if cfg.fk_rot_coef > 0.0:  # EE orientation (rotation-matrix MSE)
+                    fk_loss = fk_loss + cfg.fk_rot_coef * F.mse_loss(
+                        m_pred[:, :3, :3], m_tgt[:, :3, :3])
+                loss = joint_mse + cfg.fk_coef * fk_loss
+                fkv = fk_loss.item()
             loss.backward()
             self.optim.step()
             self.optim.zero_grad(set_to_none=True)
             self._ema_update()
-            lv = loss.item()
-            self._step_metrics({"bc_loss": lv})
+            self._step_metrics({"bc_loss": lv, **({"fk_loss": fkv} if fk_on else {})})
             losses.append(lv)
+            if fk_on:
+                fk_losses.append(fkv)
         samples = int(self.dist.mean(float(n)) * self.dist.world)
-        return {"samples": samples,
-                "bc_loss": self.dist.mean(float(np.mean(losses)))}
+        out = {"samples": samples,
+               "bc_loss": self.dist.mean(float(np.mean(losses)))}
+        if fk_on:
+            out["fk_loss"] = self.dist.mean(float(np.mean(fk_losses)))
+        return out
+
+    def _train_bc_state_flow(self) -> dict:
+        """State trunk + rectified-flow chunk head, trained from the in-RAM
+        aggregate. Targets are the stitched (chunk, act_dim) teacher labels the
+        collector built along each visited trajectory (mirrors the image-flow
+        path, minus rgb/aux); act stats normalize the flow space."""
+        cfg = self.cfg
+        X = torch.from_numpy(np.concatenate(self._chunks["obs"])).to(self.device)
+        Y = torch.from_numpy(np.concatenate(self._chunks["chunk"])).to(self.device)
+        A = torch.from_numpy(np.concatenate(self._chunks["act"])).to(self.device)
+        self._freeze_stats(X)
+        if not self._act_stats_set:
+            self.student.set_act_stats(*self.dist.obs_stats(A))
+            self._act_stats_set = True
+        # FK-space aux loss, same as the MSE path but on the de-normalized flow
+        # endpoint chunk: pose actions (--cartesian) aren't joints, so FK is off.
+        fk_on = cfg.fk_coef > 0.0 and not cfg.cartesian
+        fk = self._fk() if fk_on else None
+        n = X.shape[0]
+        perm, pos = torch.randperm(n, device=self.device), 0
+        sums = {"flow_loss": 0.0, "a0_mse": 0.0, **({"fk_loss": 0.0} if fk_on else {})}
+        for i in range(cfg.steps_per_round):
+            self._maybe_restart_lr(i)
+            if pos + cfg.batch_size > n:  # reshuffle when the shard is exhausted
+                perm, pos = torch.randperm(n, device=self.device), 0
+            idx = perm[pos : pos + cfg.batch_size]
+            pos += cfg.batch_size
+            xb, yb = X[idx], Y[idx]
+            b = xb.shape[0]
+            a = ((yb - self.student.act_mean) / self.student.act_std).reshape(b, -1)
+            eps = torch.randn_like(a)
+            t = torch.rand(b, 1, device=self.device)
+            x_t = (1.0 - t) * eps + t * a
+            x1_pred, h = self.net(xb, x_t, t)
+            fm = F.mse_loss(x1_pred, a)  # endpoint (x1) prediction, not velocity
+            loss, fkv = fm, 0.0
+            if fk_on:
+                na = fk.n_joints  # 7 arm dims; the gripper dim keeps flow MSE only
+                # de-normalize the endpoint chunk back to real action units so FK
+                # sees joint radians, not the normalized flow space.
+                pred = (x1_pred.reshape_as(yb) * self.student.act_std
+                        + self.student.act_mean)
+                m_pred = fk.matrix(pred[..., :na].reshape(-1, na))
+                with torch.no_grad():  # target q is data (yb already real units)
+                    m_tgt = fk.matrix(yb[..., :na].reshape(-1, na))
+                fk_loss = F.mse_loss(m_pred[:, :3, 3], m_tgt[:, :3, 3])  # TCP position
+                if cfg.fk_rot_coef > 0.0:  # EE orientation (rotation-matrix MSE)
+                    fk_loss = fk_loss + cfg.fk_rot_coef * F.mse_loss(
+                        m_pred[:, :3, :3], m_tgt[:, :3, :3])
+                loss = fm + cfg.fk_coef * fk_loss
+                fkv = fk_loss.item()
+            loss.backward()
+            self.optim.step()
+            self.optim.zero_grad(set_to_none=True)
+            self._ema_update()
+            with torch.no_grad():  # diagnostic comparable to mse bc_loss
+                a0 = self.student.sample(h.detach())[:, 0]
+                a0_mse = F.mse_loss(a0, yb[:, 0]).item()
+            vals = {"flow_loss": fm.item(), "a0_mse": a0_mse,
+                    **({"fk_loss": fkv} if fk_on else {})}
+            self._step_metrics(vals)
+            for k, v in vals.items():
+                sums[k] += v
+        stats = {k: self.dist.mean(v / cfg.steps_per_round) for k, v in sums.items()}
+        samples = int(self.dist.mean(float(n)) * self.dist.world)
+        return {"samples": samples, **stats}
 
     def _train_bc_image(self) -> dict:
         cfg = self.cfg
         self.collector.store.flush()
         ds = MemmapDataset(self.store_root, ("rgb", "prop", "act", "aux"))
+        if cfg.augs:
+            ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
         if not self._stats_set:
             self._freeze_stats(torch.from_numpy(
                 np.asarray(read_key(self.store_root, "prop"))).to(self.device))
@@ -483,6 +672,8 @@ class Trainer:
         cfg = self.cfg
         self.collector.store.flush()
         ds = MemmapDataset(self.store_root, ("rgb", "prop", "chunk", "aux"))
+        if cfg.augs:
+            ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
         if not self._stats_set:
             self._freeze_stats(torch.from_numpy(
                 np.asarray(read_key(self.store_root, "prop"))).to(self.device))
@@ -521,8 +712,8 @@ class Trainer:
                 eps = torch.randn_like(a)
                 t = torch.rand(n, 1, device=self.device)
                 x_t = (1.0 - t) * eps + t * a
-                v_pred, aux, h = self.net(x, prop, x_t, t)
-                fm = F.mse_loss(v_pred, a - eps)
+                x1_pred, aux, h = self.net(x, prop, x_t, t)
+                fm = F.mse_loss(x1_pred, a)  # endpoint (x1) prediction, not velocity
                 aux_l = F.mse_loss(aux, aux_y)
                 loss = fm + cfg.aux_pose_coef * aux_l
                 loss.backward()
@@ -569,16 +760,28 @@ class Trainer:
 
     def train(self) -> None:
         cfg = self.cfg
+        # offline (state mode): load the fixed dataset once, skip collection/beta
+        offline = cfg.offline_dataset is not None and not self.image
+        if offline:
+            self._load_dataset(cfg.offline_dataset)
         for rnd in range(cfg.rounds):
-            beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
-            frac = rnd / max(1, cfg.rounds - 1)
-            lr = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (1.0 + math.cos(math.pi * frac))
-            for g in self.optim.param_groups:
-                g["lr"] = lr
-            for _ in range(cfg.episodes_per_round):
-                stats = self._rollouts(beta=beta, record=True, student=self.student,
-                                       seed=cfg.seed + rnd if rnd == 0 else None)
-                self.log("collect", {"round": rnd, "beta": beta, **stats})
+            if cfg.lr_restart_per_round:
+                # base lr is cfg.lr; the within-round cosine down to lr_final is
+                # applied per step in _maybe_restart_lr, restarting each round.
+                lr = cfg.lr
+            else:
+                frac = rnd / max(1, cfg.rounds - 1)
+                lr = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (1.0 + math.cos(math.pi * frac))
+                for g in self.optim.param_groups:
+                    g["lr"] = lr
+            if not offline:
+                beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
+                for _ in range(cfg.episodes_per_round):
+                    stats = self._rollouts(beta=beta, record=True, student=self.student,
+                                           seed=cfg.seed + rnd if rnd == 0 else None)
+                    self.log("collect", {"round": rnd, "beta": beta, **stats})
+                if cfg.save_dataset and not self.image:
+                    self._save_dataset()
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate(rnd)
             self.log("eval", {"round": rnd, **eval_metrics})
