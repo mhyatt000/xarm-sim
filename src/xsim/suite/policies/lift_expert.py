@@ -4,11 +4,15 @@
 countdown, so its label at a given instant depends on hidden schedule state —
 unfittable for a student that only sees the instantaneous observation (img-v8:
 round-0 BC loss 1000x the mlp-teacher baseline). This expert keeps the same
-grasp geometry (above -> at -> close -> lift -> hold, face-aligned yaw) but
+grasp geometry (above -> at -> close -> lift -> release, face-aligned yaw) but
 derives each env's phase every tick from the measured world state, tracking
 the *live* cube pose. Labels are a function of state by construction, the plan
 waits for the arm under beta-mixing, and a fumbled cube demotes the phase, so
-the aggregate collects recovery corrections instead of schedule garbage.
+the aggregate collects recovery corrections instead of schedule garbage. After
+a completed lift the expert releases at height (env success fires mid-LIFT at
+5cm, so eval is unaffected); the drop demotes the env back to APPROACH, so
+fixed-horizon rollouts cycle grasp -> lift -> drop -> re-grasp instead of
+logging redundant hover states.
 
 Residual hidden state is only a per-env close-attempt counter (abort a grasp
 that isn't seating) — tiny and strongly state-correlated.
@@ -33,7 +37,7 @@ from xsim.suite.policies.waypoint import (
 if TYPE_CHECKING:
     from xsim.suite.environments.manipulation.lift import Lift
 
-APPROACH, DESCEND, CLOSE, LIFT, HOLD = range(5)
+APPROACH, DESCEND, CLOSE, LIFT, RELEASE = range(5)
 
 
 def side_grasp_quats(cube_yaw: np.ndarray, ref_quat: np.ndarray) -> np.ndarray:
@@ -154,13 +158,15 @@ class LiftExpertPolicy:
         # fingers need travel time: a grasp only counts once the dwell has run
         # and the norm sits in the gripping band (not still sweeping through it)
         p[(p == CLOSE) & held & (self._close_ticks >= self.close_ticks_min)] = LIFT
-        p[(p == LIFT) & held & (ee[:, 2] > lift_z - self.tol_z)] = HOLD
+        p[(p == LIFT) & held & (ee[:, 2] > lift_z - self.tol_z)] = RELEASE
         self._close_ticks[starting_close | abort] = 0
         self._close_ticks[p == CLOSE] += 1
 
         z = np.choose(p, [grasp_z + APPROACH_HEIGHT, grasp_z, grasp_z, lift_z, lift_z])
         target = np.concatenate([cube_xy, z[:, None]], axis=1)
-        grip = np.where(p >= CLOSE, GRIPPER_CLOSED, GRIPPER_OPEN)
+        # RELEASE opens at height: the dropped cube's bounce diversifies re-grasp
+        # poses, and the existing ~held demotion recycles the env to APPROACH
+        grip = np.where((p >= CLOSE) & (p != RELEASE), GRIPPER_CLOSED, GRIPPER_OPEN)
 
         delta = target - ee
         dist = np.linalg.norm(delta, axis=1, keepdims=True)
