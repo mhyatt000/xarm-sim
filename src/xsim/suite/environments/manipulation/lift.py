@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from xsim.suite.environments.manipulation.manipulation_env import ManipulationEnv
-from xsim.suite.models import BoxObject, TableArena, Task
+from xsim.suite.models import BoxObject, TableArena, TableEZ, Task
 from xsim.suite.utils import UniformRandomSampler
 
 
@@ -21,6 +21,8 @@ class Lift(ManipulationEnv):
     hand) from a brisk transport (cube moving with the hand), so the hold-tick
     count no longer has to do that job.
     """
+
+    arena_class: type[TableArena] = TableArena
 
     def __init__(
         self,
@@ -53,7 +55,7 @@ class Lift(ManipulationEnv):
         self._success_hold = np.zeros(self.n_envs, dtype=np.int64)
 
     def _load_model(self) -> None:
-        self.arena = TableArena(randomize_cameras=self.randomize_cameras)
+        self.arena = self.arena_class(randomize_cameras=self.randomize_cameras)
         s = self.cube_size
         self.cube = BoxObject(
             "cube", size=(s, s, s), color=self.cube_color, friction=2.0
@@ -128,3 +130,20 @@ class Lift(ManipulationEnv):
 
     def _check_terminated(self) -> np.ndarray:
         return self._check_success()
+
+
+class LiftEZ(Lift):
+    """Lift on the easier TableEZ arena: cameras sampled in 10 cm balls around
+    the calibrated rig, cube spawn narrowed to |y| <= 3 in (x unchanged), and
+    the arm always starts at HOME (``init_tcp_box`` is forced off)."""
+
+    arena_class = TableEZ
+
+    def __init__(
+        self,
+        robots: str | list[str] = "XArm7",
+        y_range: tuple[float, float] = (-0.0762, 0.0762),
+        **kwargs,
+    ):
+        kwargs["init_tcp_box"] = None
+        super().__init__(robots=robots, y_range=y_range, **kwargs)

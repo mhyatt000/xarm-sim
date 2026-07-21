@@ -111,6 +111,51 @@ class MountSampler(CamSampler):
 
 
 @dataclass(frozen=True, kw_only=True)
+class BallLookatSampler(CamSampler):
+    """Positions uniform in a solid ball around ``center``, lookats in a box.
+
+    Small-perturbation counterpart of :class:`ShellLookatSampler`: instead of
+    covering a workspace-sized shell, the camera stays within ``radius`` of a
+    known-good placement. Near-horizontal view rays are rejected the same way.
+    """
+
+    center: tuple[float, float, float]
+    radius: float
+    lookat_lo: tuple[float, float, float]
+    lookat_hi: tuple[float, float, float]
+    min_elevation_deg: float = 8.0
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        center = np.asarray(self.center, dtype=np.float64)
+        la_lo = np.asarray(self.lookat_lo, dtype=np.float64)
+        la_hi = np.asarray(self.lookat_hi, dtype=np.float64)
+
+        pos = np.empty((n, 3))
+        lookat = np.empty((n, 3))
+        filled = 0
+        while filled < n:
+            m = max(2 * (n - filled), 256)
+            # uniform in the ball: unit direction times cbrt-distributed radius
+            b = rng.normal(size=(m, 3))
+            b /= np.linalg.norm(b, axis=1, keepdims=True)
+            b *= np.cbrt(rng.uniform(size=(m, 1)))
+            p = center + self.radius * b
+            la = rng.uniform(la_lo, la_hi, size=(m, 3))
+            d = p - la
+            elev = np.degrees(np.arcsin(d[:, 2] / np.linalg.norm(d, axis=1)))
+            keep = elev >= self.min_elevation_deg
+            p, la = p[keep], la[keep]
+            take = min(len(p), n - filled)
+            pos[filled : filled + take] = p[:take]
+            lookat[filled : filled + take] = la[:take]
+            filled += take
+        up = np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
+        return pos, lookat, up
+
+
+@dataclass(frozen=True, kw_only=True)
 class ShellLookatSampler(CamSampler):
     """Positions in a chopped-sphere shell around the origin, lookats in a box.
 

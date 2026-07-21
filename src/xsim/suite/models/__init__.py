@@ -1,4 +1,4 @@
-from xsim.suite.models.arenas import Arena, TableArena
+from xsim.suite.models.arenas import Arena, TableArena, TableEZ
 from xsim.suite.models.cameras import CameraSpec, SplatAsset, look_offset_T, view_from_c2w_cv
 from xsim.suite.models.grippers import GripperModel, gripper_factory
 from xsim.suite.models.mounts import Mount, VMount4040
@@ -18,6 +18,7 @@ __all__ = [
     "RobotModel",
     "SplatAsset",
     "TableArena",
+    "TableEZ",
     "Task",
     "VMount4040",
     "XArm7",

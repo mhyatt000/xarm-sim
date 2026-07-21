@@ -18,13 +18,14 @@ New tasks subclass :class:`ManipulationEnv` and implement the hooks; they are
 auto-registered and constructed via :func:`make`.
 """
 
-from xsim.suite.environments import Lift, ManipulationEnv, RobotEnv
+from xsim.suite.environments import Lift, LiftEZ, ManipulationEnv, RobotEnv
 from xsim.suite.environments.base import REGISTERED_ENVS, GenesisEnv, make
 
 __all__ = [
     "REGISTERED_ENVS",
     "GenesisEnv",
     "Lift",
+    "LiftEZ",
     "ManipulationEnv",
     "RobotEnv",
     "make",

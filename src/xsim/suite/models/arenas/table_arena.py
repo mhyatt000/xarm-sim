@@ -10,7 +10,7 @@ import genesis as gs
 import numpy as np
 
 from xsim.suite.models.arenas.arena import Arena
-from xsim.suite.models.cam_space import ShellLookatSampler
+from xsim.suite.models.cam_space import BallLookatSampler, ShellLookatSampler
 from xsim.suite.models.cameras import CameraSpec, SplatAsset, view_from_c2w_cv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[5]
@@ -82,21 +82,26 @@ class TableArena(Arena):
                 if any(c.name == spec.name for c in self.cameras):
                     self.set_camera(self.cam_sampler(spec.name))
 
+    def _lookat_box(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """(lo, hi) lookat bounds covering the cube spawn region."""
+        cx = self.center_xy[0]
+        return (cx - 0.15, -0.15, self.top_z + 0.01), (cx + 0.15, 0.15, self.top_z + 0.20)
+
     def cam_sampler(self, name: str = "rand", fov_deg: float = LOGITECH_FOV_DEG) -> ShellLookatSampler:
         """Pose sampler bounded by the calibrated rig: sphere through the
         farthest rig camera plus 10% headroom, floored at the table top, capped
         at the highest rig camera; the -1 ft x floor keeps cameras out of the
         wall behind the robot. Lookats cover the cube spawn region."""
         cam_pos = [np.asarray(c.pos) for c in _TABLE_CAMERAS]
-        cx = self.center_xy[0]
+        lookat_lo, lookat_hi = self._lookat_box()
         return ShellLookatSampler(
             name=name,
             fov_deg=fov_deg,
             radius=1.1 * max(float(np.linalg.norm(p)) for p in cam_pos),
             x_range=(-0.3048, max(float(p[0]) for p in cam_pos)),
             z_range=(self.top_z, max(float(p[2]) for p in cam_pos)),
-            lookat_lo=(cx - 0.15, -0.15, self.top_z + 0.01),
-            lookat_hi=(cx + 0.15, 0.15, self.top_z + 0.20),
+            lookat_lo=lookat_lo,
+            lookat_hi=lookat_hi,
         )
 
     def add_to(self, scene: gs.Scene) -> None:
@@ -125,3 +130,26 @@ class TableArena(Arena):
                 ),
                 surface=surface,
             )
+
+
+@dataclass
+class TableEZ(TableArena):
+    """TableArena with tame camera randomization: each rig camera is sampled
+    in a small ball around its calibrated position instead of the workspace
+    shell. Lookats are unchanged."""
+
+    cam_radius: float = 0.10
+
+    def cam_sampler(self, name: str = "low", fov_deg: float = LOGITECH_FOV_DEG) -> BallLookatSampler:
+        centers = {c.name: tuple(c.pos) for c in _TABLE_CAMERAS}
+        if name not in centers:
+            raise ValueError(f"no calibrated rig camera {name!r}; have {sorted(centers)}")
+        lookat_lo, lookat_hi = self._lookat_box()
+        return BallLookatSampler(
+            name=name,
+            fov_deg=fov_deg,
+            center=centers[name],
+            radius=self.cam_radius,
+            lookat_lo=lookat_lo,
+            lookat_hi=lookat_hi,
+        )
