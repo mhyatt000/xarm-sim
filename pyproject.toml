@@ -51,6 +51,7 @@ dependencies = [
     "zarr>=3.1.6",
     "gsplat>=1.4.0",
     "wandb>=0.28.1",
+    "albumentations>=2.0.8",
 ]
 
 [dependency-groups]
