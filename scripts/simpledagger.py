@@ -153,6 +153,23 @@ class Config:
     # the performance default: v7 (joints) 93% vs v6b (poses, quat-canonical) 73%
     # at equal budget.
     cartesian: bool = False
+    # IK backend for BOTH teacher-label generation and CartesianActionWrapper
+    # execution (they share robot.ik). "genesis" = the built-in sample+DLS solver
+    # (default, byte-identical to prior runs). "softcost" = the batched weighted
+    # soft-cost Gauss-Newton/LM solver (Robot.ik_softcost) that resolves the
+    # redundant 7-DOF null space toward HOME, making EE-pose -> joint-target a
+    # near-single-valued continuous map (canonical, branch-stable joint labels).
+    ik_backend: Literal["genesis", "softcost"] = "genesis"
+    # softcost cost-block weights (only used when ik_backend="softcost"): pose
+    # tracking dominates, home is a gentle regularizer, firm limit barrier, manip
+    # off. Threaded onto the robot model in build_env.
+    ik_w_pos: float = 4.0
+    ik_w_rot: float = 2.0
+    ik_w_home: float = 0.01
+    ik_w_limit: float = 1.0
+    ik_w_manip: float = 0.0
+    ik_iters: int = 25
+    ik_damping: float = 0.01          # softcost LM lambda (normal-eqn diagonal)
     # cube spawn: x 200-400mm, y +-1ft minus the cube half-extent (table is
     # exactly 2ft wide, y +-0.3048; +-0.288 keeps the 1.25in cube fully on it)
     cube_x_range: tuple[float, float] = (0.20, 0.40)
@@ -205,6 +222,13 @@ def build_env(cfg: Config, render: bool = False):
         control_freq=cfg.control_freq,
         noslip_iterations=cfg.noslip_iterations,
     )
+    # thread the IK backend + soft-cost weights onto the robot model so BOTH the
+    # teacher (robot.ik in format_action) and CartesianActionWrapper share it.
+    rm = env.robots[0].model
+    rm.ik_backend = cfg.ik_backend
+    rm.ik_w_pos, rm.ik_w_rot = cfg.ik_w_pos, cfg.ik_w_rot
+    rm.ik_w_home, rm.ik_w_limit, rm.ik_w_manip = cfg.ik_w_home, cfg.ik_w_limit, cfg.ik_w_manip
+    rm.ik_iters, rm.ik_sc_damping = cfg.ik_iters, cfg.ik_damping
     if cfg.cartesian:
         env = CartesianActionWrapper(env)
     if image:
