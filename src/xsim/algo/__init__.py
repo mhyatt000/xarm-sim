@@ -6,7 +6,6 @@ vendored GC/tdmpc agents, in xsim.suite.algo pending migration).
 
 from __future__ import annotations
 
-from xsim.algo.augs import AugmentedDataset, sim2real_transform
 from xsim.algo.dagger import (
     Collector,
     MLPTeacher,
@@ -24,7 +23,6 @@ from xsim.algo.nets import (
 )
 
 __all__ = [
-    "AugmentedDataset",
     "Collector",
     "Distributed",
     "FlowImageStudent",
@@ -35,6 +33,5 @@ __all__ = [
     "flat",
     "image_proprio_keys",
     "rand_shift",
-    "sim2real_transform",
     "time_features",
 ]
