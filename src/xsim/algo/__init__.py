@@ -14,8 +14,10 @@ from xsim.algo.dagger import (
     image_proprio_keys,
 )
 from xsim.algo.distributed import Distributed
+from xsim.algo.fk import FKChain
 from xsim.algo.nets import (
     FlowImageStudent,
+    FlowStateStudent,
     ImageStudent,
     Student,
     rand_shift,
@@ -25,7 +27,9 @@ from xsim.algo.nets import (
 __all__ = [
     "Collector",
     "Distributed",
+    "FKChain",
     "FlowImageStudent",
+    "FlowStateStudent",
     "ImageStudent",
     "MLPTeacher",
     "Student",

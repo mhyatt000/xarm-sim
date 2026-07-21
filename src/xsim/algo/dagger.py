@@ -83,9 +83,7 @@ class Collector:
         self.image = cfg.policy == "image"
         self.flow = cfg.loss == "flow"
         if self.flow:
-            if not self.image:
-                raise ValueError("loss='flow' currently rides the image student")
-            if cfg.frame_stride != 1:
+            if self.image and cfg.frame_stride != 1:
                 raise ValueError("flow chunk labels need every step: frame_stride=1")
             if not 1 <= cfg.replan <= cfg.chunk:
                 raise ValueError("need 1 <= replan <= chunk")
@@ -134,14 +132,20 @@ class Collector:
         """Stitched chunk labels: for each recorded row (env e live at tick t),
         the next ``chunk`` per-step teacher labels along the visited trajectory,
         the final pre-death label repeated past episode end (hold pose). Rows
-        append in _record's tick-major live-masked order, so chunk.bin stays
-        row-aligned with rgb.bin. acts: (T, B, A); lives: (T, B)."""
+        append in _record's tick-major live-masked order, so chunk labels stay
+        row-aligned with the obs (image: chunk.bin with rgb.bin on disk; state:
+        the RAM ``chunk`` list with ``obs``). acts: (T, B, A); lives: (T, B)."""
         last = lives.sum(axis=0) - 1  # (B,) each env's final live tick
         ar = np.arange(self.cfg.chunk)
         for t in range(acts.shape[0]):
             envs = np.flatnonzero(lives[t])
             idx = np.minimum(t + ar[None, :], last[envs, None])  # (n_live, chunk)
-            self.store.append("chunk", acts[idx, envs[:, None]])
+            labels = acts[idx, envs[:, None]]  # (n_live, chunk, A)
+            if self.store is not None:
+                self.store.append("chunk", labels)
+            else:
+                self._chunks.setdefault("chunk", []).append(
+                    labels.astype(np.float32, copy=True))
 
     def rollout(self, beta: float, record: bool, student: nn.Module,
                 seed: int | None = None, video_path: Path | None = None) -> dict:

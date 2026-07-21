@@ -146,28 +146,29 @@ def time_features(t: torch.Tensor) -> torch.Tensor:
     return torch.cat([ang.sin(), ang.cos()], dim=-1)
 
 
-class FlowImageStudent(ImageStudent):
-    """ImageStudent trunk + a rectified-flow head over a ``chunk``-step plan.
+class _FlowHead:
+    """Rectified-flow chunk head shared by the image and state flow students.
 
-    ``vel_net`` predicts the denoising velocity field v(x_t, t | h) in
-    normalized action-chunk space — the straight noise->data direction of
-    rectified flow, not joint-space velocity. act() Euler-integrates it from
-    N(0, I) and returns a (B, chunk, act_dim) plan of absolute joint targets;
-    the gripper stays a smooth [0, 1] value (clamped, never thresholded).
-    Action normalization stats live in buffers so a checkpoint stays
-    self-contained.
+    ``flow_net`` predicts the clean action chunk x1 (the flow-path endpoint) in
+    normalized action-chunk space, conditioned on the noised chunk x_t, the flow
+    time t, and the trunk hidden ``h`` — endpoint (x1) prediction, not velocity
+    prediction. The two parametrize the same noise->data probability-flow ODE,
+    but the velocity target (a - eps) carries irreducible eps-noise that is
+    stiff to fit near t=1 and collapses training to the chunk mean; the endpoint
+    target is the clean chunk, so it fits like a plain regression. sample()
+    Euler-integrates the induced velocity (x1 - x)/(1 - t) from N(0, I) and
+    returns a (B, chunk, act_dim) plan of absolute joint targets; the gripper
+    stays a smooth [0, 1] value (clamped, never thresholded). Action
+    normalization stats live in buffers so a checkpoint stays self-contained.
+    Mixed into a student that already owns ``act_low`` / ``act_high`` buffers
+    and supplies the trunk hidden vector ``h``.
     """
 
-    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
-                 act_low: np.ndarray, act_high: np.ndarray,
-                 encoder: str = "shared", hidden: int = 256, feat_dim: int = 64,
-                 chunk: int = 50, flow_steps: int = 10):
-        super().__init__(proprio_dim, act_dim, n_views, hw, act_low, act_high,
-                         encoder, hidden, feat_dim)
-        del self.head  # the flow head replaces the direct regression head
+    def _build_flow_head(self, hidden: int, act_dim: int,
+                         chunk: int, flow_steps: int) -> None:
         self.chunk, self.flow_steps, self.act_dim = chunk, flow_steps, act_dim
         d = chunk * act_dim
-        self.vel_net = nn.Sequential(
+        self.flow_net = nn.Sequential(
             nn.Linear(hidden + d + 16, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, d),
@@ -179,17 +180,10 @@ class FlowImageStudent(ImageStudent):
         self.act_mean.copy_(mean)
         self.act_std.copy_(std.clamp_min(1e-6))
 
-    def velocity(self, h: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """h: (N, hidden); x: (N, chunk*act_dim) normalized; t: (N, 1)."""
-        return self.vel_net(torch.cat([h, x, time_features(t)], dim=-1))
-
-    def forward(self, rgb: torch.Tensor, prop: torch.Tensor,
-                x_t: torch.Tensor, t: torch.Tensor):
-        """Training forward: one call touches every parameter, so the DDP wrap
-        syncs gradients (calling features/velocity on the raw module would
-        bypass it). Returns (v_pred, aux_pred, h)."""
-        h = self.features(rgb, prop)
-        return self.velocity(h, x_t, t), self.aux_head(h), h
+    def predict_x1(self, h: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predicted clean chunk x1 given the noised chunk x_t and time t.
+        h: (N, hidden); x: (N, chunk*act_dim) normalized; t: (N, 1)."""
+        return self.flow_net(torch.cat([h, x, time_features(t)], dim=-1))
 
     def sample(self, h: torch.Tensor) -> torch.Tensor:
         """Integrate noise -> plan; returns (N, chunk, act_dim) in action units."""
@@ -198,9 +192,36 @@ class FlowImageStudent(ImageStudent):
         dt = 1.0 / self.flow_steps
         for k in range(self.flow_steps):
             t = torch.full((n, 1), k * dt, device=h.device)
-            x = x + dt * self.velocity(h, x, t)
+            # velocity of the linear path from the endpoint estimate; the last
+            # step (t = 1 - dt) lands exactly on x1, so 1 - t stays >= dt > 0
+            x = x + dt * (self.predict_x1(h, x, t) - x) / (1.0 - k * dt)
         a = x.reshape(n, self.chunk, self.act_dim) * self.act_std + self.act_mean
         return a.clamp(self.act_low, self.act_high)
+
+
+class FlowImageStudent(_FlowHead, ImageStudent):
+    """ImageStudent trunk + the rectified-flow chunk head (see ``_FlowHead``).
+
+    act() returns a (B, chunk, act_dim) plan the collector executes
+    receding-horizon.
+    """
+
+    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
+                 act_low: np.ndarray, act_high: np.ndarray,
+                 encoder: str = "shared", hidden: int = 256, feat_dim: int = 64,
+                 chunk: int = 50, flow_steps: int = 10):
+        super().__init__(proprio_dim, act_dim, n_views, hw, act_low, act_high,
+                         encoder, hidden, feat_dim)
+        del self.head  # the flow head replaces the direct regression head
+        self._build_flow_head(hidden, act_dim, chunk, flow_steps)
+
+    def forward(self, rgb: torch.Tensor, prop: torch.Tensor,
+                x_t: torch.Tensor, t: torch.Tensor):
+        """Training forward: one call touches every parameter, so the DDP wrap
+        syncs gradients (calling features/predict_x1 on the raw module would
+        bypass it). Returns (x1_pred, aux_pred, h)."""
+        h = self.features(rgb, prop)
+        return self.predict_x1(h, x_t, t), self.aux_head(h), h
 
     @torch.no_grad()
     def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
@@ -209,3 +230,40 @@ class FlowImageStudent(ImageStudent):
         x = torch.from_numpy(np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
         p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
         return self.sample(self.features(x, p)).cpu().numpy()
+
+
+class FlowStateStudent(_FlowHead, Student):
+    """State-obs MLP trunk + the rectified-flow chunk head (see ``_FlowHead``).
+
+    The same flow head as ``FlowImageStudent``, but fed by an MLP over the flat
+    privileged state instead of the CNN+proprio trunk. act() returns a
+    (B, chunk, act_dim) plan of absolute joint targets the collector executes
+    receding-horizon — identical surface to the image flow student minus rgb.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int,
+                 act_low: np.ndarray, act_high: np.ndarray,
+                 chunk: int = 50, flow_steps: int = 10):
+        super().__init__(obs_dim, act_dim, hidden, act_low, act_high)
+        del self.net  # the flow trunk + head replace the direct regression net
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        self._build_flow_head(hidden, act_dim, chunk, flow_steps)
+
+    def features(self, obs: torch.Tensor) -> torch.Tensor:
+        """obs: (N, obs_dim) raw -> (N, hidden) trunk features."""
+        return self.trunk((obs - self.obs_mean) / self.obs_std)
+
+    def forward(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor):
+        """Training forward (one call touches every parameter for DDP).
+        Returns (x1_pred, h)."""
+        h = self.features(obs)
+        return self.predict_x1(h, x_t, t), h
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        device = self.obs_mean.device
+        x = torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device)
+        return self.sample(self.features(x)).cpu().numpy()
