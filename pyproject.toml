@@ -9,6 +9,7 @@ module-name = "xsim"
 xarm-sim = { workspace = true, editable = true }
 gs-madrona = { workspace = true }
 webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
+lewm = { path = "../le-wm", editable = true }
 
 
 [tool.uv.workspace]
@@ -53,6 +54,7 @@ dependencies = [
     "wandb>=0.28.1",
     "albumentations>=2.0.8",
     "pytorch-kinematics>=0.10.0",
+    "lewm",
 ]
 
 [dependency-groups]

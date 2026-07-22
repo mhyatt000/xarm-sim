@@ -230,7 +230,7 @@ class Config:
     # soft-cost Gauss-Newton/LM solver (Robot.ik_softcost) that resolves the
     # redundant 7-DOF null space toward HOME, making EE-pose -> joint-target a
     # near-single-valued continuous map (canonical, branch-stable joint labels).
-    ik_backend: Literal["genesis", "softcost"] = "genesis"
+    ik_backend: Literal["genesis", "softcost"] = "softcost"
     # softcost cost-block weights (only used when ik_backend="softcost"): pose
     # tracking dominates, home is a gentle regularizer, firm limit barrier, manip
     # off. Threaded onto the robot model in build_env.

@@ -42,7 +42,7 @@ class RobotModel:
     # folds a HOME rest-pose preference (and optional manipulability) into the same
     # least-squares problem as the pose task, so EE-pose -> joint-target is a
     # near-single-valued continuous map (kills IK-branch label multimodality).
-    ik_backend: Literal["genesis", "softcost"] = "genesis"
+    ik_backend: Literal["genesis", "softcost"] = "softcost"
     # softcost weights (see Robot.ik_softcost). Defaults: pose tracking dominates,
     # home is a gentle regularizer (arm still reaches the table), a firm joint-limit
     # barrier, manipulability off.
