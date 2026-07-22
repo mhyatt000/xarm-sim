@@ -232,6 +232,158 @@ class FlowImageStudent(_FlowHead, ImageStudent):
         return self.sample(self.features(x, p)).cpu().numpy()
 
 
+class _Block(nn.Module):
+    """Pre-norm transformer block; with ``cond_dim`` it becomes a DiT-style
+    AdaLN-zero block (shift/scale/gate from the conditioning vector, modulation
+    zero-initialized so conditioning phases in from identity)."""
+
+    def __init__(self, dim: int, heads: int, cond_dim: int = 0, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=cond_dim == 0)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=cond_dim == 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim), nn.Dropout(dropout),
+        )
+        self.ada = None
+        if cond_dim:
+            self.ada = nn.Linear(cond_dim, 6 * dim)
+            nn.init.zeros_(self.ada.weight)
+            nn.init.zeros_(self.ada.bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        if self.ada is None:
+            h = self.norm1(x)
+            x = x + self.attn(h, h, h, need_weights=False)[0]
+            return x + self.mlp(self.norm2(x))
+        s1, g1, a1, s2, g2, a2 = self.ada(c).unsqueeze(1).chunk(6, dim=-1)
+        h = self.norm1(x) * (1 + g1) + s1
+        x = x + a1 * self.attn(h, h, h, need_weights=False)[0]
+        return x + a2 * self.mlp(self.norm2(x) * (1 + g2) + s2)
+
+
+class ViTEncoder(nn.Module):
+    """ViT-Tiny per the LeWM recipe: 12 layers, 3 heads, dim 192, [CLS] token
+    embedding -> 1-layer MLP projection with BatchNorm. Patch size adapts to
+    the frame (their 14 doesn't tile 64px; 8 gives an 8x8 grid)."""
+
+    def __init__(self, hw: int, dim: int = 192, depth: int = 12, heads: int = 3,
+                 patch: int = 8, proj_dim: int = 192):
+        super().__init__()
+        assert hw % patch == 0, f"patch {patch} must tile {hw}px frames"
+        n_tok = (hw // patch) ** 2
+        self.patch_embed = nn.Conv2d(3, dim, patch, patch)
+        self.cls = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos = nn.Parameter(torch.zeros(1, n_tok + 1, dim))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.cls, std=0.02)
+        self.blocks = nn.ModuleList(_Block(dim, heads) for _ in range(depth))
+        self.norm = nn.LayerNorm(dim)
+        # BN'd projection off the [CLS] token (the paper's anti-collapse
+        # plumbing; kept for checkpoint compatibility with LeWM encoders)
+        self.proj = nn.Sequential(nn.Linear(dim, proj_dim), nn.BatchNorm1d(proj_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, 3, H, W) float -> (N, proj_dim)."""
+        t = self.patch_embed(x).flatten(2).transpose(1, 2)
+        t = torch.cat([self.cls.expand(t.shape[0], -1, -1), t], dim=1) + self.pos
+        for blk in self.blocks:
+            t = blk(t)
+        return self.proj(self.norm(t[:, 0]))
+
+
+class ViTFlowImageStudent(_FlowHead, nn.Module):
+    """ViT-T encoder per view + a DiT-style flow transformer over the action
+    chunk (LeWM-predictor-sized: 6 layers, 16 heads, dim 320, dropout 0.1,
+    AdaLN-zero conditioning on trunk features + flow time). Same training and
+    act() surface as FlowImageStudent: forward(rgb, prop, x_t, t) ->
+    (x1_pred, aux, h); act() returns a (B, chunk, act_dim) plan."""
+
+    def __init__(self, proprio_dim: int, act_dim: int, n_views: int, hw: int,
+                 act_low: np.ndarray, act_high: np.ndarray,
+                 chunk: int = 50, flow_steps: int = 10,
+                 flow_dim: int = 320, flow_depth: int = 6, flow_heads: int = 16,
+                 dropout: float = 0.1):
+        nn.Module.__init__(self)
+        self.n_views = n_views
+        self.encoder = ViTEncoder(hw)
+        proj = self.encoder.proj[0].out_features
+        self.view_emb = nn.Parameter(torch.zeros(n_views, proj))
+        self.prop_net = nn.Sequential(nn.Linear(proprio_dim, 128), nn.ReLU())
+        self.trunk = nn.Sequential(
+            nn.Linear(n_views * proj + 128, 2 * flow_dim), nn.ReLU(),
+            nn.Linear(2 * flow_dim, flow_dim),
+        )
+        self.aux_head = nn.Linear(flow_dim, 5)
+        self.prop_mean = nn.Buffer(torch.zeros(proprio_dim))
+        self.prop_std = nn.Buffer(torch.ones(proprio_dim))
+        self.act_low = nn.Buffer(torch.as_tensor(act_low, dtype=torch.float32))
+        self.act_high = nn.Buffer(torch.as_tensor(act_high, dtype=torch.float32))
+        # flow transformer replaces _FlowHead's MLP: chunk steps are tokens
+        self.chunk, self.flow_steps, self.act_dim = chunk, flow_steps, act_dim
+        self.tok_in = nn.Linear(act_dim, flow_dim)
+        self.tok_pos = nn.Parameter(torch.zeros(1, chunk, flow_dim))
+        nn.init.trunc_normal_(self.tok_pos, std=0.02)
+        self.t_embed = nn.Sequential(nn.Linear(16, flow_dim), nn.SiLU(),
+                                     nn.Linear(flow_dim, flow_dim))
+        self.flow_blocks = nn.ModuleList(
+            _Block(flow_dim, flow_heads, cond_dim=flow_dim, dropout=dropout)
+            for _ in range(flow_depth))
+        self.flow_norm = nn.LayerNorm(flow_dim, elementwise_affine=False)
+        self.flow_ada = nn.Linear(flow_dim, 2 * flow_dim)
+        self.flow_out = nn.Linear(flow_dim, act_dim)
+        nn.init.zeros_(self.flow_ada.weight)
+        nn.init.zeros_(self.flow_ada.bias)
+        nn.init.zeros_(self.flow_out.weight)
+        nn.init.zeros_(self.flow_out.bias)
+        self.act_mean = nn.Buffer(torch.zeros(act_dim))
+        self.act_std = nn.Buffer(torch.ones(act_dim))
+
+    def set_obs_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.prop_mean.copy_(mean)
+        self.prop_std.copy_(std.clamp_min(1e-6))
+
+    def features(self, rgb: torch.Tensor, prop: torch.Tensor) -> torch.Tensor:
+        """rgb: (N, V, 3, H, W) float in [-0.5, 0.5]; prop: (N, P) raw."""
+        n = rgb.shape[0]
+        f = self.encoder(rgb.reshape(n * self.n_views, *rgb.shape[2:]))
+        f = f.reshape(n, self.n_views, -1) + self.view_emb
+        p = self.prop_net((prop - self.prop_mean) / self.prop_std)
+        return self.trunk(torch.cat([f.reshape(n, -1), p], dim=-1))
+
+    def predict_x1(self, h: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        c = h + self.t_embed(time_features(t))
+        tok = self.tok_in(x.reshape(-1, self.chunk, self.act_dim)) + self.tok_pos
+        for blk in self.flow_blocks:
+            tok = blk(tok, c)
+        s, g = self.flow_ada(c).unsqueeze(1).chunk(2, dim=-1)
+        tok = self.flow_out(self.flow_norm(tok) * (1 + g) + s)
+        return tok.reshape(-1, self.chunk * self.act_dim)
+
+    def forward(self, rgb: torch.Tensor, prop: torch.Tensor,
+                x_t: torch.Tensor, t: torch.Tensor):
+        """One call touches every parameter (DDP grad sync)."""
+        h = self.features(rgb, prop)
+        return self.predict_x1(h, x_t, t), self.aux_head(h), h
+
+    @torch.no_grad()
+    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+        # BN and dropout live in this net (unlike the CNN student): inference
+        # must run in eval mode or plans get batch-stat drift + dropout noise
+        was_training = self.training
+        self.eval()
+        try:
+            prop, rgb = obs
+            device = self.prop_mean.device
+            x = torch.from_numpy(
+                np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
+            p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
+            return self.sample(self.features(x, p)).cpu().numpy()
+        finally:
+            self.train(was_training)
+
+
 class FlowStateStudent(_FlowHead, Student):
     """State-obs MLP trunk + the rectified-flow chunk head (see ``_FlowHead``).
 

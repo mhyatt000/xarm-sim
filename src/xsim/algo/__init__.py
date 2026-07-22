@@ -20,6 +20,7 @@ from xsim.algo.nets import (
     FlowStateStudent,
     ImageStudent,
     Student,
+    ViTFlowImageStudent,
     rand_shift,
     time_features,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "ImageStudent",
     "MLPTeacher",
     "Student",
+    "ViTFlowImageStudent",
     "aux_targets",
     "flat",
     "image_proprio_keys",

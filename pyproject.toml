@@ -89,6 +89,13 @@ webpolicy = ["hatchling"]
 # running without poe (same env vars and toolchain defaults).
 #   GPUS=2 poe host scripts/simpledagger.py --policy image --n-envs 2048
 #   poe multihost scripts/simpledagger.py ...   # on every node
+[tool.poe]
+# run tasks in the inherited env instead of re-entering `uv run` (which syncs:
+# on this NFS-shared venv, per-node uv versions disagree on the gs-madrona
+# freshness stamp format and forbidden rebuilds get triggered — launch via
+# `uv run --no-sync poe ...` and poe must not undo the --no-sync)
+executor = { type = "simple" }
+
 [tool.poe.tasks._ngpu]
 shell = "echo ${GPUS:-$(nvidia-smi -L | wc -l)}"
 

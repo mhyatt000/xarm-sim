@@ -64,7 +64,8 @@ from rich import print
 
 from xsim.algo import (
     Collector, Distributed, FKChain, FlowImageStudent, FlowStateStudent,
-    ImageStudent, MLPTeacher, Student, image_proprio_keys, rand_shift,
+    ImageStudent, MLPTeacher, Student, ViTFlowImageStudent, image_proprio_keys,
+    rand_shift,
 )
 from xsim.data import AugmentedDataset, MemmapDataset, read_key, sim2real_transform
 
@@ -128,6 +129,11 @@ class Config:
     ema_decay: float = 0.999
     # student
     policy: Literal["state", "image"] = "state"
+    # image+flow architecture: "cnn" = the small shared-CNN student (~0.55M);
+    # "vit" = LeWM-style ViT-T encoder per view (12L/3H/192d, patch 8 for 64px
+    # frames) + DiT flow transformer over the chunk (6L/16H/320d, AdaLN-zero,
+    # dropout 0.1) — ~17M params
+    arch: Literal["cnn", "vit"] = "cnn"
     image_hw: int = 64                # square rgb obs size (64 trains fast)
     encoder: Literal["shared", "separate"] = "shared"  # one CNN + per-view embedding, or V CNNs
     feat_dim: int = 64                # per-view feature size
@@ -272,6 +278,20 @@ class Config:
     # run an EMA eval + latest/best checkpoint every n optimizer steps inside
     # the image BC loop (0 = per-round eval only). All ranks eval in lockstep.
     eval_every: int = 0
+    # warm start: load a student state dict (e.g. a BC run's best.pt) into both
+    # the live net and the EMA. Obs/act stats ride in as checkpoint buffers and
+    # stay frozen — never recomputed from newly collected data. Online runs
+    # seed the adaptive beta with one pre-round eval of the loaded student.
+    init_from: Path | None = None
+    # extra read-only memmap store roots (image mode) concatenated under this
+    # run's live store for BC; listed oldest-first, they register as the
+    # earliest rounds for recency weighting. Never written to.
+    extra_stores: tuple[Path, ...] = ()
+    # image BC validation: hold the last val_samples rows of each rank's FIRST
+    # extra store out of training entirely; EMA flow loss on them (fixed noise
+    # seed, no augs -> comparable across evals) logs as eval/val_flow_loss at
+    # every --eval-every checkpoint. Requires --extra-stores. 0 = off.
+    val_samples: int = 0
 
     def __post_init__(self):
         assert not (self.cartesian and self.delta), (
@@ -398,6 +418,14 @@ def build_student(cfg: Config, spec_or_env, device: torch.device):
             obs_dim=spec["obs_dim"], act_dim=spec["act_dim"], hidden=cfg.hidden_dim,
             act_low=spec["act_low"], act_high=spec["act_high"],
         ).to(device)
+    if cfg.arch == "vit":
+        assert cfg.loss == "flow", "--arch vit is only wired for --loss flow"
+        return ViTFlowImageStudent(
+            proprio_dim=spec["proprio_dim"], act_dim=spec["act_dim"],
+            n_views=spec["n_views"], hw=cfg.image_hw,
+            act_low=spec["act_low"], act_high=spec["act_high"],
+            chunk=cfg.chunk, flow_steps=cfg.flow_steps,
+        ).to(device)
     kwargs = dict(
         proprio_dim=spec["proprio_dim"], act_dim=spec["act_dim"],
         n_views=spec["n_views"], hw=cfg.image_hw,
@@ -465,11 +493,7 @@ class Trainer:
             # read an existing collection's shards in place: rank r owns
             # shard_r (single-process debug falls back to shard_0, then to a
             # flat store). Never wrapped in a MemmapStore — that would wipe it.
-            root = cfg.offline_store
-            shard = root / f"shard_{self.dist.rank}"
-            self.store_root = (shard if shard.exists()
-                               else root / "shard_0" if (root / "shard_0").exists()
-                               else root)
+            self.store_root = self._shard_of(cfg.offline_store)
             if not (self.store_root / "manifest.json").exists():
                 raise FileNotFoundError(
                     f"no manifest at {self.store_root} — --offline-store needs a "
@@ -506,8 +530,17 @@ class Trainer:
         # this rank's on-disk MemmapStore; state mode stays in RAM (tiny rows).
         self._chunks: dict[str, list[np.ndarray]] = {}
         self._round_sizes: list[int] = []  # new samples added each round (recency)
+        self._extra_sizes_set = False  # extra_stores registered as oldest rounds
+        self._val_ds = None  # held-out tail of the first extra store (val_samples)
         self._stats_set = False
         self._act_stats_set = False
+        if cfg.init_from is not None:
+            # every rank loads the same file, so DDP replicas stay identical;
+            # stats buffers ride in with the checkpoint and stay frozen
+            sd = torch.load(cfg.init_from, map_location=self.device)
+            self.student.load_state_dict(sd)
+            self.ema.load_state_dict(sd)
+            self._stats_set = self._act_stats_set = True
         self.best_success = -1.0
         self.bc_step = 0  # optimizer steps across rounds (bc/step wandb axis)
         self._win: dict[str, float] = {}
@@ -555,6 +588,65 @@ class Trainer:
             self._chunks = {k: [npz[k].astype(np.float32, copy=True)]
                             for k in npz.files}
 
+    def _shard_of(self, root: Path) -> Path:
+        """This rank's shard dir inside a store root (single-process debug
+        falls back to shard_0, then to a flat store)."""
+        shard = root / f"shard_{self.dist.rank}"
+        if shard.exists():
+            return shard
+        return root / "shard_0" if (root / "shard_0").exists() else root
+
+    def _image_dataset(self, keys: tuple[str, ...]):
+        """The BC dataset over this run's live store, with any --extra-stores
+        concatenated in front (oldest-first) and registered once as the
+        earliest recency rounds. With --val-samples, the tail of the first
+        extra store is split off as this rank's held-out validation set."""
+        cfg = self.cfg
+        parts = [MemmapDataset(self._shard_of(r), keys) for r in cfg.extra_stores]
+        ds = MemmapDataset(self.store_root, keys)
+        if not parts:
+            assert cfg.val_samples == 0, "--val-samples needs --extra-stores"
+            return ds
+        if cfg.val_samples > 0:
+            n0 = len(parts[0])
+            assert cfg.val_samples < n0, "val_samples exceeds the first extra store"
+            if self._val_ds is None:
+                self._val_ds = torch.utils.data.Subset(
+                    parts[0], range(n0 - cfg.val_samples, n0))
+            parts[0] = torch.utils.data.Subset(parts[0], range(n0 - cfg.val_samples))
+        if not self._extra_sizes_set:
+            self._round_sizes.extend(len(p) for p in parts)
+            self._extra_sizes_set = True
+        return torch.utils.data.ConcatDataset([*parts, ds])
+
+    @torch.no_grad()
+    def _val_flow_loss(self) -> float | None:
+        """EMA flow loss on the held-out tail: fixed noise/time draws and no
+        augmentation, so the number is comparable eval-to-eval. All ranks call
+        together (the mean is all-reduced)."""
+        if self._val_ds is None:
+            return None
+        was = self.ema.training
+        self.ema.eval()
+        g = torch.Generator().manual_seed(51001)
+        losses = []
+        with torch.device("cpu"):
+            loader = torch.utils.data.DataLoader(
+                self._val_ds, batch_size=self.cfg.batch_size, shuffle=False,
+                num_workers=0)
+            for rgb, prop, y, _aux in loader:
+                x = rgb.to(self.device).float() / 255.0 - 0.5
+                prop = prop.to(self.device)
+                n = y.shape[0]
+                a = ((y.to(self.device) - self.ema.act_mean)
+                     / self.ema.act_std).reshape(n, -1)
+                eps = torch.randn(a.shape, generator=g).to(self.device)
+                t = torch.rand((n, 1), generator=g).to(self.device)
+                x1, _, _ = self.ema(x, prop, (1.0 - t) * eps + t * a, t)
+                losses.append(F.mse_loss(x1, a).item())
+        self.ema.train(was)
+        return self.dist.mean(float(np.mean(losses)))
+
     def log(self, kind: str, d: dict) -> None:
         if not self.dist.main:
             return
@@ -565,7 +657,8 @@ class Trainer:
             self.wandb.log({f"{kind}/{k}": v for k, v in d.items() if k != "kind"})
         pretty = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                           for k, v in d.items() if k != "kind")
-        color = {"collect": "white", "bc": "cyan", "eval": "green"}.get(kind, "white")
+        color = {"collect": "white", "bc": "cyan", "bc_round": "cyan",
+                 "eval": "green"}.get(kind, "white")
         print(f"[{color}]\\[{kind}][/] {pretty}")
 
     def _rollout_metrics(self, d: dict) -> None:
@@ -769,7 +862,7 @@ class Trainer:
         cfg = self.cfg
         if self.collector is not None:  # offline_store reads a finished store
             self.collector.store.flush()
-        ds = MemmapDataset(self.store_root, ("rgb", "prop", "act", "aux"))
+        ds = self._image_dataset(("rgb", "prop", "act", "aux"))
         if cfg.augs:
             ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
         if not self._stats_set:
@@ -805,11 +898,13 @@ class Trainer:
                 self.optim.step()
                 self.optim.zero_grad(set_to_none=True)
                 self._ema_update()
-                vals = {"bc_loss": joints.item(), "grip_bce": grip.item(),
+                vals = {"lr": self.optim.param_groups[0]["lr"],
+                        "bc_loss": joints.item(), "grip_bce": grip.item(),
                         "aux_mse": aux_l.item()}
                 self._step_metrics(vals)
                 for k, v in vals.items():
-                    sums[k] += v
+                    if k in sums:  # lr streams to wandb but has no round mean
+                        sums[k] += v
                 if cfg.eval_every and (i + 1) % cfg.eval_every == 0:
                     self._periodic_eval((i + 1) // cfg.eval_every)
         del it, loader  # release persistent workers before the next collect
@@ -821,7 +916,7 @@ class Trainer:
         cfg = self.cfg
         if self.collector is not None:  # offline_store reads a finished store
             self.collector.store.flush()
-        ds = MemmapDataset(self.store_root, ("rgb", "prop", "chunk", "aux"))
+        ds = self._image_dataset(("rgb", "prop", "chunk", "aux"))
         if cfg.augs:
             ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
         if not self._stats_set:
@@ -869,10 +964,12 @@ class Trainer:
                     a0 = self.student.sample(h.detach())[:, 0]
                     a0_mse = F.mse_loss(a0, y[:, 0]).item()
                 vals = {"flow_loss": fm.item(), "a0_mse": a0_mse,
-                        "aux_mse": aux_l.item()}
+                        "aux_mse": aux_l.item(),
+                        "lr": self.optim.param_groups[0]["lr"]}
                 self._step_metrics(vals)
                 for k, v in vals.items():
-                    sums[k] += v
+                    if k in sums:  # lr streams to wandb but has no round mean
+                        sums[k] += v
                 if cfg.eval_every and (i + 1) % cfg.eval_every == 0:
                     self._periodic_eval((i + 1) // cfg.eval_every)
         del it, loader  # release persistent workers before the next collect
@@ -895,6 +992,9 @@ class Trainer:
         the 1-indexed eval counter — video files land as eval_r01.mp4 upward,
         leaving eval_r00.mp4 to the end-of-round eval."""
         m = self.evaluate(k)
+        vl = self._val_flow_loss()
+        if vl is not None:
+            m["val_flow_loss"] = vl
         self.log("eval", {"bc_step": self.bc_step, **m})
         if self.dist.main:
             torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
@@ -930,6 +1030,12 @@ class Trainer:
         if cfg.offline_dataset is not None and not self.image:
             self._load_dataset(cfg.offline_dataset)
         eval_hist: list[float] = []  # eval_success is all-reduced; ranks agree on beta
+        if cfg.init_from is not None and not offline and not cfg.collect_only:
+            # seed the adaptive beta with the warm-started student's actual
+            # success, so round 0 mixes rather than re-collecting pure teacher
+            m = self.evaluate(0)
+            eval_hist.append(m["eval_success"])
+            self.log("eval", {"round": -1, **m})
         for rnd in range(cfg.rounds):
             if cfg.lr_restart_per_round:
                 # base lr is cfg.lr; the within-round cosine down to lr_final is
@@ -961,7 +1067,10 @@ class Trainer:
                 if self.image:
                     self.collector.store.flush()
                 continue
-            self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
+            # own kind ("bc_round", not "bc"): these are whole-round MEANS, and
+            # under the streamed bc/* keys wandb pinned them to the round's last
+            # bc/step — the phantom "loss spike in the last 1k steps of a round"
+            self.log("bc_round", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate(rnd)
             eval_hist.append(eval_metrics["eval_success"])
             self.log("eval", {"round": rnd, **eval_metrics})
