@@ -138,7 +138,8 @@ class Lift(ManipulationEnv):
 class LiftEZ(Lift):
     """Lift on the easier TableEZ arena: cameras sampled in 10 cm balls around
     the calibrated rig, cube spawn narrowed to |y| <= 3 in (x unchanged), and
-    the arm always starts at HOME (``init_tcp_box`` is forced off)."""
+    the arm starting at HOME by default (pass ``init_tcp_box`` explicitly to
+    randomize the start, e.g. a hover box over the cube spawn region)."""
 
     arena_class = TableEZ
 
@@ -146,7 +147,8 @@ class LiftEZ(Lift):
         self,
         robots: str | list[str] = "XArm7",
         y_range: tuple[float, float] = (-0.0762, 0.0762),
+        init_tcp_box: tuple | None = None,
         **kwargs,
     ):
-        kwargs["init_tcp_box"] = None
-        super().__init__(robots=robots, y_range=y_range, **kwargs)
+        super().__init__(robots=robots, y_range=y_range,
+                         init_tcp_box=init_tcp_box, **kwargs)

@@ -169,6 +169,10 @@ class Config:
     # default and the domain the realigned splat/cameras target (rasterizer =
     # img-v2's light-calibrated legacy domain)
     batch_rasterizer: bool = False
+    # cameras per gsplat rasterization call in the per-reset background pass.
+    # Peak torch memory scales with chunk x gaussian count: 1024 (old suite
+    # default) peaked ~30GB and OOM'd 44GB L40S ranks at n_envs >= 2048
+    splat_chunk: int = 256
     # eval
     eval_batches: int = 1             # student-only eval rollouts per round (eval_envs each)
     # dedicated small eval env sharing the train env's Genesis context. PER RANK
@@ -254,12 +258,36 @@ class Config:
     cameras: tuple[str, ...] = ("low", "side", "wrist")
     spp: int = 8
     video_max_width: int = 1280       # per-camera grid width cap, px
+    # suite env to build ("Lift", "LiftEZ", ...). LiftEZ narrows the cube/camera
+    # distributions; picking it also remaps the Lift-default cube_y_range and
+    # init_tcp_box to the EZ defaults unless overridden on the CLI.
+    task: str = "Lift"
+    # collect-and-exit: run the per-round rollouts (round 0 = pure teacher),
+    # flush the image store shards to disk, and skip BC/eval entirely
+    collect_only: bool = False
+    # image mode: train offline from an existing --collect-only store. Each rank
+    # reads <offline_store>/shard_<rank> read-only; no train env or collector is
+    # built (only the eval env), so pair with --rounds 1 and --eval-envs > 0.
+    offline_store: Path | None = None
+    # run an EMA eval + latest/best checkpoint every n optimizer steps inside
+    # the image BC loop (0 = per-round eval only). All ranks eval in lockstep.
+    eval_every: int = 0
 
     def __post_init__(self):
         assert not (self.cartesian and self.delta), (
             "--cartesian and --delta both replace the absolute-joint action space; "
             "pick one"
         )
+        assert not (self.offline_store is not None and self.collect_only), (
+            "--offline-store trains from a finished store; --collect-only writes one"
+        )
+        if self.task == "LiftEZ":
+            # keep plain `--task LiftEZ` faithful to the class defaults: only
+            # values left at the Lift defaults are remapped, CLI overrides win
+            if self.cube_y_range == (-0.288, 0.288):
+                self.cube_y_range = (-0.0762, 0.0762)
+            if self.init_tcp_box == ((0.10, 0.40), (-0.3048, 0.3048), (-0.01, 0.30)):
+                self.init_tcp_box = None
 
 
 def build_env(cfg: Config, render: bool = False, n_envs: int | None = None):
@@ -279,13 +307,14 @@ def build_env(cfg: Config, render: bool = False, n_envs: int | None = None):
         gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
                 precision="32", logging_level="warning")
     env = make(
-        "Lift", robots="XArm7",
+        cfg.task, robots="XArm7",
         camera_names=list(cfg.cameras) if with_cams else [],
         camera_res=(cfg.image_hw, cfg.image_hw) if image else (640, 480),
         # image obs ride the madrona batch renderer (~100k env-cam fps at 64px);
         # nyx stays the photo-real path for state-mode play videos
         render_backend="batch" if image else ("nyx" if with_cams else "raster"),
-        renderer_config=(BatchConfig(use_rasterizer=cfg.batch_rasterizer) if image
+        renderer_config=(BatchConfig(use_rasterizer=cfg.batch_rasterizer,
+                                     splat_chunk=cfg.splat_chunk) if image
                          else NyxConfig(spp=cfg.spp) if with_cams else None),
         x_range=cfg.cube_x_range, y_range=cfg.cube_y_range,
         init_tcp_box=cfg.init_tcp_box,
@@ -431,22 +460,43 @@ class Trainer:
             self.wandb.define_metric("bc/*", step_metric="bc/step")
             self.wandb.define_metric("roll/tick")
             self.wandb.define_metric("roll/*", step_metric="roll/tick")
-        store_base = cfg.data_dir / cfg.exp_name
-        self.store_root = (store_base / f"shard_{self.dist.rank}"
-                           if self.dist.enabled else store_base)
+        offline_img = cfg.offline_store is not None and self.image
+        if offline_img:
+            # read an existing collection's shards in place: rank r owns
+            # shard_r (single-process debug falls back to shard_0, then to a
+            # flat store). Never wrapped in a MemmapStore — that would wipe it.
+            root = cfg.offline_store
+            shard = root / f"shard_{self.dist.rank}"
+            self.store_root = (shard if shard.exists()
+                               else root / "shard_0" if (root / "shard_0").exists()
+                               else root)
+            if not (self.store_root / "manifest.json").exists():
+                raise FileNotFoundError(
+                    f"no manifest at {self.store_root} — --offline-store needs a "
+                    "completed image-mode collection (shard_<rank>/manifest.json)")
+        else:
+            store_base = cfg.data_dir / cfg.exp_name
+            self.store_root = (store_base / f"shard_{self.dist.rank}"
+                               if self.dist.enabled else store_base)
         # identical init weights on every rank (DDP requirement), then
         # per-rank env reset spacing and beta/shuffle streams
         torch.manual_seed(cfg.seed)
-        self.collector = make_collector(
+        # offline image mode never builds the big training env — the small eval
+        # env supplies the action/obs spec and the rollout venue
+        self.collector = None if offline_img else make_collector(
             cfg, store_root=self.store_root if self.image else None,
             seed_offset=100003 * self.dist.rank)
         # eval rides its own small env (shared Genesis context): success noise
         # scales as 1/sqrt(episodes), but eval wall time scales with envs
+        if offline_img and cfg.eval_envs <= 0:
+            raise ValueError("--offline-store needs --eval-envs > 0 "
+                             "(there is no train env to evaluate on)")
         self.eval_collector = (make_collector(
             cfg, store_root=None, seed_offset=100003 * self.dist.rank + 1,
             n_envs=cfg.eval_envs) if cfg.eval_envs > 0 else self.collector)
-        self.device = self.collector.device
-        self.student = build_student(cfg, self.collector.env, self.device)
+        ref = self.collector or self.eval_collector
+        self.device = ref.device
+        self.student = build_student(cfg, ref.env, self.device)
         self.net = self.dist.wrap(self.student)  # BC fwd/bwd path
         self.ema = copy.deepcopy(self.student)
         self.optim = torch.optim.Adam(self.student.parameters(), lr=cfg.lr)
@@ -474,7 +524,7 @@ class Trainer:
         return self._fk_chain
 
     def _maybe_restart_lr(self, i: int) -> None:
-        """Per-round warm-restart LR (state mode): set the optimizer LR for step
+        """Per-round warm-restart LR (state + image BC loops): set the optimizer LR for step
         ``i`` of this round to a within-round cosine from cfg.lr down to
         cfg.lr_final over cfg.steps_per_round steps. No-op unless enabled, so the
         global across-rounds cosine in train() stays byte-identical when off."""
@@ -717,7 +767,8 @@ class Trainer:
 
     def _train_bc_image(self) -> dict:
         cfg = self.cfg
-        self.collector.store.flush()
+        if self.collector is not None:  # offline_store reads a finished store
+            self.collector.store.flush()
         ds = MemmapDataset(self.store_root, ("rgb", "prop", "act", "aux"))
         if cfg.augs:
             ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
@@ -731,7 +782,8 @@ class Trainer:
         with torch.device("cpu"):
             loader = self._bc_loader(ds, len(ds) - sum(self._round_sizes))
             it = iter(loader)
-            for _ in range(cfg.steps_per_round):
+            for i in range(cfg.steps_per_round):
+                self._maybe_restart_lr(i)
                 try:
                     rgb, prop, y, aux_y = next(it)
                 except StopIteration:  # cycle the shard until the budget is spent
@@ -758,6 +810,8 @@ class Trainer:
                 self._step_metrics(vals)
                 for k, v in vals.items():
                     sums[k] += v
+                if cfg.eval_every and (i + 1) % cfg.eval_every == 0:
+                    self._periodic_eval((i + 1) // cfg.eval_every)
         del it, loader  # release persistent workers before the next collect
         stats = {k: self.dist.mean(v / cfg.steps_per_round) for k, v in sums.items()}
         samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
@@ -765,7 +819,8 @@ class Trainer:
 
     def _train_bc_flow(self) -> dict:
         cfg = self.cfg
-        self.collector.store.flush()
+        if self.collector is not None:  # offline_store reads a finished store
+            self.collector.store.flush()
         ds = MemmapDataset(self.store_root, ("rgb", "prop", "chunk", "aux"))
         if cfg.augs:
             ds = AugmentedDataset(ds, sim2real_transform(cfg.aug_strength))
@@ -783,7 +838,8 @@ class Trainer:
         with torch.device("cpu"):
             loader = self._bc_loader(ds, len(ds) - sum(self._round_sizes))
             it = iter(loader)
-            for _ in range(cfg.steps_per_round):
+            for i in range(cfg.steps_per_round):
+                self._maybe_restart_lr(i)
                 try:
                     rgb, prop, y, aux_y = next(it)
                 except StopIteration:  # cycle the shard until the budget is spent
@@ -817,6 +873,8 @@ class Trainer:
                 self._step_metrics(vals)
                 for k, v in vals.items():
                     sums[k] += v
+                if cfg.eval_every and (i + 1) % cfg.eval_every == 0:
+                    self._periodic_eval((i + 1) // cfg.eval_every)
         del it, loader  # release persistent workers before the next collect
         stats = {k: self.dist.mean(v / cfg.steps_per_round) for k, v in sums.items()}
         samples = int(self.dist.mean(float(len(ds))) * self.dist.world)
@@ -829,6 +887,20 @@ class Trainer:
             pe.lerp_(p, 1.0 - d)
         for be, b in zip(self.ema.buffers(), self.student.buffers()):
             be.copy_(b)
+
+    def _periodic_eval(self, k: int) -> None:
+        """Mid-round EMA eval + checkpoint for the image BC loops (--eval-every).
+        Runs on every rank at the same optimizer step (evaluate() all-reduces,
+        so best_success stays rank-consistent); only rank 0 writes files. k is
+        the 1-indexed eval counter — video files land as eval_r01.mp4 upward,
+        leaving eval_r00.mp4 to the end-of-round eval."""
+        m = self.evaluate(k)
+        self.log("eval", {"bc_step": self.bc_step, **m})
+        if self.dist.main:
+            torch.save(self.ema.state_dict(), self.work_dir / "latest.pt")
+            if m["eval_success"] >= self.best_success:
+                self.best_success = m["eval_success"]
+                torch.save(self.ema.state_dict(), self.work_dir / "best.pt")
 
     # -- loop --------------------------------------------------------------------
     def evaluate(self, rnd: int) -> dict:
@@ -851,9 +923,11 @@ class Trainer:
 
     def train(self) -> None:
         cfg = self.cfg
-        # offline (state mode): load the fixed dataset once, skip collection/beta
-        offline = cfg.offline_dataset is not None and not self.image
-        if offline:
+        # offline: state mode loads the fixed dataset once; image mode reads the
+        # --offline-store shards in place. Both skip collection/beta entirely.
+        offline = ((cfg.offline_dataset is not None and not self.image)
+                   or (cfg.offline_store is not None and self.image))
+        if cfg.offline_dataset is not None and not self.image:
             self._load_dataset(cfg.offline_dataset)
         eval_hist: list[float] = []  # eval_success is all-reduced; ranks agree on beta
         for rnd in range(cfg.rounds):
@@ -873,12 +947,20 @@ class Trainer:
                                          cfg.beta_floor, 1.0))
                 else:
                     beta = max(cfg.beta_floor, 1.0 - rnd / cfg.beta_rampdown_rounds)
-                for _ in range(cfg.episodes_per_round):
-                    stats = self._rollouts(beta=beta, record=True, student=self.student,
-                                           seed=cfg.seed + rnd if rnd == 0 else None)
+                for ep in range(cfg.episodes_per_round):
+                    # seed only the first reset of round 0; later resets continue
+                    # the env RNG stream (reseeding every rollout in the round
+                    # would replay identical spawns batch after batch)
+                    stats = self._rollouts(
+                        beta=beta, record=True, student=self.student,
+                        seed=cfg.seed + rnd if (rnd == 0 and ep == 0) else None)
                     self.log("collect", {"round": rnd, "beta": beta, **stats})
                 if cfg.save_dataset and not self.image:
                     self._save_dataset()
+            if cfg.collect_only:
+                if self.image:
+                    self.collector.store.flush()
+                continue
             self.log("bc", {"round": rnd, "lr": lr, **self.train_bc()})
             eval_metrics = self.evaluate(rnd)
             eval_hist.append(eval_metrics["eval_success"])
@@ -895,7 +977,11 @@ class Trainer:
         if self.wandb is not None:
             self.wandb.finish()
         if self.dist.main:
-            print(f"\\[done] best eval success: {self.best_success:.0%}")
+            if cfg.collect_only:
+                print(f"\\[done] collect-only: store shards under "
+                      f"{cfg.data_dir / cfg.exp_name}")
+            else:
+                print(f"\\[done] best eval success: {self.best_success:.0%}")
 
 
 def main(cfg: Config) -> None:

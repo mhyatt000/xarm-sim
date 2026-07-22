@@ -302,6 +302,13 @@ class RobotEnv(GenesisEnv):
                     buf = np.zeros((self.n_envs, h, w, 3), dtype=np.uint8)
                     self._splat_bg_frames[name] = buf
                 buf[idx] = frames
+        # release the rasterization peak back to the driver: taichi and madrona
+        # allocate outside torch, and the cached chunk buffers would otherwise
+        # hold the peak for the whole rollout (4 ranks x 44GB L40S died on this)
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _sync_attached_cams(self) -> None:
         for name in self._rig_attached:
