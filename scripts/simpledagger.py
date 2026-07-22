@@ -542,6 +542,7 @@ class Trainer:
         self._extra_sizes_set = False  # extra_stores registered as oldest rounds
         self._val_ds = None  # held-out tail of the first extra store (val_samples)
         self._last_a0 = float("nan")  # subsampled a0_mse diagnostic, carried forward
+        self._nan_skips = 0  # optimizer steps skipped on non-finite loss/grads
         self._stats_set = False
         self._act_stats_set = False
         if cfg.init_from is not None:
@@ -970,11 +971,21 @@ class Trainer:
                     aux_l = F.mse_loss(aux.float(), aux_y)
                 loss = fm + cfg.aux_pose_coef * aux_l
                 loss.backward()
-                if cfg.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.student.parameters(), cfg.grad_clip)
-                self.optim.step()
-                self.optim.zero_grad(set_to_none=True)
-                self._ema_update()
+                # a non-finite loss or grad norm poisons the weights through
+                # optim.step (clipping preserves NaN) — skip the step instead
+                # of dying 40k steps into a day-long run (vit-bc-1m-4x{,b})
+                skip = not bool(torch.isfinite(loss))
+                if cfg.grad_clip > 0 and not skip:
+                    gn = nn.utils.clip_grad_norm_(
+                        self.student.parameters(), cfg.grad_clip)
+                    skip = not bool(torch.isfinite(gn))
+                if skip:
+                    self._nan_skips += 1
+                    self.optim.zero_grad(set_to_none=True)
+                else:
+                    self.optim.step()
+                    self.optim.zero_grad(set_to_none=True)
+                    self._ema_update()
                 if i % 100 == 0:
                     # full flow sample = 10 extra flow-net forwards; at every
                     # step this diagnostic cost ~60% of ViT step time. Sampled
@@ -984,6 +995,7 @@ class Trainer:
                         self._last_a0 = F.mse_loss(a0, y[:, 0]).item()
                 vals = {"flow_loss": fm.item(), "a0_mse": self._last_a0,
                         "aux_mse": aux_l.item(),
+                        "nan_skips": float(self._nan_skips),
                         "lr": self.optim.param_groups[0]["lr"]}
                 self._step_metrics(vals)
                 for k, v in vals.items():
