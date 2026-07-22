@@ -290,6 +290,12 @@ class Config:
     # bf16 autocast around the image BC forward (weights stay fp32; bf16 needs
     # no grad scaler). ~2x step rate on L40S/Ada for the ViT student.
     amp: bool = False
+    # clip the global grad norm before each image-BC step (0 = off). The 17.5M
+    # ViT at lr 3e-4 without clipping NaN'd between 40-50k steps (vit-bc-1m-4x)
+    grad_clip: float = 0.0
+    # linear LR warmup over the first n steps of each round (0 = off; applies
+    # inside the per-step cosine of --lr-restart-per-round)
+    warmup_steps: int = 0
     # image BC validation: hold the last val_samples rows of each rank's FIRST
     # extra store out of training entirely; EMA flow loss on them (fixed noise
     # seed, no augs -> comparable across evals) logs as eval/val_flow_loss at
@@ -571,6 +577,8 @@ class Trainer:
         steps = cfg.steps_per_round
         lr_i = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (
             1.0 + math.cos(math.pi * i / max(1, steps - 1)))
+        if cfg.warmup_steps > 0:  # linear ramp into the cosine each round
+            lr_i *= min(1.0, (i + 1) / cfg.warmup_steps)
         for g in self.optim.param_groups:
             g["lr"] = lr_i
 
@@ -962,6 +970,8 @@ class Trainer:
                     aux_l = F.mse_loss(aux.float(), aux_y)
                 loss = fm + cfg.aux_pose_coef * aux_l
                 loss.backward()
+                if cfg.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.student.parameters(), cfg.grad_clip)
                 self.optim.step()
                 self.optim.zero_grad(set_to_none=True)
                 self._ema_update()
