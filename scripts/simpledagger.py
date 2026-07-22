@@ -287,6 +287,9 @@ class Config:
     # run's live store for BC; listed oldest-first, they register as the
     # earliest rounds for recency weighting. Never written to.
     extra_stores: tuple[Path, ...] = ()
+    # bf16 autocast around the image BC forward (weights stay fp32; bf16 needs
+    # no grad scaler). ~2x step rate on L40S/Ada for the ViT student.
+    amp: bool = False
     # image BC validation: hold the last val_samples rows of each rank's FIRST
     # extra store out of training entirely; EMA flow loss on them (fixed noise
     # seed, no augs -> comparable across evals) logs as eval/val_flow_loss at
@@ -952,16 +955,17 @@ class Trainer:
                 eps = torch.randn_like(a)
                 t = torch.rand(n, 1, device=self.device)
                 x_t = (1.0 - t) * eps + t * a
-                x1_pred, aux, h = self.net(x, prop, x_t, t)
-                fm = F.mse_loss(x1_pred, a)  # endpoint (x1) prediction, not velocity
-                aux_l = F.mse_loss(aux, aux_y)
+                with torch.autocast("cuda", torch.bfloat16, enabled=cfg.amp):
+                    x1_pred, aux, h = self.net(x, prop, x_t, t)
+                    fm = F.mse_loss(x1_pred.float(), a)  # endpoint (x1) prediction
+                    aux_l = F.mse_loss(aux.float(), aux_y)
                 loss = fm + cfg.aux_pose_coef * aux_l
                 loss.backward()
                 self.optim.step()
                 self.optim.zero_grad(set_to_none=True)
                 self._ema_update()
                 with torch.no_grad():  # diagnostic comparable to mse bc_loss
-                    a0 = self.student.sample(h.detach())[:, 0]
+                    a0 = self.student.sample(h.detach().float())[:, 0]
                     a0_mse = F.mse_loss(a0, y[:, 0]).item()
                 vals = {"flow_loss": fm.item(), "a0_mse": a0_mse,
                         "aux_mse": aux_l.item(),
