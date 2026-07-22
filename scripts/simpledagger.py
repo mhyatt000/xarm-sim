@@ -535,6 +535,7 @@ class Trainer:
         self._round_sizes: list[int] = []  # new samples added each round (recency)
         self._extra_sizes_set = False  # extra_stores registered as oldest rounds
         self._val_ds = None  # held-out tail of the first extra store (val_samples)
+        self._last_a0 = float("nan")  # subsampled a0_mse diagnostic, carried forward
         self._stats_set = False
         self._act_stats_set = False
         if cfg.init_from is not None:
@@ -964,10 +965,14 @@ class Trainer:
                 self.optim.step()
                 self.optim.zero_grad(set_to_none=True)
                 self._ema_update()
-                with torch.no_grad():  # diagnostic comparable to mse bc_loss
-                    a0 = self.student.sample(h.detach().float())[:, 0]
-                    a0_mse = F.mse_loss(a0, y[:, 0]).item()
-                vals = {"flow_loss": fm.item(), "a0_mse": a0_mse,
+                if i % 100 == 0:
+                    # full flow sample = 10 extra flow-net forwards; at every
+                    # step this diagnostic cost ~60% of ViT step time. Sampled
+                    # 1/100 and carried forward (means stay well-formed).
+                    with torch.no_grad():  # diagnostic comparable to mse bc_loss
+                        a0 = self.student.sample(h.detach().float())[:, 0]
+                        self._last_a0 = F.mse_loss(a0, y[:, 0]).item()
+                vals = {"flow_loss": fm.item(), "a0_mse": self._last_a0,
                         "aux_mse": aux_l.item(),
                         "lr": self.optim.param_groups[0]["lr"]}
                 self._step_metrics(vals)
