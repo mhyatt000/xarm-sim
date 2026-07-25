@@ -115,6 +115,11 @@ def main(cfg: Config) -> None:
     obs, info = env.reset(seed=cfg.seed)
     for name in sorted(obs):
         print(f"  obs[{name}]: shape={obs[name].shape}")
+    # per-object position observables (env-agnostic: Lift has cube_pos,
+    # Stack has cube_{red,green,yellow}_pos, ...)
+    pos_keys = sorted(
+        k for k in obs if k.endswith("_pos") and not k.startswith("robot")
+    )
     policy = None
     if cfg.policy == "waypoint":
         policy = LiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
@@ -128,10 +133,11 @@ def main(cfg: Config) -> None:
         obs, reward, terminated, truncated, info = env.step(action)
         record()
         done = terminated | truncated
+        objs = " ".join(f"{k[:-4]}={obs[k][0].round(3)}" for k in pos_keys)
         print(
             f"step {i}: reward={np.round(reward, 3)} terminated={terminated.astype(int)} "
             f"truncated={truncated.astype(int)} success={info['success'].astype(int)} "
-            f"cube0={obs['cube_pos'][0].round(3)}"
+            f"{objs}"
         )
         if done.all():
             print(f"episode end at step {i}: success={info['success']}")

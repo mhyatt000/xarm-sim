@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from xsim.suite.environments.base import REGISTERED_ENVS, GenesisEnv, make
 from xsim.suite.environments.robot_env import RobotEnv
-from xsim.suite.environments.manipulation import Lift, LiftEZ, ManipulationEnv
+from xsim.suite.environments.manipulation import (
+    Lift,
+    LiftEZ,
+    ManipulationEnv,
+    Stack,
+    StackRGY,
+)
 
 __all__ = [
     "REGISTERED_ENVS",
@@ -13,5 +19,7 @@ __all__ = [
     "LiftEZ",
     "ManipulationEnv",
     "RobotEnv",
+    "Stack",
+    "StackRGY",
     "make",
 ]
