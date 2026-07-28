@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import genesis as gs
 import numpy as np
 import torch
+import trimesh
 
 
 class GenesisObject:
@@ -21,6 +22,18 @@ class GenesisObject:
     @property
     def top_offset(self) -> float:
         """Height of the object's top above its origin."""
+        raise NotImplementedError
+
+    @property
+    def bottom_offset(self) -> float:
+        """Height of the object's origin above its bottom (drop height that
+        rests the object on a surface). Symmetric objects reuse top_offset."""
+        return self.top_offset
+
+    @property
+    def xy_radius(self) -> float:
+        """Circumradius of the footprint around the origin, for spacing
+        objects at reset so they cannot spawn overlapping at any yaw."""
         raise NotImplementedError
 
     def set_pose(self, x, y, z, yaw=0.0, envs_idx=None) -> None:
@@ -40,9 +53,10 @@ class GenesisObject:
         )
         pos_t = torch.tensor(pos, device=gs.device, dtype=gs.tc_float)
         quat_t = torch.tensor(quat, device=gs.device, dtype=gs.tc_float)
-        # skip_forward chains so forward kinematics runs once for the batch
-        self.entity.set_pos(pos_t, envs_idx=envs_idx, skip_forward=True)
-        self.entity.set_quat(quat_t, envs_idx=envs_idx, skip_forward=False)
+        # no skip_forward chaining: on mesh entities the skipped set_pos is
+        # silently dropped by the forward pass of the following set_quat
+        self.entity.set_pos(pos_t, envs_idx=envs_idx)
+        self.entity.set_quat(quat_t, envs_idx=envs_idx)
 
     def get_pos(self) -> np.ndarray:
         """Positions (n_envs, 3)."""
@@ -83,3 +97,68 @@ class BoxObject(GenesisObject):
     @property
     def top_offset(self) -> float:
         return self.size[2] / 2.0
+
+    @property
+    def xy_radius(self) -> float:
+        return float(np.hypot(self.size[0], self.size[1]) / 2.0)
+
+
+@dataclass
+class MeshObject(GenesisObject):
+    """Rigid object loaded from a mesh file (STL/OBJ/GLB).
+
+    ``max_extent`` rescales the mesh so its largest bounding-box side matches
+    (on top of ``scale``); ``decompose`` runs CoACD convex decomposition so
+    concave interiors (bins, cups) collide correctly — without it Genesis
+    collides against the convex hull. ``color=None`` keeps the file's own
+    materials/textures.
+    """
+
+    name: str
+    file: str
+    scale: float = 1.0
+    max_extent: float | None = None
+    color: tuple[float, float, float] | None = None
+    friction: float = 1.0
+    fixed: bool = False
+    decompose: bool = False
+
+    def __post_init__(self):
+        mesh = trimesh.load(self.file, force="mesh")
+        if self.max_extent is not None:
+            self.scale *= self.max_extent / float(mesh.extents.max())
+        self._bounds = self.scale * np.asarray(mesh.bounds)
+        self._xy_radius = self.scale * float(
+            np.linalg.norm(mesh.vertices[:, :2], axis=-1).max()
+        )
+
+    def add_to(self, scene: gs.Scene):
+        surface = (
+            gs.surfaces.Plastic(color=self.color, roughness=0.6)
+            if self.color is not None
+            else None
+        )
+        self.entity = scene.add_entity(
+            gs.morphs.Mesh(
+                file=self.file,
+                scale=self.scale,
+                fixed=self.fixed,
+                # always-decompose vs plain convex hull
+                decompose_object_error_threshold=0.0 if self.decompose else float("inf"),
+            ),
+            material=gs.materials.Rigid(friction=self.friction),
+            surface=surface,
+        )
+        return self.entity
+
+    @property
+    def top_offset(self) -> float:
+        return float(self._bounds[1, 2])
+
+    @property
+    def bottom_offset(self) -> float:
+        return float(-self._bounds[0, 2])
+
+    @property
+    def xy_radius(self) -> float:
+        return self._xy_radius
