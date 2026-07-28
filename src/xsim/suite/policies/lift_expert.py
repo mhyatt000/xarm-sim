@@ -26,7 +26,7 @@ import genesis as gs
 import numpy as np
 import torch
 
-from xsim.suite.policies.lift import APPROACH_HEIGHT, GRASP_TCP_OFFSET, LIFT_HEIGHT
+from xsim.suite.policies.lift import APPROACH_HEIGHT, LIFT_HEIGHT
 from xsim.suite.policies.waypoint import (
     GRIPPER_CLOSED,
     GRIPPER_OPEN,
@@ -36,8 +36,9 @@ from xsim.suite.policies.waypoint import (
 
 if TYPE_CHECKING:
     from xsim.suite.environments.manipulation.lift import Lift
+    from xsim.suite.robots.robot import Robot
 
-APPROACH, DESCEND, CLOSE, LIFT, RELEASE = range(5)
+APPROACH, DESCEND, CLOSE, LIFT, RELEASE, RETREAT = range(6)
 
 
 def side_grasp_quats(cube_yaw: np.ndarray, ref_quat: np.ndarray) -> np.ndarray:
@@ -65,6 +66,12 @@ class LiftExpertPolicy:
     def __init__(
         self,
         env: Lift,
+        robot: Robot | None = None,
+        # True: open at height, let the drop demote back to APPROACH so
+        # fixed-horizon rollouts cycle grasp -> lift -> drop -> re-grasp.
+        # False (LiftRelease): after the drop, hold at height — the task ends
+        # at release, so the arm must not chase the fallen cube.
+        recycle: bool = True,
         cartesian: bool = False,
         # only meaningful when cartesian: "fixed" pins the grasp to a top-down
         # quat and emits 4-dim [x,y,z, g] labels (matching CartesianActionWrapper
@@ -84,18 +91,12 @@ class LiftExpertPolicy:
         rot_frac: float = 0.15,    # slerp fraction toward the grasp quat per tick
         tol_xy: float = 0.02,      # xy alignment gate, m
         tol_z: float = 0.015,      # z arrival gate, m
-        grasp_r: float = 0.035,    # cube-to-TCP distance that counts as held, m
-        # gripping band: closed-on-air drives gripper_norm toward 0, open is 1,
-        # seated on the 31.75mm cube it plateaus in between
-        grip_lo: float = 0.20,
-        grip_hi: float = 0.85,
-        close_ticks_min: int = 12, # finger travel time before a grasp can count
-        close_ticks_max: int = 30, # abort a close attempt that never seats
     ):
         assert cartesian_orientation in ("free", "fixed", "yaw")
         assert not (cartesian and delta), "cartesian and delta are mutually exclusive"
         self.env = env
-        self.robot = env.robots[0]
+        self.robot = env.robots[0] if robot is None else robot
+        self.recycle = recycle
         self.cartesian = cartesian
         self.cartesian_orientation = cartesian_orientation
         self.delta = delta
@@ -104,11 +105,14 @@ class LiftExpertPolicy:
         self.rot_frac = rot_frac
         self.tol_xy = tol_xy
         self.tol_z = tol_z
-        self.grasp_r = grasp_r
-        self.grip_lo = grip_lo
-        self.grip_hi = grip_hi
-        self.close_ticks_min = close_ticks_min
-        self.close_ticks_max = close_ticks_max
+        # grasp geometry and timing from the gripper: held radius, the
+        # gripper_norm band meaning "seated on the cube" (closed-on-air drives
+        # the norm toward 0, open is 1), and finger-travel dwells in ticks
+        g = self.robot.gripper
+        self.grasp_r = g.held_radius
+        self.grip_lo, self.grip_hi = g.holding_band(env.cube_size)
+        self.close_ticks_min = round(g.close_min_s * env.control_freq)
+        self.close_ticks_max = round(g.close_timeout_s * env.control_freq)
         # xy clamp for chase targets: stay over the table even if the cube
         # leaves it (never labels a dive off the edge)
         cx, cy = env.arena.center_xy
@@ -123,6 +127,14 @@ class LiftExpertPolicy:
         self.phase = np.full(n, APPROACH, dtype=np.int64)
         self._close_ticks = np.zeros(n, dtype=np.int64)
 
+    def grasp_target_pos(self) -> np.ndarray:
+        """(n, 3) position of each env's current grasp object (arm assignment)."""
+        return np.asarray(self.env.cube.get_pos(), dtype=np.float64)
+
+    def reassignable(self) -> np.ndarray:
+        """(n,) envs between grasps, where switching the active arm is safe."""
+        return self.phase == APPROACH
+
     def act(self, obs=None) -> np.ndarray:
         r = self.robot
         ee = np.asarray(r.ee_pos, dtype=np.float64)
@@ -131,7 +143,7 @@ class LiftExpertPolicy:
         cube = np.asarray(self.env.cube.get_pos(), dtype=np.float64)
         q = np.asarray(self.env.cube.get_quat(), dtype=np.float64)
         top_z = self.env.arena.top_z
-        grasp_z = top_z + GRASP_TCP_OFFSET
+        grasp_z = top_z + self.env.cube_size / 2 + r.gripper.grasp_dz
         lift_z = grasp_z + LIFT_HEIGHT
 
         cube_xy = np.clip(cube[:, :2], self._xy_lo, self._xy_hi)
@@ -146,8 +158,10 @@ class LiftExpertPolicy:
         )
 
         p = self.phase
+        if not self.recycle:  # task ends at release: park at height, don't chase
+            p[(p == RELEASE) & ~held] = RETREAT
         # demotions first: lost the cube, or drifted off it while descending
-        p[(p >= LIFT) & ~held] = APPROACH
+        p[(p >= LIFT) & (p < RETREAT) & ~held] = APPROACH
         p[(p == DESCEND) & (xy_err > 2 * self.tol_xy)] = APPROACH
         abort = (p == CLOSE) & ~held & (self._close_ticks >= self.close_ticks_max)
         p[abort] = APPROACH
@@ -162,11 +176,14 @@ class LiftExpertPolicy:
         self._close_ticks[starting_close | abort] = 0
         self._close_ticks[p == CLOSE] += 1
 
-        z = np.choose(p, [grasp_z + APPROACH_HEIGHT, grasp_z, grasp_z, lift_z, lift_z])
+        z = np.choose(
+            p, [grasp_z + APPROACH_HEIGHT, grasp_z, grasp_z, lift_z, lift_z, lift_z]
+        )
         target = np.concatenate([cube_xy, z[:, None]], axis=1)
+        target[p == RETREAT] = ee[p == RETREAT]  # hold still, task is done
         # RELEASE opens at height: the dropped cube's bounce diversifies re-grasp
         # poses, and the existing ~held demotion recycles the env to APPROACH
-        grip = np.where((p >= CLOSE) & (p != RELEASE), GRIPPER_CLOSED, GRIPPER_OPEN)
+        grip = np.where((p >= CLOSE) & (p < RELEASE), GRIPPER_CLOSED, GRIPPER_OPEN)
 
         delta = target - ee
         dist = np.linalg.norm(delta, axis=1, keepdims=True)

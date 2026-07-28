@@ -22,6 +22,17 @@ class GripperModel:
     kp: float
     kv: float
     force_limit: float
+    # grasp geometry and timing consumed by the scripted experts
+    grasp_dz: float  # TCP height above the held object's center at grasp
+    max_open_width: float  # jaw opening at open_dof
+    held_radius: float  # object-center-to-TCP distance that still counts as held
+    close_min_s: float  # finger travel time before a grasp can register
+    close_timeout_s: float  # abort a close attempt that never seats
+    open_s: float  # finger opening dwell
+    # gripper_norm interval meaning "fingers seated on an object" (below:
+    # closed on air; above: still open)
+    hold_norm_lo: float
+    hold_norm_hi: float
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -30,3 +41,8 @@ class GripperModel:
     @property
     def default_dofs(self) -> tuple[float, ...]:
         return (self.open_dof,) * self.n_dofs
+
+    def holding_band(self, obj_width: float) -> tuple[float, float]:
+        """``gripper_norm`` interval for fingers seated on an ``obj_width``-wide
+        object. Parallel-jaw grippers use the class band; hands override."""
+        return self.hold_norm_lo, self.hold_norm_hi

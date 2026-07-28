@@ -27,9 +27,6 @@ from xsim.suite.policies.waypoint import (
 if TYPE_CHECKING:
     from xsim.suite.environments.manipulation.lift import Lift
 
-# The cube is 31.75 mm tall. Keep the TCP near the upper half of the cube;
-# driving it near the table plane makes the gripper visibly clip through the block.
-GRASP_TCP_OFFSET = 0.018
 APPROACH_HEIGHT = 0.12
 LIFT_HEIGHT = 0.09
 # Per-segment travel durations (x steps_per_segment): approach, plunge, close,
@@ -120,7 +117,7 @@ class LiftPolicy(WaypointPolicy):
             )
             return torch.cat([xyz, quat], dim=-1)
 
-        grasp_z = top_z + GRASP_TCP_OFFSET
+        grasp_z = top_z + self.env.cube_size / 2 + r.gripper.grasp_dz
         lift_z = grasp_z + LIFT_HEIGHT
         above = pose(cube[:, 0], cube[:, 1], grasp_z + APPROACH_HEIGHT, grasp_quat)
         at = pose(cube[:, 0], cube[:, 1], grasp_z, grasp_quat)

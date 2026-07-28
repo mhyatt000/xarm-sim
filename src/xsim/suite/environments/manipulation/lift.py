@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from xsim.suite.environments.manipulation.manipulation_env import ManipulationEnv
+from xsim.suite.environments.manipulation.manipulation_env import (
+    ManipulationEnv,
+    pose_mats,
+)
 from xsim.suite.models import BoxObject, TableArena, TableEZ, Task
 from xsim.suite.utils import UniformRandomSampler
 
@@ -97,29 +100,25 @@ class Lift(ManipulationEnv):
             return np.where(success, 1.0, shaped).astype(np.float32)
         return success.astype(np.float32)
 
-    def _robot_contact(self) -> np.ndarray:
-        """Per-env: is the cube in contact with any robot body?"""
-        contacts = self.cube.entity.get_contacts(with_entity=self.robots[0].entity)
-        mask = contacts.get("valid_mask") if isinstance(contacts, dict) else None
-        if mask is None:
-            return np.zeros(self.n_envs, dtype=bool)
-        mask = np.asarray(mask.detach().cpu() if hasattr(mask, "detach") else mask)
-        if mask.ndim == 1:  # non-parallelized scene: (n_contacts,)
-            return np.full(self.n_envs, bool(mask.any()))
-        return mask.any(axis=-1)
-
     def _raw_success(self) -> np.ndarray:
         """Instantaneous held-lift condition; success needs it for
-        ``success_hold_ticks`` consecutive control steps."""
+        ``success_hold_ticks`` consecutive control steps. Any robot may be the
+        holder (the slow/near pair must come from the same robot)."""
         pos = self.cube.get_pos()
         high = pos[:, 2] > self.arena.top_z + self.lift_height
-        rel_vel = self.cube.get_vel() - self.robots[0].ee_vel
-        slow = np.linalg.norm(rel_vel, axis=-1) < self.success_max_speed
-        near = (
-            np.linalg.norm(pos[:, :2] - self.robots[0].ee_pos[:, :2], axis=-1)
-            < self.success_eef_xy_radius
+        vel = self.cube.get_vel()
+        held = np.any(
+            [
+                (np.linalg.norm(vel - r.ee_vel, axis=-1) < self.success_max_speed)
+                & (
+                    np.linalg.norm(pos[:, :2] - r.ee_pos[:, :2], axis=-1)
+                    < self.success_eef_xy_radius
+                )
+                for r in self.robots
+            ],
+            axis=0,
         )
-        return high & slow & near & self._robot_contact()
+        return high & held & self._robot_contact(self.cube)
 
     def _post_action(self, action):
         # one hold-counter update per control step (base calls _check_success
@@ -133,6 +132,42 @@ class Lift(ManipulationEnv):
 
     def _check_terminated(self) -> np.ndarray:
         return self._check_success()
+
+    def _datagen_object_poses(self) -> dict[str, np.ndarray]:
+        return {"cube": pose_mats(self.cube.get_pos(), self.cube.get_quat())}
+
+    def _datagen_term_signals(self) -> dict[str, np.ndarray]:
+        return {"grasp": self._grasped(self.cube)}
+
+
+class LiftRelease(Lift):
+    """Lift, then let go: sparse reward once the cube has been lifted while
+    grasped (latched per env) and is now released and settled. Same released-
+    success house style as Stack/PlaceObj — the episode only counts once no
+    robot touches the cube."""
+
+    def __init__(self, robots: str | list[str] = "XArm7", **kwargs):
+        super().__init__(robots=robots, **kwargs)
+        self._was_lifted = np.zeros(self.n_envs, dtype=bool)
+
+    def _reset_internal(self, envs_idx=None) -> None:
+        super()._reset_internal(envs_idx)
+        rows = slice(None) if envs_idx is None else np.asarray(envs_idx)
+        self._was_lifted[rows] = False
+
+    def _post_action(self, action):
+        # latch BEFORE Lift's hold counter reads _raw_success, so the tick that
+        # completes the lift can't double as its own release
+        high = self.cube.get_pos()[:, 2] > self.arena.top_z + self.lift_height
+        self._was_lifted |= high & self._grasped(self.cube)
+        return super()._post_action(action)
+
+    def _raw_success(self) -> np.ndarray:
+        released = ~self._robot_contact(self.cube)
+        settled = (
+            np.linalg.norm(self.cube.get_vel(), axis=-1) < self.success_max_speed
+        )
+        return self._was_lifted & released & settled
 
 
 class LiftEZ(Lift):
