@@ -78,6 +78,7 @@ class RobotEnv(GenesisEnv):
         self._splat_bg_frames: dict[str, np.ndarray] = {}
         self._splat_steps = 0  # global step count driving splat_resplat_every
         self._render_stale = False  # reset moved cameras/state without advancing scene.t
+        self._last_action: np.ndarray | None = None  # last commanded action (n_envs, action_dim)
         super().__init__(**kwargs)
 
     # -- cameras -----------------------------------------------------------------
@@ -415,6 +416,7 @@ class RobotEnv(GenesisEnv):
             raise ValueError(
                 f"Action has shape {a.shape}, expected {(self.n_envs, self.action_dim)}"
             )
+        self._last_action = a.copy()
         offset = 0
         for robot in self.robots:
             robot.control(a[:, offset : offset + robot.action_dim])
