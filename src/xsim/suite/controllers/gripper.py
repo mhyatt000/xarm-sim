@@ -29,8 +29,8 @@ class GripperController(Controller):
 
     def setup(self) -> None:
         n = int(self.dofs_idx.shape[0])
-        kp = torch.full((n,), self.gripper.kp, device=gs.device, dtype=gs.tc_float)
-        kv = torch.full((n,), self.gripper.kv, device=gs.device, dtype=gs.tc_float)
+        kp = torch.tensor(self.gripper.kp_vec, device=gs.device, dtype=gs.tc_float)
+        kv = torch.tensor(self.gripper.kv_vec, device=gs.device, dtype=gs.tc_float)
         self.entity.set_dofs_kp(kp, dofs_idx_local=self.dofs_idx)
         self.entity.set_dofs_kv(kv, dofs_idx_local=self.dofs_idx)
         f = torch.full((n,), self.gripper.force_limit, device=gs.device, dtype=gs.tc_float)
@@ -38,9 +38,8 @@ class GripperController(Controller):
 
     def run(self, action: np.ndarray) -> None:
         a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), 0.0, 1.0)
-        dof = self.gripper.grasp_dof + a * (self.gripper.open_dof - self.gripper.grasp_dof)
-        n = int(self.dofs_idx.shape[0])
-        t = torch.tensor(
-            np.repeat(dof[:, None], n, axis=1), device=gs.device, dtype=gs.tc_float
-        )
+        grasp = np.asarray(self.gripper.grasp_vec, dtype=np.float64)
+        open_ = np.asarray(self.gripper.open_vec, dtype=np.float64)
+        dof = grasp[None, :] + a[:, None] * (open_ - grasp)[None, :]
+        t = torch.tensor(dof, device=gs.device, dtype=gs.tc_float)
         self.entity.control_dofs_position(position=t, dofs_idx_local=self.dofs_idx)

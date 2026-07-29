@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 from xsim.suite.models.grippers.gripper_model import GRIPPER_REGISTRY, GripperModel
+from xsim.suite.models.grippers.robosuite_grippers import (
+    BDGripper,
+    JacoThreeFingerGripper,
+    PandaGripper,
+    RethinkGripper,
+    Robotiq85Gripper,
+    Robotiq140Gripper,
+    RobotiqSGripper,
+)
 from xsim.suite.models.grippers.xarm7_gripper import XArm7Gripper
 
-__all__ = ["GRIPPER_REGISTRY", "GripperModel", "XArm7Gripper", "gripper_factory"]
+__all__ = [
+    "BDGripper",
+    "GRIPPER_REGISTRY",
+    "GripperModel",
+    "JacoThreeFingerGripper",
+    "PandaGripper",
+    "RethinkGripper",
+    "Robotiq140Gripper",
+    "Robotiq85Gripper",
+    "RobotiqSGripper",
+    "XArm7Gripper",
+    "gripper_factory",
+]
 
 
 def gripper_factory(name: str) -> GripperModel:

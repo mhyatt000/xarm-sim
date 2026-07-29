@@ -180,11 +180,15 @@ class StackExpertPolicy:
         )
         p[starting_open] = OPEN
         starting_open |= slipped_in_place
+        # zero the dwell BEFORE the finished gate: a stale count from the
+        # previous move's open would otherwise skip this move's dwell entirely,
+        # retreating with the fingers still physically closed (dragging the
+        # just-placed cube through the tower)
+        self._open_ticks[starting_open] = 0
         finished_open = ~done & (p == OPEN) & (self._open_ticks >= self.open_ticks_min)
         p[finished_open] = RETREAT
         self._close_ticks[starting_close | abort] = 0
         self._close_ticks[p == CLOSE] += 1
-        self._open_ticks[starting_open] = 0
         self._open_ticks[p == OPEN] += 1
         # retreat complete: next move (or hover done above the tower)
         retreat_done = ~done & (p == RETREAT) & (ee[:, 2] > transport_z - 2 * self.tol_z)

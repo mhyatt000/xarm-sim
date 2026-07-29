@@ -7,8 +7,32 @@ import numpy as np
 import torch
 
 from xsim.suite.controllers import Controller, GripperController, JointPositionController
-from xsim.suite.models.grippers import GripperModel, gripper_factory
+from xsim.suite.models.grippers import GripperModel
 from xsim.suite.models.robots import RobotModel
+from xsim.suite.models.robots.robot_model import compose_pose
+
+
+def _qmul_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Batched Hamilton product (n, 4) x (n, 4) -> (n, 4), wxyz."""
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        axis=-1,
+    )
+
+
+def _qrot_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate the fixed vector ``v`` (3,) by each wxyz quat in ``q`` (n, 4)."""
+    u = q[:, 1:4]
+    w = q[:, 0:1]
+    uv = np.cross(u, np.broadcast_to(v, u.shape))
+    return v + 2.0 * (w * uv + np.cross(u, uv))
 
 
 def _quat_error(cur: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
@@ -42,9 +66,8 @@ class Robot:
 
     def __init__(self, robot_model: RobotModel):
         self.model = robot_model
-        self.gripper: GripperModel | None = (
-            gripper_factory(robot_model.gripper_name) if robot_model.gripper_name else None
-        )
+        # the model's cached instance, shared with build_entity (one construction)
+        self.gripper: GripperModel | None = robot_model.gripper_model
         self.entity = None
         self.arm_controller: JointPositionController | None = None
         self.gripper_controller: GripperController | None = None
@@ -57,6 +80,10 @@ class Robot:
                 "was the Task added to a scene?"
             )
         self.entity = self.model.entity
+        # attached-entity gripper (robosuite MJCF port) vs fingers baked into
+        # the robot morph as its trailing dofs (native xArm)
+        self._split = self.gripper is not None and self.gripper.morph_file is not None
+        self.gripper_entity = self.model.gripper_entity or self.entity
         self._arm_idx = torch.arange(self.model.arm_dofs, device=gs.device)
         self.arm_controller = JointPositionController(
             self.entity,
@@ -66,13 +93,17 @@ class Robot:
             self.model.arm_force_limit,
         )
         if self.gripper is not None:
-            self._finger_idx = torch.arange(
-                self.model.arm_dofs,
-                self.model.arm_dofs + self.gripper.n_dofs,
-                device=gs.device,
+            self._finger_idx = (
+                torch.arange(self.gripper.n_dofs, device=gs.device)
+                if self._split
+                else torch.arange(
+                    self.model.arm_dofs,
+                    self.model.arm_dofs + self.gripper.n_dofs,
+                    device=gs.device,
+                )
             )
             self.gripper_controller = GripperController(
-                self.entity, self._finger_idx, self.gripper
+                self.gripper_entity, self._finger_idx, self.gripper
             )
         self._controllers = [
             c for c in (self.arm_controller, self.gripper_controller) if c is not None
@@ -81,9 +112,29 @@ class Robot:
             c.setup()
         self._ee_link = self.entity.get_link(self.model.ee_link_name)
         init = list(self.model.default_arm_qpos) + (
-            list(self.gripper.default_dofs) if self.gripper else []
+            list(self.gripper.default_dofs) if self.gripper and not self._split else []
         )
         self._init_qpos = torch.tensor(init, device=gs.device, dtype=gs.tc_float)
+        if self._split:
+            self._init_gripper_qpos = torch.tensor(
+                self.gripper.default_dofs, device=gs.device, dtype=gs.tc_float
+            )
+        # virtual TCP: the robot's ee link is the flange; the gripper's TCP is
+        # a fixed transform past it (flange->mount ∘ gripper base ∘ base->tcp)
+        self._tcp_pos = None
+        if self.gripper is not None and self.gripper.tcp_pos is not None:
+            mp, mq = compose_pose(
+                self.model.gripper_mount_pos, self.model.gripper_mount_quat,
+                self.gripper.mount_pos, self.gripper.mount_quat,
+            )
+            tp, tq = compose_pose(
+                mp, mq, self.gripper.tcp_pos,
+                self.gripper.tcp_quat or (1.0, 0.0, 0.0, 0.0),
+            )
+            self._tcp_pos = np.asarray(tp, dtype=np.float64)
+            self._tcp_quat = np.asarray(tq, dtype=np.float64)
+            self._tcp_inv_quat = self._tcp_quat * np.array([1.0, -1.0, -1.0, -1.0])
+            self._tcp_inv_pos = -_qrot_np(self._tcp_inv_quat[None], self._tcp_pos)[0]
 
     @property
     def action_dim(self) -> int:
@@ -108,10 +159,22 @@ class Robot:
             c.run(a[:, offset : offset + c.action_dim])
             offset += c.action_dim
 
+    @property
+    def entities(self) -> tuple:
+        """Every Genesis entity with robot bodies (arm, plus a split gripper)."""
+        if self.gripper_entity is self.entity:
+            return (self.entity,)
+        return (self.entity, self.gripper_entity)
+
     def reset(self, envs_idx=None) -> None:
         self.entity.set_qpos(
             self._init_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=False
         )
+        if self._split:  # arm first, so child FK reads the fresh flange pose
+            self.gripper_entity.set_qpos(
+                self._init_gripper_qpos, envs_idx=envs_idx,
+                zero_velocity=True, skip_forward=False,
+            )
         for c in self._controllers:
             c.reset()
 
@@ -125,6 +188,11 @@ class Robot:
         if envs_idx is not None:
             qpos = qpos[torch.as_tensor(np.atleast_1d(envs_idx), device=gs.device)]
         self.entity.set_qpos(qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=False)
+        if self._split:
+            self.gripper_entity.set_qpos(
+                self._init_gripper_qpos, envs_idx=envs_idx,
+                zero_velocity=True, skip_forward=False,
+            )
         for c in self._controllers:
             c.reset()
 
@@ -138,7 +206,13 @@ class Robot:
 
         Dispatches to ``ik_softcost`` when the robot model selects the
         ``"softcost"`` backend; otherwise the byte-identical Genesis path below.
+
+        With a virtual TCP the commanded pose is the TCP's; it is re-expressed
+        at the flange (``pose ∘ tcp⁻¹``, exact) before either backend solves on
+        the robot's own ee link.
         """
+        if self._tcp_pos is not None:
+            pose = self._tcp_to_flange(pose)
         if self.model.ik_backend == "softcost":
             return self.ik_softcost(pose, from_current=from_current)
         pose = pose.to(gs.device)
@@ -290,22 +364,51 @@ class Robot:
         v = np.asarray(self.entity.get_dofs_velocity().detach().cpu())
         return v[:, : self.model.arm_dofs]
 
+    def _tcp_to_flange(self, pose: torch.Tensor) -> torch.Tensor:
+        """Re-express desired TCP poses (n, 7) at the flange link (exact)."""
+        arr = np.asarray(pose.detach().cpu(), dtype=np.float64)
+        q = arr[:, 3:7]
+        pos = arr[:, :3] + _qrot_np(q, self._tcp_inv_pos)
+        quat = _qmul_np(q, np.broadcast_to(self._tcp_inv_quat, q.shape))
+        return torch.as_tensor(
+            np.concatenate([pos, quat], axis=-1), device=pose.device, dtype=pose.dtype
+        )
+
     @property
     def ee_pos(self) -> np.ndarray:
-        return np.asarray(self._ee_link.get_pos().detach().cpu())
+        p = np.asarray(self._ee_link.get_pos().detach().cpu())
+        if self._tcp_pos is None:
+            return p
+        q = np.asarray(self._ee_link.get_quat().detach().cpu())
+        return p + _qrot_np(q, self._tcp_pos)
 
     @property
     def ee_quat(self) -> np.ndarray:
-        return np.asarray(self._ee_link.get_quat().detach().cpu())
+        q = np.asarray(self._ee_link.get_quat().detach().cpu())
+        if self._tcp_pos is None:
+            return q
+        return _qmul_np(q, np.broadcast_to(self._tcp_quat, q.shape))
 
     @property
     def ee_vel(self) -> np.ndarray:
-        return np.asarray(self._ee_link.get_vel().detach().cpu())
+        v = np.asarray(self._ee_link.get_vel().detach().cpu())
+        if self._tcp_pos is None:
+            return v
+        q = np.asarray(self._ee_link.get_quat().detach().cpu())
+        w = np.asarray(self._ee_link.get_ang().detach().cpu())
+        return v + np.cross(w, _qrot_np(q, self._tcp_pos))
 
     @property
     def gripper_norm(self) -> np.ndarray:
-        q = np.asarray(self.entity.get_dofs_position().detach().cpu())
         if self.gripper is None:
+            q = np.asarray(self.entity.get_dofs_position().detach().cpu())
             return np.ones(q.shape[0], dtype=np.float64)
-        g = q[:, self.model.arm_dofs]
-        return np.clip(1.0 - g / self.gripper.close_dof, 0.0, 1.0)
+        q = np.asarray(self.gripper_entity.get_dofs_position().detach().cpu())
+        col = (
+            self.gripper.drive_dof
+            if self._split
+            else self.model.arm_dofs + self.gripper.drive_dof
+        )
+        g = q[:, col]
+        lo, hi = self.gripper.open_dof, self.gripper.close_dof
+        return np.clip(1.0 - (g - lo) / (hi - lo), 0.0, 1.0)

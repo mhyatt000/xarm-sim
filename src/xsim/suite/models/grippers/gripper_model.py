@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 GRIPPER_REGISTRY: dict[str, type[GripperModel]] = {}
 
@@ -33,14 +34,54 @@ class GripperModel:
     # closed on air; above: still open)
     hold_norm_lo: float
     hold_norm_hi: float
+    # attached-entity grippers (robosuite MJCF ports): a separate Genesis
+    # entity attached to the robot's flange. None = fingers baked into the
+    # robot's own URDF (the native xArm case).
+    morph_file: Path | None = None
+    # the gripper MJCF's original base-body pose, zeroed out of the patched XML
+    # (a non-identity base breaks RigidEntity.attach); composed with the
+    # robot's flange->mount constant into the child morph pos/quat
+    mount_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    mount_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    # gripper base -> TCP (robosuite's eef body). None = the robot's own
+    # ee link already is the TCP
+    tcp_pos: tuple[float, float, float] | None = None
+    tcp_quat: tuple[float, float, float, float] | None = None
+    # per-dof setpoints for mirrored fingers / linkage ratios / hand postures;
+    # () broadcasts the open_dof/grasp_dof scalars to all dofs
+    open_dofs: tuple[float, ...] = ()
+    grasp_dofs: tuple[float, ...] = ()
+    drive_dof: int = 0  # dof the open/close/grasp_dof scalars describe
+    # per-dof gains: linkage grippers servo their driven knuckles stiffly and
+    # their spring-coupled followers softly (the follower target then acts as
+    # the spring's neutral pose, so contact can back-drive the pad flat onto
+    # the object, like the real tendon spring). () broadcasts kp/kv.
+    kp_dofs: tuple[float, ...] = ()
+    kv_dofs: tuple[float, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         GRIPPER_REGISTRY[cls.__name__] = cls
 
     @property
+    def kp_vec(self) -> tuple[float, ...]:
+        return self.kp_dofs or (self.kp,) * self.n_dofs
+
+    @property
+    def kv_vec(self) -> tuple[float, ...]:
+        return self.kv_dofs or (self.kv,) * self.n_dofs
+
+    @property
+    def open_vec(self) -> tuple[float, ...]:
+        return self.open_dofs or (self.open_dof,) * self.n_dofs
+
+    @property
+    def grasp_vec(self) -> tuple[float, ...]:
+        return self.grasp_dofs or (self.grasp_dof,) * self.n_dofs
+
+    @property
     def default_dofs(self) -> tuple[float, ...]:
-        return (self.open_dof,) * self.n_dofs
+        return self.open_vec
 
     def holding_band(self, obj_width: float) -> tuple[float, float]:
         """``gripper_norm`` interval for fingers seated on an ``obj_width``-wide

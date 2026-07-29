@@ -40,9 +40,12 @@ class ManipulationEnv(RobotEnv):
 
     def _robot_contact(self, obj, robot_idx: int | None = None) -> np.ndarray:
         """Per-env: is ``obj`` in contact with any body of the ``robot_idx``-th
-        robot (or of ANY robot, the default)?"""
+        robot (or of ANY robot, the default)? A robot may span several entities
+        (arm + attached gripper)."""
         robots = self.robots if robot_idx is None else [self.robots[robot_idx]]
-        return np.any([self._contact_mask(obj, r.entity) for r in robots], axis=0)
+        return np.any(
+            [self._contact_mask(obj, e) for r in robots for e in r.entities], axis=0
+        )
 
     def _grasped(self, obj, clearance: float = 0.005) -> np.ndarray:
         """Per-env: is ``obj`` held by any robot? Contact paired with THAT
@@ -54,7 +57,8 @@ class ManipulationEnv(RobotEnv):
         )
         holding = np.any(
             [
-                self._contact_mask(obj, r.entity) & (r.gripper_norm < 0.9)
+                np.any([self._contact_mask(obj, e) for e in r.entities], axis=0)
+                & (r.gripper_norm < 0.9)
                 for r in self.robots
             ],
             axis=0,
