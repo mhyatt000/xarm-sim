@@ -44,15 +44,21 @@ class RukaHand(GripperModel):
     grasp_dof: float = 1.0
     drive_dof: int = 6  # mid_mcp — the middle pad stalls hardest on the cube
     finger_link_names: tuple[str, str] = ("ruka_thumb___joint_3", "ruka_finger___joint_3_2")
-    kp: float = 80.0
+    # capture-rate sweep (8 envs x 3 grasp cycles): kp 80 -> 0.58, 160 -> 0.33,
+    # 40 -> 0.71, 25 -> 0.54 — soft fingers conform around the cube instead of
+    # ejecting it. force 35 per the prior-hand pattern (Jaco/MHR).
+    kp: float = 40.0
     kv: float = 8.0
     force_limit: float = 35.0
-    grasp_dz: float = 0.0
+    # swept: 0 -> 0.58, -0.006 -> 0.71, -0.010 -> 0.50, +0.006 -> 0.12
+    grasp_dz: float = -0.006
     max_open_width: float = 0.068  # thumb-middle x span at the open posture
     held_radius: float = 0.05
     close_min_s: float = 0.4
     close_timeout_s: float = 1.0
-    open_s: float = 1 / 3
+    # long shed dwell: the cube walks down out of the uncurling fingers along
+    # the release_rise creep; short dwells retreat with it still in contact
+    open_s: float = 2.0
     # the capture is a scoop-envelop (the squeeze seed-squirts the cube ~3 cm
     # up into the fist pocket, where it wedges); the drive reaches full command
     # either way, so norm can't separate held from closed-on-air — the band is
@@ -60,6 +66,15 @@ class RukaHand(GripperModel):
     # precedent)
     hold_norm_lo: float = -1.0
     hold_norm_hi: float = 0.9
+    # stack-release family swept @16 envs: the winning shed is a partial
+    # uncurl held while the arm creeps upward — rel/clearance/dwell/creep
+    # (0.8, 0.005, 2.0 s, 0.002) -> 0.69-0.75; creep 0 -> 0.0-0.19 (static
+    # dwell then retreat-speed jerk drags the seated cube), creep 0.003 -> 0,
+    # release 1.0 -> 0-0.25 (full-open extension sweeps the tower)
+    release_a: float = 0.8
+    place_clearance: float = 0.005
+    release_rise: float = 0.002
+    finger_friction: float | None = 2.0  # URDF has none; default drops carries
     morph_file: Path | None = None  # fingers baked into the robot URDF
     # squeeze pocket, link_eef frame: x -0.065 = where the closing thumb
     # (-0.042 -> -0.072) and middle (-0.083 -> -0.052) tips cross, with 7 mm
@@ -87,7 +102,7 @@ class RukaHand(GripperModel):
         1.0, 0.5, 0.3,
         0.0, 1.5, 1.3, 0.5,
         0.0, 1.5, 1.3, 0.5,
-        1.1, -0.2, 0.9,
+        1.1, -0.4, 0.4,
         0.0,
     )
 

@@ -59,7 +59,13 @@ class StackExpertPolicy:
         place_tol_xy: float = 0.008,
         place_tol_z: float = 0.008,
         transport_height: float = 0.15,  # TCP height above the table while carrying
-        place_clearance: float = 0.002,  # held-cube bottom above the target top at release
+        # release geometry; None = the gripper model's values (jaw defaults:
+        # 2 mm hover, no creep). release_rise is the vertical creep per tick
+        # during the OPEN dwell — hands shed the cube gently along the rise
+        # instead of dwelling in contact and then jerking away at retreat
+        # speed (the drag that knocks the tower).
+        place_clearance: float | None = None,
+        release_rise: float | None = None,
     ):
         self.env = env
         self.robot = env.robots[0] if robot is None else robot
@@ -70,9 +76,10 @@ class StackExpertPolicy:
         self.place_tol_xy = place_tol_xy
         self.place_tol_z = place_tol_z
         self.transport_height = transport_height
-        self.place_clearance = place_clearance
         # grasp geometry and timing from the gripper (see LiftExpertPolicy)
         g = self.robot.gripper
+        self.place_clearance = g.place_clearance if place_clearance is None else place_clearance
+        self.release_rise = g.release_rise if release_rise is None else release_rise
         self.grasp_r = g.held_radius
         self.grip_lo, self.grip_hi = g.holding_band(env.cube_size)
         self.close_ticks_min = round(g.close_min_s * env.control_freq)
@@ -93,6 +100,7 @@ class StackExpertPolicy:
         self.phase = np.full(n, APPROACH, dtype=np.int64)
         self._close_ticks = np.zeros(n, dtype=np.int64)
         self._open_ticks = np.zeros(n, dtype=np.int64)
+        self._open_target = np.zeros((n, 3))
 
     def grasp_target_pos(self) -> np.ndarray:
         """(n, 3) position of each env's current move's cube (arm assignment)."""
@@ -210,8 +218,28 @@ class StackExpertPolicy:
         target[p == PLACE, 2] = (
             targ[:, 2] + size + self.place_clearance + held_off[:, 2]
         )[p == PLACE]
-        target[p == OPEN] = ee[p == OPEN]  # hold still while the fingers open
+        # hold still while the fingers open — at the pose LATCHED when OPEN
+        # began, not the live ee: retargeting the measured ee each tick lets
+        # the finger-opening reaction walk the arm (a hand's uncurl shifted
+        # the TCP 3.5 cm sideways chasing its own drift, carrying the wedged
+        # cube off the tower before it dropped)
+        self._open_target[starting_open] = ee[starting_open]
+        target[p == OPEN] = self._open_target[p == OPEN]
+        target[p == OPEN, 2] += np.minimum(
+            self._open_ticks[p == OPEN] * self.release_rise, 0.06
+        )
+        # RETREAT rises VERTICALLY from the release pose: its choose-row xy is
+        # the tower center, but the TCP released laterally offset from it
+        # (held-cube compensation), so chasing center-xy while rising sweeps
+        # the fingers diagonally through the tower
+        target[p == RETREAT, :2] = self._open_target[p == RETREAT, :2]
         grip = np.where((p >= CLOSE) & (p <= PLACE), GRIPPER_CLOSED, GRIPPER_OPEN)
+        # OPEN and RETREAT command the gripper's release action: full open for
+        # jaws, a partial uncurl for hands (a full open EXTENDS curled fingers
+        # through the just-placed cube — during the retreat rise too, where
+        # the extra uncurl drags the seated cube off the tower). The next
+        # APPROACH restores full open at transport height.
+        grip = np.where(p >= OPEN, self.robot.gripper.release_a, grip)
 
         delta = target - ee
         dist = np.linalg.norm(delta, axis=1, keepdims=True)

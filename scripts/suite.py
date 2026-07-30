@@ -20,7 +20,7 @@ import numpy as np
 import tyro
 
 import xsim.suite as suite
-from xsim.suite.policies import LiftExpertPolicy, LiftPolicy
+from xsim.suite.policies import LiftPolicy, expert_for
 from xsim.suite.renderers import BatchConfig, NyxConfig
 from xsim.utils.video import tile_grid
 
@@ -125,7 +125,7 @@ def main(cfg: Config) -> None:
         policy = LiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
         policy.reset(obs)
     elif cfg.policy == "expert":
-        policy = LiftExpertPolicy(env)
+        policy = expert_for(env)  # env-matched FSM expert (Lift, Stack, ...)
         policy.reset(obs)
     record()
     for i in tqdm(range(cfg.steps)):
