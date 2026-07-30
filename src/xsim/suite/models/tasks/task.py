@@ -40,9 +40,6 @@ class Task:
         for model in self.robot_models:
             if model.mount is not None:
                 model.mount.add_to(scene)
-            model.entity = scene.add_entity(
-                material=gs.materials.Rigid(),
-                morph=model.make_morph(),
-            )
+            model.entity = model.build_entity(scene)
         for obj in self.objects:
             obj.add_to(scene)
