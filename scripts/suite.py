@@ -7,6 +7,20 @@ model composition, controllers, policies, and the episode loop hold together.
     uv run python scripts/suite.py [--env Lift] [--steps 5] [--seed 0] [--n-envs 16]
     uv run python scripts/suite.py --policy waypoint --steps 200 --seed 0
     uv run python scripts/suite.py --policy expert --steps 200 --n-envs 16 --video expert.mp4
+
+Source-demo recording for the MimicGen-style generator (xsim.datagen): keep
+running expert episodes until N successes are banked to hdf5:
+
+    uv run python scripts/suite.py --env Lift --policy expert --n-envs 16 \\
+        --record-datagen demos/lift.h5 --record-n 10
+    uv run python scripts/suite.py --env StackRGY --policy expert \\
+        --n-envs 16 --horizon 500 --record-datagen demos/stack.h5
+
+--policy expert picks the env's FSM expert, and on a multi-robot rig (e.g.
+--robots DXArm7L DXArm7R) drives the nearest arm per env while the other parks:
+
+    uv run python scripts/suite.py --env LiftRelease --robots DXArm7L DXArm7R \\
+        --policy expert --steps 250 --n-envs 16
 """
 
 from __future__ import annotations
@@ -20,7 +34,7 @@ import numpy as np
 import tyro
 
 import xsim.suite as suite
-from xsim.suite.policies import LiftExpertPolicy, LiftPolicy
+from xsim.suite.policies import LiftPolicy, expert_for
 from xsim.suite.renderers import BatchConfig, NyxConfig
 from xsim.utils.video import tile_grid
 
@@ -36,6 +50,15 @@ class Config:
     show_viewer: bool = False
     policy: Literal["random", "waypoint", "expert"] = "random"
     steps_per_segment: int = 20
+    # record successful policy episodes (datagen_info + actions + obs) to this
+    # hdf5 until --record-n demos are banked (source demos for scripts/datagen.py)
+    record_datagen: Path | None = None
+    record_n: int = 10
+    # keep recording this many ticks past an env's success (or until the policy
+    # opens the gripper): envs terminate AT success, which would otherwise cut
+    # the final subtask segment to a couple of frames (e.g. Lift ends ~2 ticks
+    # after the cube leaves the table)
+    record_tail: int = 6
     noslip_iterations: int = 10
     render_backend: Literal["raster", "nyx", "batch"] = "batch"
     spp: int = 8                    # nyx samples per pixel
@@ -51,6 +74,52 @@ class Config:
     # otherwise the video shows env 0
     video_all_envs: bool = True
     video_max_width: int = 2048     # per-camera grid width cap, px
+
+
+def record_source_demos(cfg: Config, env, policy) -> None:
+    """Bank ``cfg.record_n`` successful episodes (datagen_info + actions + obs)
+    into ``cfg.record_datagen``, re-running batched episodes as needed."""
+    from xsim.datagen import DemoRecorder
+
+    rec = DemoRecorder(env, cfg.record_datagen)
+    ep = 0
+    while rec.n_demos < cfg.record_n:
+        obs, _ = env.reset(seed=cfg.seed + 1000 * ep)
+        policy.reset(obs)
+        rec.begin_episode()
+        n = env.n_envs
+        live = np.ones(n, dtype=bool)
+        tailing = np.zeros(n, dtype=bool)
+        success = np.zeros(n, dtype=bool)
+        rec_len = np.zeros(n, dtype=np.int64)
+        tail = np.zeros(n, dtype=np.int64)
+        was_closed = np.zeros(n, dtype=bool)
+        for _ in range(cfg.horizon + cfg.record_tail):
+            action = np.asarray(policy.act(obs))
+            grip_open = action[:, -1] > 0.5
+            tailing &= ~(was_closed & grip_open)  # policy released: stop the tail
+            was_closed = ~grip_open
+            rec.record_step(action, obs)
+            rec_len += live | tailing
+            obs, _, terminated, truncated, info = env.step(action)
+            done = terminated | truncated
+            tailing |= live & done & info["success"]
+            success |= live & info["success"]
+            live &= ~done
+            tail += tailing
+            tailing &= tail <= cfg.record_tail
+            if not (live | tailing).any():
+                break
+        keep = np.zeros_like(success)
+        keep[np.flatnonzero(success)[: cfg.record_n - rec.n_demos]] = True
+        written = rec.end_episode(keep, rec_len)
+        ep += 1
+        print(
+            f"episode batch {ep}: success {int(success.sum())}/{env.n_envs}, "
+            f"banked {written} (total {rec.n_demos}/{cfg.record_n})"
+        )
+    rec.close()
+    print(f"source demos -> {cfg.record_datagen}")
 
 
 def main(cfg: Config) -> None:
@@ -125,8 +194,16 @@ def main(cfg: Config) -> None:
         policy = LiftPolicy(env, steps_per_segment=cfg.steps_per_segment)
         policy.reset(obs)
     elif cfg.policy == "expert":
-        policy = LiftExpertPolicy(env)
+        policy = expert_for(env)
         policy.reset(obs)
+    if cfg.record_datagen is not None:
+        if policy is None:
+            raise ValueError("--record-datagen needs a scripted policy, not random")
+        if len(env.robots) > 1:
+            raise ValueError("--record-datagen is single-arm only (datagen "
+                             "reads robots[0] and the last action channel)")
+        record_source_demos(cfg, env, policy)
+        return
     record()
     for i in tqdm(range(cfg.steps)):
         action = policy.act(obs) if policy is not None else env.action_space.sample()

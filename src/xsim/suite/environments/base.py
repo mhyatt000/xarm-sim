@@ -98,8 +98,20 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
 
     def _initialize_sim(self) -> None:
         renderer = self._scene_renderer()
+        # A robot with a soft (MPM) part declares the grid domain it needs; the MPM
+        # solver is world-fixed and sized at build time, so it must be configured here
+        # before the Scene is created. Absent any such robot there is no MPM solver.
+        mpm_cfg = next(
+            (o for m in getattr(self.model, "robot_models", []) if (o := m.mpm_options())),
+            None,
+        )
+        mpm_kw: dict = {}
+        substeps = 4
+        if mpm_cfg is not None:
+            mpm_kw["mpm_options"] = gs.options.MPMOptions(**mpm_cfg)
+            substeps = 20  # MPM needs a small substep for stability at this dt
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.physics_dt, substeps=4),
+            sim_options=gs.options.SimOptions(dt=self.physics_dt, substeps=substeps),
             rigid_options=gs.options.RigidOptions(
                 dt=self.physics_dt,
                 constraint_solver=gs.constraint_solver.Newton,
@@ -109,6 +121,7 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
             ),
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
             show_viewer=self.show_viewer,
+            **mpm_kw,
             **({"renderer": renderer} if renderer is not None else {}),
         )
         self.model.add_to(self.scene)
