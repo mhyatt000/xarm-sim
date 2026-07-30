@@ -401,11 +401,26 @@ class SimHand:
         return self.entity
 
     def setup(self):
-        """Post-build: dof maps and PD gains (call after scene.build)."""
+        """Post-build for a standalone scene (demo): unbatched, morph at the origin."""
+        self.batched = False
+        self.base_off = np.zeros(3)
+        self._setup_common()
+
+    def attach(self, robot):
+        """Adopt a suite robot's entity (arena mode): same dof names (base_0..5 +
+        link_XX_flex/abd via build_floating_urdf), batched at n_envs=1, base chain
+        rooted at the robot's morph pos."""
+        self.entity = robot.entity
+        self.batched = True
+        self.base_off = np.asarray(robot.model.base_pos, dtype=float)
+        self._setup_common()
+
+    def _setup_common(self):
         rigid = self.rigid = self.entity
         self.name_to_dofs = {j.name: list(j.dofs_idx_local) for j in rigid.joints}
         self.base_dofs = [self.name_to_dofs[f"base_{i}"][0] for i in range(6)]
-        self.finger_dofs = [d for d in range(rigid.n_dofs) if d not in self.base_dofs]
+        hand_dofs = {d for dofs in self.name_to_dofs.values() for d in dofs}
+        self.finger_dofs = sorted(hand_dofs - set(self.base_dofs))
         self.fmap = {d: i for i, d in enumerate(self.finger_dofs)}
         # phalanx inertia is tiny, so finger response is damping-dominated: the tracking
         # time-constant is kv/kp regardless of stiffness. kp 40 (the lift expert's grasp
@@ -417,12 +432,24 @@ class SimHand:
         rigid.set_dofs_kp(np.array([400.0, 400.0, 400.0, 30.0, 30.0, 30.0]), self.base_dofs)
         rigid.set_dofs_kv(np.array([40.0, 40.0, 40.0, 2.5, 2.5, 2.5]), self.base_dofs)
         lo, hi = rigid.get_dofs_limit(self.finger_dofs)
-        self.f_lo, self.f_hi = np.asarray(lo.cpu()), np.asarray(hi.cpu())
+        lo, hi = np.asarray(lo.cpu()), np.asarray(hi.cpu())
+        self.f_lo, self.f_hi = (lo[0], hi[0]) if lo.ndim > 1 else (lo, hi)
         # start at the idle pose, targets held there until the hand is first tracked
-        base0 = np.concatenate([self.pos, np.zeros(3)])
-        rigid.set_dofs_position(base0, self.base_dofs)
+        base0 = np.concatenate([self.pos - self.base_off, np.zeros(3)])
+        self._setq(base0, self.base_dofs)
         self._prev_base = base0.copy()
         self.targets = (np.zeros(len(self.finger_dofs)), base0)
+
+    # batched (n_envs=1) vs unbatched entity API adapters
+    def _ctrl(self, arr, idx):
+        self.rigid.control_dofs_position(arr[None] if self.batched else arr, idx)
+
+    def _setq(self, arr, idx):
+        self.rigid.set_dofs_position(arr[None] if self.batched else arr, idx)
+
+    def _getq(self, idx):
+        q = np.asarray(self.rigid.get_dofs_position(idx).cpu())
+        return q[0] if self.batched else q
 
     def set_local(self, kp_local, tgt_pos, tgt_quat):
         """Finger kp already in this rig's rest frame + explicit wrist pose -> targets."""
@@ -441,7 +468,7 @@ class SimHand:
         # base chain composes Rx(q3) Ry(q4) Rz(q5): intrinsic-XYZ euler of the wrist
         # rotation, unwrapped toward the previous target for 2pi continuity
         eul = _euler_xyz(_quat_to_R(np.asarray(tgt_quat, dtype=float)), self._prev_base[3:])
-        base_tgt = np.concatenate([np.asarray(tgt_pos, dtype=float), eul])
+        base_tgt = np.concatenate([np.asarray(tgt_pos, dtype=float) - self.base_off, eul])
         self._prev_base = base_tgt.copy()
         self.targets = (ftgt, base_tgt)
         return err
@@ -484,21 +511,23 @@ class SimHand:
         if self.targets is None:
             return 0.0
         ftgt, base_tgt = self.targets
-        self.rigid.control_dofs_position(ftgt, self.finger_dofs)
-        self.rigid.control_dofs_position(base_tgt, self.base_dofs)
-        cur = np.asarray(self.rigid.get_dofs_position(self.base_dofs).cpu())
-        return float(np.linalg.norm(base_tgt[:3] - cur[:3]))
+        self._ctrl(ftgt, self.finger_dofs)
+        self._ctrl(base_tgt, self.base_dofs)
+        return float(np.linalg.norm(base_tgt[:3] - self._getq(self.base_dofs)[:3]))
 
     def teleport(self, pos, quat):
         """Place the base immediately (demo start pose)."""
-        base = np.concatenate([np.asarray(pos, dtype=float), _euler_xyz(_quat_to_R(np.asarray(quat, dtype=float)), np.zeros(3))])
-        self.rigid.set_dofs_position(base, self.base_dofs)
+        base = np.concatenate(
+            [np.asarray(pos, dtype=float) - self.base_off, _euler_xyz(_quat_to_R(np.asarray(quat, dtype=float)), np.zeros(3))]
+        )
+        self._setq(base, self.base_dofs)
         self._prev_base = base.copy()
         self.targets = (self.targets[0] if self.targets else np.zeros(len(self.finger_dofs)), base)
 
     def finger_torque(self):
         """Summed |control torque| on the finger dofs (rises on contact); read post-step."""
-        return float(np.abs(np.asarray(self.rigid.get_dofs_control_force(self.finger_dofs).cpu())).sum())
+        f = np.asarray(self.rigid.get_dofs_control_force(self.finger_dofs).cpu())
+        return float(np.abs(f).sum())
 
 
 # --------------------------------------------------------------------------- render
@@ -749,7 +778,118 @@ def _dets_to_world(dets, K, world_from_cam_rdf):
     return got
 
 
+def _register_teleop_robots():
+    """Suite robot variants for teleop, auto-registered by class name: the
+    user-validated chirality convention (right = source asset at -y, left = the x=0
+    mirror at +y — note this DIFFERS from the suite's relabeled ManoR/ManoL) with the
+    widened-limit teleop URDF and no gripper controller (fingers are driven directly)."""
+    from dataclasses import dataclass
+
+    from xsim.suite.models.robots.mano import ManoR as _SuiteMano
+    from xsim.suite.models.robots.mano import mirror_mano_assets
+
+    mirror_mano_assets(MANO_DIR, MANO_LEFT_DIR)  # idempotent
+
+    @dataclass
+    class ManoTeleopR(_SuiteMano):
+        name: str = "ManoTeleopR"
+        morph_file: str = str(SimHand._teleop_urdf(MANO_DIR / "mano_hand_planar.urdf"))
+        base_pos: tuple[float, float, float] = (0.1016, -0.2032, 0.3048)
+        # no gripper: all 26 dofs are the "arm" (teleop drives fingers per-dof)
+        gripper_name: str | None = None
+        arm_dofs: int = 26
+        default_arm_qpos: tuple[float, ...] = (0.0,) * 26
+        arm_kp: tuple[float, ...] = (400.0, 400.0, 400.0, 30.0, 30.0, 30.0) + (40.0,) * 20
+        arm_kv: tuple[float, ...] = (40.0, 40.0, 40.0, 2.5, 2.5, 2.5) + (2.0,) * 20
+
+        def __post_init__(self):  # parent variants generate their own mirrors
+            pass
+
+    @dataclass
+    class ManoTeleopL(ManoTeleopR):
+        name: str = "ManoTeleopL"
+        morph_file: str = str(SimHand._teleop_urdf(MANO_LEFT_DIR / "mano_hand_planar.urdf"))
+        base_pos: tuple[float, float, float] = (0.1016, 0.2032, 0.3048)
+
+    return {"right": "ManoTeleopR", "left": "ManoTeleopL"}
+
+
+class EnvRecorder:
+    """Frames from the env's TableArena cameras with the suite's own splat-plate
+    compositing. save() writes one mp4 per camera as `path`_<name>.mp4."""
+
+    def __init__(self, env, path, splat_bg=True):
+        self.env, self.path = env, Path(path).resolve()
+        self.frames = {n: [] for n in env.cams}
+        self.plates = {}
+        if splat_bg:
+            from xsim.suite.models.arenas.table_arena import (
+                DEFAULT_SPLAT,
+                LOW_C2W_CV,
+                SIDE_C2W_CV,
+            )
+            from xsim.suite.renderers.splat_bg import SplatBackground
+
+            f = 0.5 * CAM_RES[1] / math.tan(math.radians(CAM_FOV) / 2)
+            K = np.array([[f, 0.0, CAM_RES[0] / 2], [0.0, f, CAM_RES[1] / 2], [0.0, 0.0, 1.0]])
+            c2w = {"low": LOW_C2W_CV, "side": SIDE_C2W_CV}
+            names = [n for n in env.cams if n in c2w]
+            if names:
+                vm = np.stack([np.linalg.inv(np.asarray(c2w[n])) for n in names])
+                bgs = SplatBackground(DEFAULT_SPLAT, prune_opacity=0.15).render(vm, K, CAM_RES)
+                self.plates = dict(zip(names, bgs))
+
+    def capture(self):
+        from xsim.suite.wrappers.image_obs import render_plated_views
+
+        for n, img in render_plated_views(self.env, self.plates).items():
+            self.frames[n].append(img[0])
+
+    def save(self, fps=20):
+        import cv2
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for n, frames in self.frames.items():
+            path = self.path.with_stem(f"{self.path.stem}_{n}")
+            vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, CAM_RES)
+            for f in frames:
+                vw.write(f[..., ::-1])
+            vw.release()
+            print(f"wrote {path} ({len(frames)} frames)")
+
+
+def _build_env(a):
+    """TableArena Lift env as the teleop stage: table, cube, calibrated rig cameras,
+    splat compositing. env.step is BYPASSED (the suite gripper is a scalar open/close,
+    not 20-dof teleop) — SimHand drives the robot entities directly and the loop steps
+    env.scene."""
+    from xsim import suite
+
+    names = _register_teleop_robots()
+    sides = {"lr": ["right", "left"], "r": ["right"], "l": ["left"]}[a.hands]
+    env = suite.make(
+        "Lift",
+        robots=[names[s] for s in sides],
+        n_envs=1,
+        show_viewer=a.vis,
+        render_backend="batch" if a.record else "raster",
+        camera_res=CAM_RES,
+        randomize_cameras=False,
+        horizon=10**9,
+    )
+    env.reset()
+    hands = {}
+    for s, robot in zip(sides, env.robots):
+        h = SimHand(s, np.asarray(robot.model.base_pos), ema_n=a.ema)
+        h.attach(robot)
+        hands[s] = h
+    rec = EnvRecorder(env, a.record, not a.no_splat_bg) if a.record else None
+    return hands, env.scene, rec
+
+
 def _build_hands(a):
+    if not a.no_arena:
+        return _build_env(a)
     sides = {"lr": ["right", "left"], "r": ["right"], "l": ["left"]}[a.hands]
     off = np.asarray(a.offset)
     hands = {s: SimHand(s, np.array(LIVE_POS[s]) + off, ema_n=a.ema) for s in sides}
@@ -976,6 +1116,7 @@ def main():
     l.add_argument("--vis", action="store_true")
     l.add_argument("--record", type=str, default=None, help="mp4 rendered via madrona+gsplat from the teleop-cam pose")
     l.add_argument("--no-splat-bg", action="store_true")
+    l.add_argument("--no-arena", action="store_true", help="bare-plane scene instead of the TableArena Lift env")
     l.add_argument("--steps", type=int, default=0, help="0 = run until stopped")
     l.add_argument(
         "--offset", type=float, nargs=3, default=list(WORLD_OFFSET), metavar=("X", "Y", "Z"),
