@@ -4,18 +4,30 @@
 Genesis dof order (measured; equals URDF file order, depth-first per finger):
 per finger [flex1, abd, flex2, flex3] for index, middle, pinky, ring, thumb.
 
-Grasp family (hull-mesh distance probe, link_00 frame): fingers extend along
--x and curl toward +y (the palm normal); the thumb sits on the +z side. The
-working pinch is thumb pad vs deep-curled index tip: the thumb CMC stays at
-0.6 with abd -0.35 (an over-swept CMC crosses the palm and never meets the
-fingertips — measured min gap 59 mm for the tip-to-tip wall-thumb family) and
-only the thumb IP joints close, while index+middle wrap from (0.35,0.15,0.1)
-to (1.5,1.1,0.8). Thumb-index hull gap closes 62 mm (open) -> 0.8 mm (full
-command), crossing the 32 mm cube width at closure ~0.5 with pinch mid
-(-0.072, 0.046, 0.059) and squeeze axis ~x_hand (0.97,-0.21,-0.06).
-tcp_quat maps the TCP frame's z to +y_hand (palm normal), so the expert's
+Grasp family (calibrated on 8-env Lift with the FSM expert; 8/8 success):
+fingers extend along -x and curl toward +y (the palm normal); the thumb sits
+on the +z side. The grasp is a claw wrap onto a splayed-thumb wall:
+
+  - open: index+middle hang claw-deep (1.0, 0.55, 0.35) so the pads dangle at
+    cube-face depth BESIDE the cube (a shallow open makes the closing arc land
+    on the cube's top edge and bulldoze it — the dominant failure family).
+  - thumb: CMC pre-swept to 0.9 with abd SPLAYED to -0.35 (its limit) so the
+    thumb dangles as a near-table-height post on the +x_tcp side of the cube.
+    The splay is functionally required: tabd {0, +0.2, +0.35} all score 0/8 —
+    without it the thumb closes parallel to the fingers and nothing opposes.
+  - close: index+middle wrap to (1.5, 1.2, 0.9); their flat middle-phalanx
+    pads press the cube's -x face onto the thumb post (flat-on-flat, unlike
+    the curved-flank abd-straddle grasps, which slip-capped at ~4 cm lift).
+  - ring+pinky: partial curl (0.7, 0.8, 0.5), laterally clear of the cube
+    (z_tcp -0.05..-0.08); a full fist tuck works equally but reads wrong.
+
+Measured at the frozen postures (tcp frame): index tip sweeps x -0.040 ->
+-0.002 through the cube's -x face; thumb tip holds x +0.025..+0.028.
+tcp_quat = Rx(-90) maps TCP z -> +y_hand (palm normal), so the expert's
 top-down quat family [0, cos h, sin h, 0] puts the palm face-down with the
-squeeze axis horizontal.
+squeeze axis (x_hand) horizontal. Friction 3.5 helped the (abandoned) straddle
+carry but 2.0 is best here; 5.0 makes the close drag the cube (capped by
+Genesis at 5).
 """
 
 from __future__ import annotations
@@ -32,9 +44,9 @@ _SQ2 = 0.7071067811865476
 class ManoGrasp(GripperModel):
     name: str = "ManoGrasp"
     n_dofs: int = 20
-    # scalars describe index flex1 (drive_dof): commanded curl, not the 1.6
-    # mechanical stop, so closed-on-air gripper_norm ~= 0
-    open_dof: float = 0.35
+    # scalars describe index flex1 (drive_dof): the commanded wrap, not the
+    # 1.6 mechanical stop, so closed-on-air gripper_norm ~= 0
+    open_dof: float = 1.0
     close_dof: float = 1.5
     grasp_dof: float = 1.5
     drive_dof: int = 0  # index flex1
@@ -43,7 +55,7 @@ class ManoGrasp(GripperModel):
     kv: float = 8.0
     force_limit: float = 35.0
     grasp_dz: float = -0.004
-    max_open_width: float = 0.062  # thumb-index hull gap at the open posture
+    max_open_width: float = 0.065  # thumb-post-to-index-pad mouth at open
     held_radius: float = 0.05
     close_min_s: float = 0.4
     close_timeout_s: float = 1.0
@@ -58,26 +70,25 @@ class ManoGrasp(GripperModel):
     release_rise: float = 0.002
     finger_friction: float | None = 2.0  # URDF ships none; default drops carries
     morph_file: Path | None = None  # fingers baked into the robot URDF
-    # thumb-index pinch mid at the 32 mm-gap closure, link_00 frame (measured)
-    tcp_pos: tuple[float, float, float] | None = (-0.072, 0.046, 0.059)
+    # pinch pocket in the link_00 frame: cube center at capture (sweep optimum;
+    # x = thumb-post wall face -0.043 minus the cube half-width)
+    tcp_pos: tuple[float, float, float] | None = (-0.064, 0.050, 0.040)
     # Rx(-90): TCP z -> +y_hand (palm normal), TCP x -> x_hand (squeeze axis)
     tcp_quat: tuple[float, float, float, float] | None = (_SQ2, -_SQ2, 0.0, 0.0)
     # dof order: index[f1,abd,f2,f3] middle[...] pinky[...] ring[...] thumb[...]
-    # ring+pinky tuck out of the way; thumb CMC (f1) and abd are pinned in both
-    # postures — only the thumb IP pair closes (wall thumb, minimal ip close)
     open_dofs: tuple[float, ...] = (
-        0.35, 0.0, 0.15, 0.1,
-        0.35, 0.0, 0.15, 0.1,
-        1.3, 0.0, 1.4, 0.9,
-        1.3, 0.0, 1.4, 0.9,
-        0.6, -0.35, 0.15, 0.1,
+        1.0, 0.0, 0.55, 0.35,
+        1.0, 0.0, 0.55, 0.35,
+        0.7, 0.0, 0.8, 0.5,
+        0.7, 0.0, 0.8, 0.5,
+        0.9, -0.35, 0.5, 0.3,
     )
     grasp_dofs: tuple[float, ...] = (
-        1.5, 0.0, 1.1, 0.8,
-        1.5, 0.0, 1.1, 0.8,
-        1.3, 0.0, 1.4, 0.9,
-        1.3, 0.0, 1.4, 0.9,
-        0.6, -0.35, 0.8, 1.0,
+        1.5, 0.0, 1.2, 0.9,
+        1.5, 0.0, 1.2, 0.9,
+        0.7, 0.0, 0.8, 0.5,
+        0.7, 0.0, 0.8, 0.5,
+        0.9, -0.35, 0.6, 0.4,
     )
 
 
@@ -87,4 +98,4 @@ class ManoGraspL(ManoGrasp):
     joint angles chirality-consistent); the pinch pocket reflects across x=0."""
 
     name: str = "ManoGraspL"
-    tcp_pos: tuple[float, float, float] | None = (0.072, 0.046, 0.059)
+    tcp_pos: tuple[float, float, float] | None = (0.064, 0.050, 0.040)
