@@ -36,9 +36,11 @@ class ActiveArmView:
     gathers the active rows."""
 
     def __init__(self, robots: list[Robot], n_envs: int):
-        assert len({type(r.gripper) for r in robots}) == 1, (
-            "mixed grippers across arms are unsupported"
-        )
+        g0 = robots[0].gripper
+        assert all(
+            isinstance(r.gripper, type(g0)) or isinstance(g0, type(r.gripper))
+            for r in robots
+        ), "mixed grippers across arms are unsupported"
         assert len({r.action_dim for r in robots}) == 1, (
             "arms must share one action layout"
         )
