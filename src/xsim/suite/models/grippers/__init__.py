@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from xsim.suite.models.grippers.gripper_model import GRIPPER_REGISTRY, GripperModel
+from xsim.suite.models.grippers.mano import ManoGrasp, ManoGraspL
 from xsim.suite.models.grippers.ruka import RukaHand, RukaHandL
 from xsim.suite.models.grippers.robosuite_grippers import (
     BDGripper,
@@ -28,6 +29,8 @@ __all__ = [
     "InspireLeftHand",
     "InspireRightHand",
     "JacoThreeFingerGripper",
+    "ManoGrasp",
+    "ManoGraspL",
     "PandaGripper",
     "RethinkGripper",
     "Robotiq140Gripper",
