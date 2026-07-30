@@ -8,6 +8,10 @@ from xsim.suite.models.robots.robot_model import ROBOT_MODEL_REGISTRY, RobotMode
 from xsim.suite.models.robots.xarm7 import XArm7
 from xsim.suite.models.robots.xarm7_variants import (
     XArm7BD,
+    XArm7FourierL,
+    XArm7FourierR,
+    XArm7InspireL,
+    XArm7InspireR,
     XArm7Jaco,
     XArm7Panda,
     XArm7Rethink,
@@ -26,6 +30,10 @@ __all__ = [
     "RobotModel",
     "XArm7",
     "XArm7BD",
+    "XArm7FourierL",
+    "XArm7FourierR",
+    "XArm7InspireL",
+    "XArm7InspireR",
     "XArm7Jaco",
     "XArm7Panda",
     "XArm7RS",

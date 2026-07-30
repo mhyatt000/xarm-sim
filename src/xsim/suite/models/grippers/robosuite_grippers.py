@@ -159,6 +159,144 @@ class Robotiq85Gripper(GripperModel):
 
 
 @dataclass
+class InspireRightHand(GripperModel):
+    # GR1 dexterous hand, dof order (MJCF body order) [thumb_proximal_1(yaw),
+    # thumb_proximal_2, thumb_middle, thumb_distal, index_prox, index_dist,
+    # middle_prox, middle_dist, ring_prox, ring_dist, pinky_prox, pinky_dist].
+    # open = robosuite init_qpos zeros; grasp curls the four fingers to their
+    # proximal hard stops with soft distals, thumb yaw opposes across the palm.
+    # Grasp family (pad-position probe, hand-base frame): thumb yaw pinned at
+    # 1.3 (robosuite keeps it there open AND closed) puts the thumb pad
+    # directly opposite index/middle; fingers curl toward the palm normal.
+    # The pinch tilts about the finger-spread axis from hand-vertical toward
+    # palm-down; swept on 16-env Lift (natural mount): 55 -> 69%, 60 -> 75%,
+    # 70 -> 81%, 75 -> 75%, 80 -> 88%, 85 -> 75%, 90 -> 44%. Open pre-curls
+    # the fingers (full-open tips reach 7 cm below the pocket and dig the
+    # table); pocket gap ~4.6 cm vs 3.2 cm cube.
+    name: str = "InspireRightHand"
+    n_dofs: int = 12
+    open_dof: float = 0.55
+    close_dof: float = 1.62
+    grasp_dof: float = 1.62
+    drive_dof: int = 4  # index_proximal
+    finger_link_names: tuple[str, str] = ("r_thumb_distal", "r_index_distal")
+    kp: float = 120.0
+    kv: float = 12.0
+    force_limit: float = 35.0
+    # swept on 64-env Lift: 0 -> 80%, -0.004 -> 83% (16-env ties at 88%)
+    grasp_dz: float = -0.004
+    max_open_width: float = 0.046
+    held_radius: float = 0.05
+    close_min_s: float = 0.4
+    close_timeout_s: float = 1.0
+    open_s: float = 1 / 3
+    # measured plateaus overlap: closed-on-air 0.29-0.30 (index tip stalls on
+    # the curled thumb), seated 0.165-0.544 — norm can't separate them, so the
+    # band stays wide and held_radius does the discriminating
+    hold_norm_lo: float = 0.05
+    hold_norm_hi: float = 0.9
+    morph_file: Path | None = _GRIPPERS / "inspire_right_hand.xml"
+    mount_quat: tuple[float, float, float, float] = (0.7071068, 0.7071068, 0.0, 0.0)
+    # measured pinch pocket center, expressed in the gripper base; quat =
+    # tilt-80 grasp frame (TCP z world-down at grasp, y = pinch axis)
+    tcp_pos: tuple[float, float, float] | None = (-0.055, -0.115, -0.018)
+    tcp_quat: tuple[float, float, float, float] | None = (
+        0.061628, 0.704416, 0.061628, -0.704416,
+    )
+    open_dofs: tuple[float, ...] = (
+        1.3, 0.2, 0.2, 0.25, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55,
+    )
+    grasp_dofs: tuple[float, ...] = (
+        1.3, 0.45, 0.45, 0.5, 1.62, 1.1, 1.62, 1.1, 1.62, 1.1, 1.62, 1.1,
+    )
+    kp_dofs: tuple[float, ...] = (
+        120.0, 100.0, 12.0, 12.0, 120.0, 12.0, 120.0, 12.0, 120.0, 12.0, 120.0, 12.0,
+    )
+    kv_dofs: tuple[float, ...] = (
+        12.0, 10.0, 2.0, 2.0, 12.0, 2.0, 12.0, 2.0, 12.0, 2.0, 12.0, 2.0,
+    )
+
+
+@dataclass
+class InspireLeftHand(InspireRightHand):
+    # mirror of the right hand: pad probe shows the mirror is across flange y
+    # only (curl stays -x_f, thumb stays -x at yaw 1.3), so setpoints and
+    # tcp_quat carry over and just the pocket's lateral offset flips sign
+    name: str = "InspireLeftHand"
+    finger_link_names: tuple[str, str] = ("l_thumb_distal", "l_index_distal")
+    morph_file: Path | None = _GRIPPERS / "inspire_left_hand.xml"
+    tcp_pos: tuple[float, float, float] | None = (-0.055, -0.115, 0.018)
+
+
+@dataclass
+class FourierRightHand(GripperModel):
+    # GR1 dexterous hand, dof order [thumb_yaw, thumb_pitch, thumb_distal,
+    # index_prox, index_int, middle_prox, middle_int, ring_prox, ring_int,
+    # pinky_prox, pinky_int]. Same grasp family as the Inspire (pad probe):
+    # thumb yaw pinned at its 1.74 stop opposes index/middle, fingers curl
+    # toward the palm normal. Tilt swept on Lift (natural mount): 45/50 -> 25%
+    # (4-env), 55 -> 81%, 60 -> 88%, 65 -> 75% (16-env), 75 -> 0%. The thumb
+    # hangs deepest, so high tilt digs it into the table (75+ collapses).
+    name: str = "FourierRightHand"
+    n_dofs: int = 11
+    open_dof: float = 0.5
+    close_dof: float = 1.57
+    grasp_dof: float = 1.57
+    drive_dof: int = 3  # index_proximal
+    finger_link_names: tuple[str, str] = (
+        "R_thumb_distal_link", "R_index_intermediate_link",
+    )
+    kp: float = 120.0
+    kv: float = 12.0
+    force_limit: float = 35.0
+    grasp_dz: float = 0.0
+    max_open_width: float = 0.057  # thumb-to-index pad gap at the open posture
+    held_radius: float = 0.05
+    close_min_s: float = 0.4
+    close_timeout_s: float = 1.0
+    open_s: float = 1 / 3
+    hold_norm_lo: float = 0.05
+    hold_norm_hi: float = 0.9
+    morph_file: Path | None = _GRIPPERS / "fourier_right_hand.xml"
+    mount_quat: tuple[float, float, float, float] = (0.7071068, 0.7071068, 0.0, 0.0)
+    # measured pinch pocket center, expressed in the gripper base; quat =
+    # tilt-60 grasp frame (TCP z world-down at grasp, y = pinch axis)
+    tcp_pos: tuple[float, float, float] | None = (-0.07, -0.11, -0.016)
+    tcp_quat: tuple[float, float, float, float] | None = (
+        0.183013, 0.683013, 0.183013, -0.683013,
+    )
+    open_dofs: tuple[float, ...] = (
+        1.74, 0.35, 0.12, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+    )
+    grasp_dofs: tuple[float, ...] = (
+        1.74, 0.85, 0.6, 1.57, 1.2, 1.57, 1.2, 1.57, 1.2, 1.57, 1.2,
+    )
+    # followers at kp 12 gave the drive a near-identical stall angle on air vs
+    # cube (norm 0.09 vs 0.14) -> phantom holds, and closes squirted the cube
+    # ~8 cm; 50 stalls the drive on contact. Swept 16-env: 12 -> 75% (L) / 88%
+    # (R), 25 -> 100%/81%, 50 -> 100%/88%
+    kp_dofs: tuple[float, ...] = (
+        120.0, 120.0, 50.0, 120.0, 50.0, 120.0, 50.0, 120.0, 50.0, 120.0, 50.0,
+    )
+    kv_dofs: tuple[float, ...] = (
+        12.0, 12.0, 5.0, 12.0, 5.0, 12.0, 5.0, 12.0, 5.0, 12.0, 5.0,
+    )
+
+
+@dataclass
+class FourierLeftHand(FourierRightHand):
+    # mirror of the right hand across the finger-spread axis (same pattern as
+    # the Inspire pair): setpoints and tcp_quat carry over, the pocket's
+    # lateral offset flips sign
+    name: str = "FourierLeftHand"
+    finger_link_names: tuple[str, str] = (
+        "L_thumb_distal_link", "L_index_intermediate_link",
+    )
+    morph_file: Path | None = _GRIPPERS / "fourier_left_hand.xml"
+    tcp_pos: tuple[float, float, float] | None = (-0.07, -0.11, 0.016)
+
+
+@dataclass
 class JacoThreeFingerGripper(GripperModel):
     # three fingers (thumb opposing index+pinky across the palm y axis), dof
     # order [thumb, thumb_distal, index, index_distal, pinky, pinky_distal];

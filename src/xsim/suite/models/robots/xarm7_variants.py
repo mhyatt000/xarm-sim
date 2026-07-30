@@ -46,6 +46,42 @@ class XArm7BD(XArm7RS):
     gripper_name: str | None = "BDGripper"
 
 
+# The GR1 hands' recorded base pose (Rx+90) is the humanoid wrist convention;
+# on the xArm flange it points the fingers back along the forearm. The
+# robot-side 180-about-x below composes to Rx(-90): fingers along +z_f (away
+# from the flange, like the native gripper). Hand-base-frame tcp_* fields are
+# invariant under this flip.
+_HAND_MOUNT_QUAT = (0.0, 1.0, 0.0, 0.0)
+
+
+@dataclass
+class XArm7FourierL(XArm7RS):
+    name: str = "XArm7FourierL"
+    gripper_name: str | None = "FourierLeftHand"
+    gripper_mount_quat: tuple[float, float, float, float] = _HAND_MOUNT_QUAT
+
+
+@dataclass
+class XArm7FourierR(XArm7RS):
+    name: str = "XArm7FourierR"
+    gripper_name: str | None = "FourierRightHand"
+    gripper_mount_quat: tuple[float, float, float, float] = _HAND_MOUNT_QUAT
+
+
+@dataclass
+class XArm7InspireL(XArm7RS):
+    name: str = "XArm7InspireL"
+    gripper_name: str | None = "InspireLeftHand"
+    gripper_mount_quat: tuple[float, float, float, float] = _HAND_MOUNT_QUAT
+
+
+@dataclass
+class XArm7InspireR(XArm7RS):
+    name: str = "XArm7InspireR"
+    gripper_name: str | None = "InspireRightHand"
+    gripper_mount_quat: tuple[float, float, float, float] = _HAND_MOUNT_QUAT
+
+
 @dataclass
 class XArm7Jaco(XArm7RS):
     name: str = "XArm7Jaco"

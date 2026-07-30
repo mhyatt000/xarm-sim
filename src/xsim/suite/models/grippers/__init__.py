@@ -5,6 +5,10 @@ from __future__ import annotations
 from xsim.suite.models.grippers.gripper_model import GRIPPER_REGISTRY, GripperModel
 from xsim.suite.models.grippers.robosuite_grippers import (
     BDGripper,
+    FourierLeftHand,
+    FourierRightHand,
+    InspireLeftHand,
+    InspireRightHand,
     JacoThreeFingerGripper,
     PandaGripper,
     RethinkGripper,
@@ -16,8 +20,12 @@ from xsim.suite.models.grippers.xarm7_gripper import XArm7Gripper
 
 __all__ = [
     "BDGripper",
+    "FourierLeftHand",
+    "FourierRightHand",
     "GRIPPER_REGISTRY",
     "GripperModel",
+    "InspireLeftHand",
+    "InspireRightHand",
     "JacoThreeFingerGripper",
     "PandaGripper",
     "RethinkGripper",
