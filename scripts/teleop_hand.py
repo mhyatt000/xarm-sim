@@ -39,6 +39,11 @@ MANO_LEFT_DIR = REPO / "assets" / "mano_left"
 # idle poses in front of the teleop camera (which looks down -x from the origin)
 HAND_POS = (-0.45, 0.0, 0.32)
 LIVE_POS = {"right": (-0.45, -0.15, 0.32), "left": (-0.45, 0.15, 0.32)}
+# world shift applied to kp, homes AND the virtual teleop cam: moves the operator's
+# hand region (x -0.9..-0.2 in the teleop-cam frame) over the TableArena workspace
+# (table center x 0.39, robot-base frame) so the Lift rig cameras see the hands,
+# while the co-shifted teleop cam view stays pixel-comparable to the raw webcam
+WORLD_OFFSET = (0.85, 0.0, 0.0)
 
 # the physical teleop camera: eye at (0,0,0.36) looking down world -x, level
 # (matches retarget.py's DEFAULT_WORLD_FROM_CAM_FLU); fov from fx=515 @ 640x480
@@ -267,7 +272,7 @@ def decompose(kp, o_rest, R_rest):
     return local, o_in, _R_to_quat(R_in.T @ R_rest)
 
 
-def make_kp_sequence(joints, flex, abd, n):
+def make_kp_sequence(joints, flex, abd, n, base=HAND_POS):
     """Author a MANO-like kp3d trajectory (open -> fist) plus a wrist wobble. Keypoints
     are already in the rest/wrist-local frame (FK from rest joints), so no palm-frame
     alignment is needed -- the wrist target pose is returned separately."""
@@ -285,11 +290,11 @@ def make_kp_sequence(joints, flex, abd, n):
                 kp[k] = posed.get(jid, joints[jid])
         R = _rot(np.array([0, 0, 1.0]), 0.4 * np.sin(2 * np.pi * t / n))
         trans = np.array([0.04 * np.sin(2 * np.pi * t / n), 0.0, 0.03 * phase])
-        seq.append((kp, np.array(HAND_POS) + trans, _R_to_quat(R)))
+        seq.append((kp, np.asarray(base) + trans, _R_to_quat(R)))
     return seq
 
 
-def kp_sequence_from_file(path, steps, joints):
+def kp_sequence_from_file(path, steps, joints, base=HAND_POS):
     """Load real (T,21,3) MANO/OpenPose keypoints (world frame). Each frame yields
     (local_kp, wrist_pos, wrist_quat): fingers expressed in the REST frame the IK
     expects, the wrist pose driving the free base. Recentered so the first wrist sits
@@ -300,7 +305,7 @@ def kp_sequence_from_file(path, steps, joints):
     assert kp_all.ndim == 3 and kp_all.shape[1:] == (21, 3), f"expected (T,21,3), got {kp_all.shape}"
     if steps and steps < len(kp_all):
         kp_all = kp_all[:: max(1, len(kp_all) // steps)][:steps]
-    kp_all = kp_all - (kp_all[0, 0] - np.array(HAND_POS))
+    kp_all = kp_all - (kp_all[0, 0] - np.asarray(base))
 
     o_rest, R_rest = palm_frame(joints[KP_TO_JOINT])  # rest hand's own palm frame, in rig coords
     return [decompose(kp, o_rest, R_rest) for kp in kp_all]
@@ -346,6 +351,9 @@ class SimHand:
         self.entity = scene.add_entity(
             material=gs.materials.Rigid(gravity_compensation=1.0),
             morph=gs.morphs.URDF(file=str(build_floating_urdf(self.out / "mano_hand_planar.urdf")), fixed=True, convexify=False),
+            # skin tone #ebb496, matte: the URDF's <material> tag is unreferenced by its
+            # visuals, so the color rides on the entity surface (matches suite ManoR)
+            surface=gs.surfaces.Rough(color=(0.922, 0.706, 0.588)),
         )
         return self.entity
 
@@ -356,8 +364,12 @@ class SimHand:
         self.base_dofs = [self.name_to_dofs[f"base_{i}"][0] for i in range(6)]
         self.finger_dofs = [d for d in range(rigid.n_dofs) if d not in self.base_dofs]
         self.fmap = {d: i for i, d in enumerate(self.finger_dofs)}
-        rigid.set_dofs_kp(np.full(len(self.finger_dofs), 14.0), self.finger_dofs)
-        rigid.set_dofs_kv(np.full(len(self.finger_dofs), 1.4), self.finger_dofs)
+        # phalanx inertia is tiny, so finger response is damping-dominated: the tracking
+        # time-constant is kv/kp regardless of stiffness. kp 40 (the lift expert's grasp
+        # stiffness) with kv 2 -> tau ~50 ms; their kv 8 (grasp-stable) tracked at a
+        # sluggish 200 ms, which read as frozen fingers at teleop rates
+        rigid.set_dofs_kp(np.full(len(self.finger_dofs), 40.0), self.finger_dofs)
+        rigid.set_dofs_kv(np.full(len(self.finger_dofs), 2.0), self.finger_dofs)
         # the suite ManoR gains: gravity-compensated, so they shape tracking, not droop
         rigid.set_dofs_kp(np.array([400.0, 400.0, 400.0, 30.0, 30.0, 30.0]), self.base_dofs)
         rigid.set_dofs_kv(np.array([40.0, 40.0, 40.0, 2.5, 2.5, 2.5]), self.base_dofs)
@@ -450,15 +462,31 @@ def _np(t):
     return t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
 
 
-class MadronaRecorder:
-    """Frames from a madrona batch camera at the physical teleop-camera pose, with the
-    lab gsplat composited where seg==0 -- the same render stack scripts/suite.py uses,
-    so recordings are directly comparable to the raw webcam video."""
+def _record_specs(offset):
+    """Render views: the teleop cam (co-shifted with the world offset so its view stays
+    pixel-comparable to the raw webcam) + the Lift env's calibrated TableArena rig cams."""
+    from xsim.suite.models.arenas.table_arena import LOW_C2W_CV, SIDE_C2W_CV
+    from xsim.suite.models.cameras import CameraSpec
 
-    def __init__(self, cam, path, splat_bg=True):
-        self.cam, self.path, self.frames, self._first = cam, Path(path).resolve(), [], True
-        cam.set_pose(pos=CAM_POS, lookat=CAM_LOOKAT, up=CAM_UP)
-        self.bg = None
+    off = np.asarray(offset)
+    return {
+        "tele": CameraSpec("tele", pos=tuple(np.array(CAM_POS) + off), lookat=tuple(np.array(CAM_LOOKAT) + off), up=CAM_UP),
+        "low": CameraSpec.from_c2w_cv("low", LOW_C2W_CV),
+        "side": CameraSpec.from_c2w_cv("side", SIDE_C2W_CV),
+    }
+
+
+class MadronaRecorder:
+    """Frames from madrona batch cameras (teleop pose + TableArena rig cams), with the
+    lab gsplat composited where seg==0 -- the same render stack scripts/suite.py uses.
+    save() writes the teleop view to `path` and each rig cam to `path`_<name>.mp4."""
+
+    def __init__(self, cams, specs, path, splat_bg=True):
+        self.cams, self.path, self._first = cams, Path(path).resolve(), True
+        self.frames = {n: [] for n in cams}
+        for n, cam in cams.items():
+            cam.set_pose(pos=specs[n].pos, lookat=specs[n].lookat, up=specs[n].up)
+        self.bg = {}
         if splat_bg:
             from xsim.suite.models.arenas.table_arena import DEFAULT_SPLAT
             from xsim.suite.models.cameras import viewmats_cv
@@ -466,31 +494,40 @@ class MadronaRecorder:
 
             f = 0.5 * CAM_RES[1] / math.tan(math.radians(CAM_FOV) / 2)
             K = np.array([[f, 0.0, CAM_RES[0] / 2], [0.0, f, CAM_RES[1] / 2], [0.0, 0.0, 1.0]])
-            self.bg = SplatBackground(DEFAULT_SPLAT, prune_opacity=0.15).render(
-                viewmats_cv(CAM_POS, CAM_LOOKAT, CAM_UP), K, CAM_RES
-            )[0]
+            names = list(cams)
+            vm = viewmats_cv(
+                np.stack([specs[n].pos for n in names]),
+                np.stack([specs[n].lookat for n in names]),
+                np.stack([specs[n].up for n in names]),
+            )
+            bgs = SplatBackground(DEFAULT_SPLAT, prune_opacity=0.15).render(vm, K, CAM_RES)
+            self.bg = dict(zip(names, bgs))
 
     def capture(self):
-        rgb_t, _, seg_t, _ = self.cam.render(rgb=True, segmentation=True, force_render=self._first)
+        for n, cam in self.cams.items():
+            rgb_t, _, seg_t, _ = cam.render(rgb=True, segmentation=True, force_render=self._first)
+            rgb = _np(rgb_t)[..., :3]
+            frame = np.where((_np(seg_t) == 0)[..., None], self.bg[n], rgb) if n in self.bg else rgb
+            self.frames[n].append(frame.astype(np.uint8))
         self._first = False
-        rgb = _np(rgb_t)[..., :3]
-        frame = np.where((_np(seg_t) == 0)[..., None], self.bg, rgb) if self.bg is not None else rgb
-        self.frames.append(frame.astype(np.uint8))
 
     def save(self, fps=20):
         import cv2
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        vw = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), fps, CAM_RES)
-        for f in self.frames:
-            vw.write(f[..., ::-1])
-        vw.release()
-        print(f"wrote {self.path} ({len(self.frames)} frames)")
+        for n, frames in self.frames.items():
+            path = self.path if n == "tele" else self.path.with_stem(f"{self.path.stem}_{n}")
+            vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, CAM_RES)
+            for f in frames:
+                vw.write(f[..., ::-1])
+            vw.release()
+            print(f"wrote {path} ({len(frames)} frames)")
 
 
-def build_scene(hands, vis, record, splat_bg=True):
+def build_scene(hands, vis, record, splat_bg=True, offset=(0.0, 0.0, 0.0)):
     """One scene holding all `hands` (rigid, no MPM). With `record`, adds the madrona
-    batch raytracer + a camera at the physical teleop-cam pose + the suite light pair."""
+    batch raytracer + the teleop-pose and TableArena rig cameras + the suite light pair.
+    The ground plane collides but never renders (the splat supplies the floor pixels)."""
     import genesis as gs
 
     mid = np.mean([h.pos for h in hands], axis=0)
@@ -509,12 +546,16 @@ def build_scene(hands, vis, record, splat_bg=True):
         show_viewer=vis,
         **({"renderer": gs.options.renderers.BatchRenderer(use_rasterizer=False)} if record else {}),
     )
-    scene.add_entity(gs.morphs.Plane())
-    cam = None
+    scene.add_entity(gs.morphs.Plane(visualization=False))
+    cams, specs = {}, {}
     if record:
-        cam = scene.add_camera(
-            res=CAM_RES, fov=CAM_FOV, GUI=False, pos=CAM_POS, lookat=CAM_LOOKAT, near=0.02, far=50.0
-        )
+        specs = _record_specs(offset)
+        cams = {
+            n: scene.add_camera(
+                res=CAM_RES, fov=spec.fov_deg or CAM_FOV, GUI=False, pos=spec.pos, lookat=spec.lookat, near=0.02, far=50.0
+            )
+            for n, spec in specs.items()
+        }
         # madrona takes no scene ambience (hardcoded 0.05); the suite's light pair
         for d, i, sh in (((-0.4, -0.4, -0.8), 1.7, True), ((0.5, 0.3, -0.6), 0.85, False)):
             scene.add_light(pos=(0, 0, 3), dir=d, color=(1, 1, 1), directional=True, castshadow=sh, cutoff=45.0, intensity=i)
@@ -523,16 +564,17 @@ def build_scene(hands, vis, record, splat_bg=True):
     scene.build(n_envs=0)
     for h in hands:
         h.setup()
-    rec = MadronaRecorder(cam, record, splat_bg) if record else None
+    rec = MadronaRecorder(cams, specs, record, splat_bg) if record else None
     return scene, rec
 
 
 def demo(record, steps, vis, kp_file=None, splat_bg=True):
     joints, flex, abd = mano_rig()
-    hand = SimHand("right", HAND_POS)
-    scene, rec = build_scene([hand], vis, record, splat_bg)
+    base = np.array(HAND_POS) + np.array(WORLD_OFFSET)
+    hand = SimHand("right", base)
+    scene, rec = build_scene([hand], vis, record, splat_bg, WORLD_OFFSET)
 
-    seq = kp_sequence_from_file(kp_file, steps, joints) if kp_file else make_kp_sequence(joints, flex, abd, steps)
+    seq = kp_sequence_from_file(kp_file, steps, joints, base) if kp_file else make_kp_sequence(joints, flex, abd, steps, base)
     hand.teleport(seq[0][1], seq[0][2])
 
     def run_once():
@@ -643,7 +685,9 @@ def _annotate(frame, dets):
 
 
 def _dets_to_world(dets, K, world_from_cam_rdf):
-    """WiLoR detections -> {'left'/'right': {kp2d, cam, world}} (first detection per side)."""
+    """WiLoR detections -> {'left'/'right': {kp2d, cam, world}} (first detection per side).
+    `world` is un-offset (physical teleop-cam frame); consumers add WORLD_OFFSET, so
+    dumps stay replayable under any offset."""
     got = {}
     for d in dets:
         side = "right" if d["is_right"] else "left"
@@ -663,8 +707,9 @@ def _dets_to_world(dets, K, world_from_cam_rdf):
 
 def _build_hands(a):
     sides = {"lr": ["right", "left"], "r": ["right"], "l": ["left"]}[a.hands]
-    hands = {s: SimHand(s, LIVE_POS[s], ema_n=a.ema) for s in sides}
-    scene, rec = build_scene(list(hands.values()), a.vis, a.record, not a.no_splat_bg)
+    off = np.asarray(a.offset)
+    hands = {s: SimHand(s, np.array(LIVE_POS[s]) + off, ema_n=a.ema) for s in sides}
+    scene, rec = build_scene(list(hands.values()), a.vis, a.record, not a.no_splat_bg, a.offset)
     return hands, scene, rec
 
 
@@ -685,14 +730,15 @@ def replay(a):
     # prefer camera-frame kp (re-mapped through the current --extr/--yaw) so extrinsic
     # experiments don't need a fresh capture; fall back to baked-in world kp
     wfc = _world_from_cam(a)
+    off = np.asarray(a.offset)
     frames = {}
     for s in hands:
         if f"{s}_cam" in data.files and len(data[f"{s}_cam"]):
             kp = data[f"{s}_cam"]
             kp_h = np.concatenate([kp, np.ones((*kp.shape[:2], 1))], axis=2)
-            frames[s] = (kp_h @ wfc.T)[..., :3]
+            frames[s] = (kp_h @ wfc.T)[..., :3] + off
         elif s in data.files and len(data[s]):
-            frames[s] = data[s]
+            frames[s] = data[s] + off  # dumps store un-offset world kp
     if not frames:
         raise RuntimeError(f"{a.replay} has no frames for hands {list(hands)} (files: {data.files})")
     T = max(len(v) for v in frames.values())
@@ -703,7 +749,7 @@ def replay(a):
             for s, h in hands.items():
                 kp = frames[s][t] if s in frames and t < len(frames[s]) else None
                 h.command(None if kp is None or np.isnan(kp).any() else kp)
-            for _ in range(a.sim_steps):
+            for _ in range(a.sim_steps or 8):
                 for h in hands.values():
                     h.drive()
                 scene.step()
@@ -755,6 +801,7 @@ def live(a):
         vpath = str(Path(a.dump_kp).resolve().with_suffix(".mp4"))
         video = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*"mp4v"), 20, (iw, ih))
     step = 0
+    last_t = time.monotonic()
     try:
         while (scene.viewer.is_alive() if scene and a.vis else True) and (not a.steps or step < a.steps):
             ok, frame = cap.read()
@@ -780,12 +827,16 @@ def live(a):
                         msg += f"  {s[0].upper()}@world{np.round(r['world'][0], 2)}"
                     print(msg)
             else:
+                off = np.asarray(a.offset)
                 for side, hand in hands.items():
                     r = got.get(side)
-                    hand.command(r["world"] if r else None)
-                # several sim steps per camera frame: one 3 ms step per ~100 ms WiLoR
-                # round-trip would leave the hands in ~30x slow motion
-                for _ in range(a.sim_steps):
+                    hand.command(r["world"] + off if r else None)
+                # advance sim in wall-clock parity: one 3 ms step per camera frame would
+                # leave the hands in ~30x slow motion. --sim-steps 0 = real time.
+                now = time.monotonic()
+                n_steps = a.sim_steps or int(np.clip(round((now - last_t) / 3e-3), 1, 64))
+                last_t = now
+                for _ in range(n_steps):
                     errs = {s: h.drive() for s, h in hands.items()}
                     scene.step()
                 if rec:
@@ -870,7 +921,7 @@ def main():
     l.add_argument("--no-sim", action="store_true", help="debug tracking only: skip genesis, preview + stats")
     l.add_argument("--dump-kp", type=str, default=None, help="with --no-sim: record kp + raw video to this npz/.mp4")
     l.add_argument("--replay", type=str, default=None, help="drive the sim from a --dump-kp npz; no camera/WiLoR")
-    l.add_argument("--sim-steps", type=int, default=8, help="sim steps per camera/replay frame")
+    l.add_argument("--sim-steps", type=int, default=0, help="sim steps per camera/replay frame; 0 = wall-clock real time (replay: 8)")
     l.add_argument("--preview-port", type=int, default=8090, help="MJPEG preview of the annotated camera; 0 disables")
     l.add_argument("--fx", type=float, default=515.0)
     l.add_argument("--fy", type=float, default=515.0)
@@ -882,6 +933,10 @@ def main():
     l.add_argument("--record", type=str, default=None, help="mp4 rendered via madrona+gsplat from the teleop-cam pose")
     l.add_argument("--no-splat-bg", action="store_true")
     l.add_argument("--steps", type=int, default=0, help="0 = run until stopped")
+    l.add_argument(
+        "--offset", type=float, nargs=3, default=list(WORLD_OFFSET), metavar=("X", "Y", "Z"),
+        help="world shift for kp/homes/teleop-cam: puts hands over the TableArena workspace",
+    )
     a = ap.parse_args()
     if a.cmd == "selftest":
         selftest()
