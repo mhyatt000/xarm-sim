@@ -104,3 +104,27 @@ class XArm7Robotiq140(XArm7RS):
 class XArm7RobotiqS(XArm7RS):
     name: str = "XArm7RobotiqS"
     gripper_name: str | None = "RobotiqSGripper"
+
+
+@dataclass
+class XArm7RukaR(XArm7RS):
+    """RUKA v2 right hand, baked into the merged URDF as 21 trailing dofs.
+
+    The CAD-derived ruka_mount graft (40 deg pitch, +/-90 deg yaw) is part of
+    the URDF and visually verified on the real rig — do not retune. Self-
+    collision off: teleop drops all 231 intra-hand pairs; curled postures jam
+    otherwise.
+    """
+
+    name: str = "XArm7RukaR"
+    morph_file: str = str(PROJECT_ROOT / "assets/ruka/xarm7_ruka_right.urdf")
+    gripper_name: str | None = "RukaHand"
+    gripper_mount_link: str = ""  # fingers baked into the robot morph
+    self_collision: bool = False
+
+
+@dataclass
+class XArm7RukaL(XArm7RukaR):
+    name: str = "XArm7RukaL"
+    morph_file: str = str(PROJECT_ROOT / "assets/ruka/xarm7_ruka_left.urdf")
+    gripper_name: str | None = "RukaHandL"

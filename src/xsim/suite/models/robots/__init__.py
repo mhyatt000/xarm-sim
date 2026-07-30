@@ -39,6 +39,8 @@ from xsim.suite.models.robots.xarm7_variants import (
     XArm7Robotiq140,
     XArm7RobotiqS,
     XArm7RS,
+    XArm7RukaL,
+    XArm7RukaR,
 )
 
 __all__ = [
@@ -79,6 +81,8 @@ __all__ = [
     "XArm7Robotiq140",
     "XArm7RobotiqS",
     "XArm7Robotiq85",
+    "XArm7RukaL",
+    "XArm7RukaR",
     "create_robot_model",
 ]
 

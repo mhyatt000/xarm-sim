@@ -104,6 +104,9 @@ class GenesisEnv(gym.Env, metaclass=EnvMeta):
                 dt=self.physics_dt,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
+                enable_self_collision=all(
+                    m.self_collision for m in self.model.robot_models
+                ),
                 enable_joint_limit=True,
                 noslip_iterations=self.noslip_iterations,
             ),
