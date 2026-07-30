@@ -33,6 +33,10 @@ XMLS = [
     "rethink_gripper.xml",
     "panda_gripper.xml",
     "bd_gripper.xml",
+    "inspire_left_hand.xml",
+    "inspire_right_hand.xml",
+    "fourier_left_hand.xml",
+    "fourier_right_hand.xml",
     "robotiq_gripper_85.xml",
     "robotiq_gripper_140.xml",
     "jaco_three_finger_gripper.xml",
@@ -88,6 +92,17 @@ def patch_gripper(src: Path, dst: Path) -> list[str]:
         for t in eq.findall("tendon"):
             eq.remove(t)
             fixes.append(f"stripped equality/tendon {t.get('name')}")
+
+    if src.name.startswith("fourier"):
+        # placeholder 0.5 kg on every phalanx geom = a 6.5 kg hand; the wrist
+        # servo droops ~2 cm under it and the lift expert stalls at the descend
+        # gate. 0.1/link matches the inspire XML (~1.3 kg, real hand is ~0.6)
+        n = 0
+        for g in root.iter("geom"):
+            if g.get("mass") == "0.5":
+                g.set("mass", "0.1")
+                n += 1
+        fixes.append(f"fourier mass placeholder 0.5 -> 0.1 on {n} geoms")
 
     root.insert(0, ET.Comment(f" {HEADER} "))
     tree.write(dst)
