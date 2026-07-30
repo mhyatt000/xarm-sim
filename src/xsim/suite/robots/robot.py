@@ -105,6 +105,8 @@ class Robot:
             self.gripper_controller = GripperController(
                 self.gripper_entity, self._finger_idx, self.gripper
             )
+        if self.gripper is not None and self.gripper.finger_friction is not None:
+            self.gripper_entity.set_friction(self.gripper.finger_friction)
         self._controllers = [
             c for c in (self.arm_controller, self.gripper_controller) if c is not None
         ]

@@ -49,6 +49,9 @@ class RobotModel:
     base_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)  # wxyz
     fixed: bool = True
     merge_fixed_links: bool = False
+    # scene-level self-collision opt-out: dexterous hands with hundreds of
+    # intra-hand pairs jam at curled postures (teleop drops all 231 RUKA pairs)
+    self_collision: bool = True
     arm_dofs: int = 7
     default_arm_qpos: tuple[float, ...] = ()
     ee_link_name: str = ""

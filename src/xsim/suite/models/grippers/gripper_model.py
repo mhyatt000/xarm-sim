@@ -34,6 +34,21 @@ class GripperModel:
     # closed on air; above: still open)
     hold_norm_lo: float
     hold_norm_hi: float
+    # contact friction applied to the gripper's entity at setup (None = keep
+    # the morph/Genesis default). URDF hand ports carry no friction spec and
+    # the default is too slippery to carry a cube through a transport.
+    finger_friction: float | None = None
+    # gripper action commanded during the stack expert's OPEN dwell and the
+    # RETREAT that follows. 1.0 (full open) is right for parallel jaws, whose
+    # fingers splay laterally; a curling hand's fingers EXTEND several cm
+    # through the just-placed cube, so hands set a partial uncurl (~0.8) —
+    # enough clearance to shed the cube without the extension sweep. The next
+    # APPROACH restores full open at transport height.
+    release_a: float = 1.0
+    # stack-place geometry consumed by the stack expert (per-gripper: a hand's
+    # curled digits need different hover/shed margins than a jaw's pads)
+    place_clearance: float = 0.002  # held-cube bottom above the seat at release
+    release_rise: float = 0.0  # OPEN-dwell vertical creep per tick, m (0 = hold)
     # attached-entity grippers (robosuite MJCF ports): a separate Genesis
     # entity attached to the robot's flange. None = fingers baked into the
     # robot's own URDF (the native xArm case).
