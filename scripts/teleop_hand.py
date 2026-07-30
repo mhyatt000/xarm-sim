@@ -127,7 +127,10 @@ def mano_rig():
             name = f"link_{KP_LINK[jid]:02d}"
             p = p + origin[f"{name}_flex"]
             joints[jid] = p
-            flex[jid] = axis[f"{name}_flex"]
+            # NEGATED: the URDF's "curl-verified" flex axes point DORSAL (positive URDF
+            # angle bends fingers backward). The IK works palmar-positive on the negated
+            # axes and set_local emits -angle, so anatomy and URDF stay consistent.
+            flex[jid] = -axis[f"{name}_flex"]
             rows = [limit[f"{name}_flex"]]
             if spec["drive"].get(jid) == 2:
                 abd[jid] = axis[f"{name}_abd"]
@@ -346,21 +349,13 @@ class SimHand:
     def __init__(self, side, pos, ema_n=4):
         self.side, self.pos = side, np.asarray(pos, dtype=float)
         self.ik_joints, self.flex, self.abd = mano_rig()
-        # The URDF's curl-verified axes ALL flex toward +y — including the thumb — which
-        # makes assets/mano FUNCTIONALLY a left hand whatever its right-hand meshes say
-        # (MANO canonical rotated to this frame puts the anatomical palm at -y; a real
-        # right hand can only fit these axes through a reflection — measured: 133 mm ->
-        # 52 mm on a fist frame). So each side loads the OTHER side's asset: the
-        # mirrored asset is functionally right, and the existing mirror IK path IS the
-        # reflection. If the URDF's axis signs get fixed upstream, swap these back.
-        if side == "right":
+        self.out = MANO_DIR
+        if side == "left":
             from xsim.suite.models.robots.mano import mirror_mano_assets
 
             mirror_mano_assets(MANO_DIR, MANO_LEFT_DIR)  # idempotent
             self.out = MANO_LEFT_DIR
-        else:
-            self.out = MANO_DIR
-        mirror = np.array([1.0 if side == "left" else -1.0, 1.0, 1.0])
+        mirror = np.array([1.0 if side == "right" else -1.0, 1.0, 1.0])
         rest_kp = self.ik_joints[KP_TO_JOINT] * mirror
         self.o_rest, self.R_rest = palm_frame(rest_kp)
         self._rig_spans = np.linalg.norm(rest_kp[[5, 9, 13, 17]] - rest_kp[0], axis=1)  # wrist->MCP
@@ -369,6 +364,23 @@ class SimHand:
         self.scale = None  # observed-hand / rig palm-size ratio, estimated online
         self._prev_quat = None  # last commanded wrist quat (hand-swap gate)
         self.targets = None  # (finger qpos targets, 6-dof base qpos targets)
+
+    @staticmethod
+    def _teleop_urdf(src):
+        """Sibling URDF with flex limits widened to symmetric: the shipped ranges are
+        anatomical PALMAR estimates, but the axes point dorsal, so palmar curl needs
+        negative angles the shipped lower bounds forbid. Grasp-expert postures (all
+        within the shipped positive range) remain valid."""
+        import xml.etree.ElementTree as ET
+
+        dst = src.with_name(src.stem + "_teleop.urdf")
+        tree = ET.parse(src)
+        for j in tree.getroot().findall("joint"):
+            if j.get("name", "").endswith("_flex"):
+                lim = j.find("limit")
+                lim.set("lower", f"{-float(lim.get('upper')):.4f}")
+        tree.write(dst, xml_declaration=True, encoding="utf-8")
+        return dst
 
     def add_to(self, scene):
         import genesis as gs
@@ -381,7 +393,7 @@ class SimHand:
         # limits to stay stable). Morph at the origin so base_0..2 ARE world coords.
         self.entity = scene.add_entity(
             material=gs.materials.Rigid(gravity_compensation=1.0),
-            morph=gs.morphs.URDF(file=str(build_floating_urdf(self.out / "mano_hand_planar.urdf")), fixed=True, convexify=False),
+            morph=gs.morphs.URDF(file=str(build_floating_urdf(self._teleop_urdf(self.out / "mano_hand_planar.urdf"))), fixed=True, convexify=False),
             # skin tone #ebb496, matte: the URDF's <material> tag is unreferenced by its
             # visuals, so the color rides on the entity surface (matches suite ManoR)
             surface=gs.surfaces.Rough(color=(0.922, 0.706, 0.588)),
@@ -413,15 +425,14 @@ class SimHand:
         self.targets = (np.zeros(len(self.finger_dofs)), base0)
 
     def set_local(self, kp_local, tgt_pos, tgt_quat):
-        """Finger kp already in this rig's rest frame + explicit wrist pose -> targets.
-        The x-reflection routes through the shared (functionally-left) IK tables; with
-        the asset swap it applies to the RIGHT side (see __init__)."""
-        kp_ik = kp_local * np.array([-1.0, 1.0, 1.0]) if self.side == "right" else kp_local
+        """Finger kp already in this rig's rest frame + explicit wrist pose -> targets."""
+        kp_ik = kp_local * np.array([-1.0, 1.0, 1.0]) if self.side == "left" else kp_local
         ang, err = retarget(kp_ik, self.ik_joints, self.flex, self.abd, warm=self.warm)
         ftgt = np.zeros(len(self.finger_dofs))
         for jid, a in ang.items():
             base = f"link_{KP_LINK[jid]:02d}"
-            for nm, val in ((f"{base}_flex", a[0]), (f"{base}_abd", a[1] if len(a) > 1 else None)):
+            # flex emitted NEGATED: IK is palmar-positive, the URDF axes are dorsal
+            for nm, val in ((f"{base}_flex", -a[0]), (f"{base}_abd", a[1] if len(a) > 1 else None)):
                 if val is not None and nm in self.name_to_dofs:
                     ftgt[self.fmap[self.name_to_dofs[nm][0]]] = val
         # noisy keypoints can walk the unconstrained IK far past anatomy; the joint
