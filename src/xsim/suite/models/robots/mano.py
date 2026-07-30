@@ -10,13 +10,18 @@ arm+gripper robot.
 Asset: assets/mano/mano_hand_planar.urdf — 21 links / 20 dofs, concave
 watertight visuals (links_planar) + convex hull collisions (links_hull).
 Hand frame (measured by FK probe): fingers extend along -x, palm normal +y
-(positive flex curls the tips toward +y), thumb on the +z side. Genesis dof
-order equals URDF file order: per finger [flex1, abd, flex2, flex3] for
-index, middle, pinky, ring, thumb.
+(positive flex curls the tips toward +y), thumb on the +z side — a LEFT
+hand: palm-down FK puts its thumb at +y, where a right hand's would point
+-y. (On camera, fingers -x / palm toward +x reads as the opposite chirality
+— judge handedness by FK, not by looks.) Genesis dof order equals URDF file
+order: per finger [flex1, abd, flex2, flex3] for index, middle, pinky,
+ring, thumb.
 
-Left hand: the right-hand asset mirrored across x=0 (MANO models a right
-hand). Axis rule (x,-y,-z) keeps joint angles chirality-consistent, so the
-mirrored hand at the same qpos is the exact reflection of the right hand.
+Right hand: the left-hand source asset mirrored across x=0. Axis rule
+(x,-y,-z) keeps joint angles chirality-consistent, so the mirrored hand at
+the same qpos is the exact reflection of the source hand. Generated into
+assets/mano_right (assets/mano_left is the stale pre-relabel mirror, kept
+on disk because scripts/teleop_hand.py reads it).
 
 Run: ``scripts/suite.py --robots ManoR``. See [[mano-suite-robot]].
 """
@@ -37,7 +42,7 @@ from xsim.suite.models.robots.robot_model import ROBOT_MODEL_REGISTRY, RobotMode
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 _MANO_DIR = PROJECT_ROOT / "assets" / "mano"
 _MANO_URDF = _MANO_DIR / "mano_hand_planar.urdf"
-_MANO_LEFT_DIR = PROJECT_ROOT / "assets" / "mano_left"
+_MANO_RIGHT_DIR = PROJECT_ROOT / "assets" / "mano_right"
 
 _N_BASE = 6
 _N_FINGER = 20
@@ -102,8 +107,10 @@ def build_floating_urdf(src: Path) -> Path:
 
 
 @dataclass
-class ManoR(RobotModel):
-    name: str = "ManoR"
+class ManoL(RobotModel):
+    """Left hand: the source asset's own chirality (see module docstring)."""
+
+    name: str = "ManoL"
     morph_kind: Literal["urdf", "mjcf"] = "urdf"
     morph_file: str = str(_MANO_URDF)  # source; wrapped with a floating base in make_morph
     fixed: bool = True  # world root fixed; the 6 base joints provide the float
@@ -118,8 +125,8 @@ class ManoR(RobotModel):
     arm_kp: tuple[float, ...] = (400.0, 400.0, 400.0, 30.0, 30.0, 30.0)
     arm_kv: tuple[float, ...] = (40.0, 40.0, 40.0, 2.5, 2.5, 2.5)
     arm_force_limit: float = 50.0
-    gripper_name: str | None = "ManoGrasp"
-    base_pos: tuple[float, float, float] = (_HOME_X, -_HOME_Y, _HOME_Z)  # right at -y
+    gripper_name: str | None = "ManoGraspL"
+    base_pos: tuple[float, float, float] = (_HOME_X, _HOME_Y, _HOME_Z)  # left at +y
     ik_backend: Literal["genesis", "softcost"] = "genesis"
 
     def make_morph(self):
@@ -157,7 +164,7 @@ def _mirror_mesh(src: Path, dst: Path) -> None:
 
 
 def mirror_mano_assets(src_dir: Path, dst_dir: Path) -> None:
-    """Produce a left-hand asset set from the right-hand MANO asset by
+    """Produce a right-hand asset set from the left-hand MANO source asset by
     reflecting across the sagittal plane (x -> -x). Idempotent. Rules:
       meshes         : negate x, flip winding (visuals AND collision hulls)
       joint origin   : negate x (parent-relative vector)
@@ -198,13 +205,13 @@ def mirror_mano_assets(src_dir: Path, dst_dir: Path) -> None:
 
 
 @dataclass
-class ManoL(ManoR):
-    """Left hand: the right-hand MANO asset mirrored across x=0."""
+class ManoR(ManoL):
+    """Right hand: the left-hand MANO source asset mirrored across x=0."""
 
-    name: str = "ManoL"
-    morph_file: str = str(_MANO_LEFT_DIR / "mano_hand_planar.urdf")
-    gripper_name: str | None = "ManoGraspL"
-    base_pos: tuple[float, float, float] = (_HOME_X, _HOME_Y, _HOME_Z)  # left at +y
+    name: str = "ManoR"
+    morph_file: str = str(_MANO_RIGHT_DIR / "mano_hand_planar.urdf")
+    gripper_name: str | None = "ManoGrasp"
+    base_pos: tuple[float, float, float] = (_HOME_X, -_HOME_Y, _HOME_Z)  # right at -y
     # pre-yawed home (world-yaw pi = intrinsic (+pi/2, 0, pi), MHR precedent):
     # the mirrored asset's fingers point +x_hand, so without the yaw the pair
     # reads as x-mirrored, not centerline-mirrored — this puts both hands
@@ -213,7 +220,7 @@ class ManoL(ManoR):
 
     def __post_init__(self) -> None:
         # pure file ops (no genesis) -> safe at construction time
-        mirror_mano_assets(_MANO_DIR, _MANO_LEFT_DIR)
+        mirror_mano_assets(_MANO_DIR, _MANO_RIGHT_DIR)
 
 
 # convenience aliases so `--robots mano-r` / `mano-l` / `mano` also resolve

@@ -4,9 +4,12 @@
 Genesis dof order (measured; equals URDF file order, depth-first per finger):
 per finger [flex1, abd, flex2, flex3] for index, middle, pinky, ring, thumb.
 
-Grasp family (calibrated on 8-env Lift with the FSM expert; 8/8 success):
-fingers extend along -x and curl toward +y (the palm normal); the thumb sits
-on the +z side. The grasp is a claw wrap onto a splayed-thumb wall:
+Grasp family (calibrated on 8-env Lift with the FSM expert; 8/8 success).
+All measurements below were taken on the SOURCE asset — a left hand (fingers
+-x, palm normal +y, thumb +z in its own frame) — and carry to the mirrored
+right hand exactly (0.000 mm FK parity): ``ManoGraspL`` holds the measured
+values, ``ManoGrasp`` (right) reflects tcp x. The grasp is a claw wrap onto
+a splayed-thumb wall:
 
   - open: index+middle hang claw-deep (1.0, 0.55, 0.35) so the pads dangle at
     cube-face depth BESIDE the cube (a shallow open makes the closing arc land
@@ -80,9 +83,10 @@ class ManoGrasp(GripperModel):
     rot_frac: float | None = 0.05
     finger_friction: float | None = 3.0  # slip-limited carry; 2.0 caps lower, 5.0 drags
     morph_file: Path | None = None  # fingers baked into the robot URDF
-    # pinch pocket in the link_00 frame: cube center at capture (sweep optimum;
-    # x = thumb-post wall face -0.043 minus the cube half-width)
-    tcp_pos: tuple[float, float, float] | None = (-0.064, 0.050, 0.040)
+    # pinch pocket in the link_00 frame: cube center at capture (sweep optimum
+    # on the source asset: thumb-post wall face -0.043 minus the cube
+    # half-width = -0.064; the right hand's pocket reflects to +0.064)
+    tcp_pos: tuple[float, float, float] | None = (0.064, 0.050, 0.040)
     # Rx(-90): TCP z -> +y_hand (palm normal), TCP x -> x_hand (squeeze axis)
     tcp_quat: tuple[float, float, float, float] | None = (_SQ2, -_SQ2, 0.0, 0.0)
     # dof order: index[f1,abd,f2,f3] middle[...] pinky[...] ring[...] thumb[...]
@@ -104,8 +108,9 @@ class ManoGrasp(GripperModel):
 
 @dataclass
 class ManoGraspL(ManoGrasp):
-    """Mirrored left hand: same dof order and setpoints (the axis rule keeps
-    joint angles chirality-consistent); the pinch pocket reflects across x=0."""
+    """Left hand (the source asset): same dof order and setpoints (the axis
+    rule keeps joint angles chirality-consistent); holds the as-measured
+    pinch pocket."""
 
     name: str = "ManoGraspL"
-    tcp_pos: tuple[float, float, float] | None = (0.064, 0.050, 0.040)
+    tcp_pos: tuple[float, float, float] | None = (-0.064, 0.050, 0.040)
