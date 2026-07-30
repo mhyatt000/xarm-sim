@@ -253,9 +253,12 @@
   </link>
   <link name="link_13">
     <inertial>
-      <origin xyz="-0.004344 -0.002781 0.022336" rpy="0 0 0"/>
+      <!-- regenerated from links_hull/link_13_r_thumb1.obj at the original mass:
+           the shipped tensor (from the non-watertight planar mesh) was not
+           positive definite and Genesis refused to load it -->
+      <origin xyz="-0.004676 -0.000155 0.008373" rpy="0 0 0"/>
       <mass value="1.291484609e-02"/>
-      <inertia ixx="1.133160353e-06" iyy="1.916169757e-07" izz="-2.117673817e-06" ixy="2.262859027e-07" ixz="-6.925080014e-07" iyz="5.260856714e-07"/>
+      <inertia ixx="1.903005668e-06" iyy="3.002495649e-06" izz="2.388286426e-06" ixy="-1.039146993e-07" ixz="2.834851888e-07" iyz="-3.104318406e-07"/>
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
