@@ -58,7 +58,9 @@ class StackExpertPolicy:
         # tighter gates for the drop: centering within stack_xy_tol with margin
         place_tol_xy: float = 0.008,
         place_tol_z: float = 0.008,
-        transport_height: float = 0.15,  # TCP height above the table while carrying
+        # TCP height above the table while carrying; None = the gripper
+        # model's transport_height if it declares one, else 0.15
+        transport_height: float | None = None,
         # release geometry; None = the gripper model's values (jaw defaults:
         # 2 mm hover, no creep). release_rise is the vertical creep per tick
         # during the OPEN dwell — hands shed the cube gently along the rise
@@ -75,9 +77,14 @@ class StackExpertPolicy:
         self.tol_z = tol_z
         self.place_tol_xy = place_tol_xy
         self.place_tol_z = place_tol_z
-        self.transport_height = transport_height
         # grasp geometry and timing from the gripper (see LiftExpertPolicy)
         g = self.robot.gripper
+        if transport_height is None:
+            transport_height = 0.15 if g.transport_height is None else g.transport_height
+        self.transport_height = transport_height
+        if g.rot_frac is not None:
+            self.rot_frac = g.rot_frac
+        self.carry_step_scale = 0.8 if g.carry_step_scale is None else g.carry_step_scale
         self.place_clearance = g.place_clearance if place_clearance is None else place_clearance
         self.release_rise = g.release_rise if release_rise is None else release_rise
         self.grasp_r = g.held_radius
@@ -245,7 +252,7 @@ class StackExpertPolicy:
         dist = np.linalg.norm(delta, axis=1, keepdims=True)
         # gentler while carrying: full-speed transports shake the cube loose
         step = np.where(((p >= LIFT) & (p <= PLACE))[:, None],
-                        0.8 * self.max_step, self.max_step)
+                        self.carry_step_scale * self.max_step, self.max_step)
         pos_cmd = ee + delta * np.minimum(1.0, step / np.maximum(dist, 1e-9))
         # align to the active cube's faces while grasping, to the target cube's
         # once carrying (so the placed faces meet flush)

@@ -49,6 +49,21 @@ class GripperModel:
     # curled digits need different hover/shed margins than a jaw's pads)
     place_clearance: float = 0.002  # held-cube bottom above the seat at release
     release_rise: float = 0.0  # OPEN-dwell vertical creep per tick, m (0 = hold)
+    # TCP height above the table while carrying (None = the stack expert's
+    # default). Hands whose carry is a friction pinch (not a geometric wedge)
+    # cap the survivable climb; any value must still clear the mid-stack tower
+    # (cube bottom ~2 cm below the TCP vs a 2-cube tower at 6.4 cm).
+    transport_height: float | None = None
+    # stack-expert wrist-slerp fraction override (None = the expert's 0.15).
+    # A friction-pinch hand sheds the cube when the transport phase re-aligns
+    # the wrist to the target cube's faces at full rate; slowed down, the held
+    # cube co-rotates with the fingers instead of grinding out.
+    rot_frac: float | None = None
+    # stack-expert carrying-speed scale override (None = the expert's 0.8 of
+    # max_step). A friction pinch sheds the cube within ~0.7 s at the default
+    # 2 cm/tick lateral pace but survives the slower vertical climb; scale the
+    # carry pace down instead of dropping every long transport.
+    carry_step_scale: float | None = None
     # attached-entity grippers (robosuite MJCF ports): a separate Genesis
     # entity attached to the robot's flange. None = fingers baked into the
     # robot's own URDF (the native xArm case).

@@ -54,7 +54,10 @@ class ManoGrasp(GripperModel):
     kp: float = 40.0  # soft fingers conform around the cube (RUKA: 40 > 160)
     kv: float = 8.0
     force_limit: float = 35.0
-    grasp_dz: float = -0.004
+    # deep grasp: the palm caps the pocket (palm-on-cube) and the pinch line
+    # lands at the cube's mid-face; -0.004 pinched the upper face and the
+    # carry slip-capped at ee ~7 cm (max held-carry sweep)
+    grasp_dz: float = -0.020
     max_open_width: float = 0.065  # thumb-post-to-index-pad mouth at open
     held_radius: float = 0.05
     close_min_s: float = 0.4
@@ -68,7 +71,14 @@ class ManoGrasp(GripperModel):
     release_a: float = 0.8
     place_clearance: float = 0.005
     release_rise: float = 0.002
-    finger_friction: float | None = 2.0  # URDF ships none; default drops carries
+    # the friction-pinch carry survives to ee ~0.10 (measured held-carry
+    # ceiling at friction 3.0); 0.15 is unreachable, and 0.095 still clears
+    # the mid-stack 2-cube tower during both StackRGY moves
+    transport_height: float | None = 0.095
+    # slow wrist re-alignment during the stack carry (the transport-entry
+    # slerp at 0.15 grinds the pinched cube out within a few ticks)
+    rot_frac: float | None = 0.05
+    finger_friction: float | None = 3.0  # slip-limited carry; 2.0 caps lower, 5.0 drags
     morph_file: Path | None = None  # fingers baked into the robot URDF
     # pinch pocket in the link_00 frame: cube center at capture (sweep optimum;
     # x = thumb-post wall face -0.043 minus the cube half-width)
