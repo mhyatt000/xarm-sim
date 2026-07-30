@@ -16,7 +16,9 @@ thumb->index vector mixes the closing x with a FIXED lateral y offset).
 Contact pair = thumb (y ~0.010 at cmc 1.1) vs middle (y ~0.025); index
 (y ~0.044) sweeps just past the cube's +y face. The thumb must close during
 grasp (a pinned thumb is a static post: the curling fingers sweep the cube
-sideways past it). Ring+pinky tuck at 1.5/1.3/0.5; palm dofs (base_pitch,
+sideways past it — but it must NOT sweep under: minimal ip close keeps it a
+low side wall, or the cube ends up resting ON the thumb and can never be
+lowered onto a stack seat). Ring+pinky tuck at 1.5/1.3/0.5; palm dofs (base_pitch,
 wrist_yaw) and splays stay 0 in both postures; index splay moves the tip
 <1 mm (dead lever).
 """
@@ -31,10 +33,10 @@ from xsim.suite.models.grippers.gripper_model import GripperModel
 
 @dataclass
 class RukaHand(GripperModel):
-    # scalars describe index_mcp (dof 3). close_dof = the commanded grasp curl
-    # (not the 1.92 mechanical stop) so closed-on-air gripper_norm ~= 0.
     name: str = "RukaHand"
     n_dofs: int = 21
+    # close_dof = the commanded grasp curl (not the 1.92 mechanical stop) so
+    # closed-on-air gripper_norm ~= 0.
     # scalars describe mid_mcp: a deep command lets the fingers wrap PAST the
     # cube (contacts migrate tip -> pip/mcp knuckles, pinch degrades to a
     # loose envelop and the drive reaches full command = phantom closed-on-air)
