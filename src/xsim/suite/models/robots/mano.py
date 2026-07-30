@@ -135,9 +135,13 @@ class ManoR(RobotModel):
     def build_entity(self, scene):
         # the floating hand is a virtual 6-dof mount, not a supported arm:
         # gravity compensation models the mount holding the hand's weight, so
-        # the base gains can stay soft without a ~9 cm droop
+        # the base gains can stay soft without a ~9 cm droop.
+        # skin tone #ebb496, matte (the URDF's <material> tag is unreferenced
+        # by its visuals, so the color rides on the entity surface)
         return scene.add_entity(
-            material=gs.materials.Rigid(gravity_compensation=1.0), morph=self.make_morph()
+            material=gs.materials.Rigid(gravity_compensation=1.0),
+            morph=self.make_morph(),
+            surface=gs.surfaces.Rough(color=(0.922, 0.706, 0.588)),
         )
 
 
@@ -201,6 +205,11 @@ class ManoL(ManoR):
     morph_file: str = str(_MANO_LEFT_DIR / "mano_hand_planar.urdf")
     gripper_name: str | None = "ManoGraspL"
     base_pos: tuple[float, float, float] = (_HOME_X, _HOME_Y, _HOME_Z)  # left at +y
+    # pre-yawed home (world-yaw pi = intrinsic (+pi/2, 0, pi), MHR precedent):
+    # the mirrored asset's fingers point +x_hand, so without the yaw the pair
+    # reads as x-mirrored, not centerline-mirrored — this puts both hands
+    # fingers -x, thumbs inboard
+    default_arm_qpos: tuple[float, ...] = (0.0, 0.0, 0.0, math.pi / 2, 0.0, math.pi)
 
     def __post_init__(self) -> None:
         # pure file ops (no genesis) -> safe at construction time
