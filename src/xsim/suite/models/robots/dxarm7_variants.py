@@ -23,6 +23,8 @@ from xsim.suite.models.robots.xarm7_variants import (
     XArm7Robotiq85,
     XArm7Robotiq140,
     XArm7RobotiqS,
+    XArm7RukaL,
+    XArm7RukaR,
 )
 
 
@@ -165,6 +167,22 @@ class DXArm7LRobotiqS(XArm7RobotiqS):
 @dataclass
 class DXArm7RRobotiqS(XArm7RobotiqS):
     name: str = "DXArm7RRobotiqS"
+    base_pos: tuple[float, float, float] = _R_POS
+    base_quat: tuple[float, float, float, float] = _R_QUAT
+    mount: Mount | None = field(default_factory=lambda: VMount4040(side=-1))
+
+
+@dataclass
+class DXArm7LRuka(XArm7RukaL):
+    name: str = "DXArm7LRuka"
+    base_pos: tuple[float, float, float] = _L_POS
+    base_quat: tuple[float, float, float, float] = _L_QUAT
+    mount: Mount | None = field(default_factory=lambda: VMount4040(side=+1))
+
+
+@dataclass
+class DXArm7RRuka(XArm7RukaR):
+    name: str = "DXArm7RRuka"
     base_pos: tuple[float, float, float] = _R_POS
     base_quat: tuple[float, float, float, float] = _R_QUAT
     mount: Mount | None = field(default_factory=lambda: VMount4040(side=-1))

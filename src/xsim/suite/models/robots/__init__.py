@@ -13,6 +13,7 @@ from xsim.suite.models.robots.dxarm7_variants import (
     DXArm7LRobotiq85,
     DXArm7LRobotiq140,
     DXArm7LRobotiqS,
+    DXArm7LRuka,
     DXArm7RBD,
     DXArm7RFourier,
     DXArm7RInspire,
@@ -22,6 +23,7 @@ from xsim.suite.models.robots.dxarm7_variants import (
     DXArm7RRobotiq85,
     DXArm7RRobotiq140,
     DXArm7RRobotiqS,
+    DXArm7RRuka,
 )
 from xsim.suite.models.robots.mano import ManoL, ManoR
 from xsim.suite.models.robots.robot_model import ROBOT_MODEL_REGISTRY, RobotModel
@@ -54,6 +56,7 @@ __all__ = [
     "DXArm7LRobotiq140",
     "DXArm7LRobotiq85",
     "DXArm7LRobotiqS",
+    "DXArm7LRuka",
     "DXArm7R",
     "DXArm7RBD",
     "DXArm7RFourier",
@@ -64,6 +67,7 @@ __all__ = [
     "DXArm7RRobotiq140",
     "DXArm7RRobotiq85",
     "DXArm7RRobotiqS",
+    "DXArm7RRuka",
     "ManoL",
     "ManoR",
     "ROBOT_MODEL_REGISTRY",
