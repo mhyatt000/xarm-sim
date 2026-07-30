@@ -98,6 +98,7 @@ def _obj_vertices(path):
 
 
 _RIG = None
+DRIVE_BOUNDS = {}  # joint id -> (n_dof, 2) URDF limits; filled by mano_rig()
 
 
 def mano_rig():
@@ -111,11 +112,13 @@ def mano_rig():
     import xml.etree.ElementTree as ET
 
     root = ET.parse(MANO_DIR / "mano_hand_planar.urdf").getroot()
-    origin, axis = {}, {}
+    origin, axis, limit = {}, {}, {}
     for j in root.findall("joint"):
         origin[j.get("name")] = np.fromstring(j.find("origin").get("xyz"), sep=" ")
         a = np.fromstring(j.find("axis").get("xyz"), sep=" ")
         axis[j.get("name")] = a / np.linalg.norm(a)
+        lim = j.find("limit")
+        limit[j.get("name")] = (float(lim.get("lower")), float(lim.get("upper")))
 
     joints, flex, abd = (np.zeros((21, 3)) for _ in range(3))
     for spec in FINGERS.values():
@@ -125,8 +128,11 @@ def mano_rig():
             p = p + origin[f"{name}_flex"]
             joints[jid] = p
             flex[jid] = axis[f"{name}_flex"]
+            rows = [limit[f"{name}_flex"]]
             if spec["drive"].get(jid) == 2:
                 abd[jid] = axis[f"{name}_abd"]
+                rows.append(limit[f"{name}_abd"])
+            DRIVE_BOUNDS[jid] = np.asarray(rows)
         tip_id = spec["chain"][-1]
         v = _obj_vertices(MANO_DIR / "links_planar" / f"{TIP_LINK[tip_id]}.obj")
         joints[tip_id] = p + v[np.argmax(np.linalg.norm(v, axis=1))]
@@ -158,13 +164,17 @@ def _fk_clean(name, angles, joints, flex, abd):
     R = np.eye(3)
     for i in range(1, len(chain)):
         j, jp = chain[i], chain[i - 1]
+        # URDF semantics: joint j's rotation moves only its DESCENDANTS, so place j
+        # first, then fold its rotation into the accumulated frame. (The old NIMBLE rig
+        # rotated the segment ENDING at j -- fingers bent at the wrist, and against real
+        # targets whose MCPs stay put the IK's optimum was zero flex: frozen fingers.)
+        out[j] = out[jp] + R @ (joints[j] - joints[jp])
         if j in angles:
             a = angles[j]
             Rj = _rot(R @ flex[j], a[0])
             if len(a) > 1:
                 Rj = Rj @ _rot(R @ abd[j], a[1])
             R = Rj @ R
-        out[j] = out[jp] + R @ (joints[j] - joints[jp])
     return out
 
 
@@ -174,7 +184,13 @@ def ik_finger(name, target, joints, flex, abd, iters=40, x0=None, tol=1e-3):
     warm-starts from the previous frame's solution; `tol` (m) is an early exit."""
     spec = FINGERS[name]
     dofs = [(j, d) for j, d in spec["drive"].items()]  # (joint, n_dof)
+    # project every iterate onto the URDF joint limits: unbounded Gauss-Newton on noisy
+    # real keypoints settles into zigzag minima (PIP -2.7, DIP +2.2) that the clamp then
+    # pins to the same limit pose every frame -- fingers look frozen
+    bnd = np.concatenate([DRIVE_BOUNDS[j][:d] for j, d in dofs]) if DRIVE_BOUNDS else None
     x = np.zeros(sum(d for _, d in dofs)) if x0 is None else np.asarray(x0, dtype=float).copy()
+    if bnd is not None:
+        x = np.clip(x, bnd[:, 0], bnd[:, 1])
 
     def unpack(x):
         angles, k = {}, 0
@@ -200,6 +216,8 @@ def ik_finger(name, target, joints, flex, abd, iters=40, x0=None, tol=1e-3):
             J[:, k] = (resid(x + dx) - r) / 1e-4
         step = np.linalg.lstsq(J, -r, rcond=None)[0]
         x = x + np.clip(step, -0.5, 0.5)
+        if bnd is not None:
+            x = np.clip(x, bnd[:, 0], bnd[:, 1])
     return unpack(x), float(np.linalg.norm(resid(x))), x
 
 
@@ -224,7 +242,12 @@ def selftest():
     rng = np.random.default_rng(1)
     worst = 0.0
     for name in FINGERS:
-        gt = {j: rng.uniform(-0.2, 0.8, size=d) for j, d in FINGERS[name]["drive"].items()}
+        # sample within the URDF limits: the bounded IK cannot (and should not) recover
+        # angles outside them
+        gt = {
+            j: rng.uniform(DRIVE_BOUNDS[j][:d, 0] * 0.8, DRIVE_BOUNDS[j][:d, 1] * 0.8)
+            for j, d in FINGERS[name]["drive"].items()
+        }
         posed = _fk_clean(name, gt, joints, flex, abd)
         ang, err, _ = ik_finger(name, posed, joints, flex, abd)
         derr = max(np.abs(np.concatenate([ang[j] - gt[j] for j in gt])))
@@ -323,13 +346,21 @@ class SimHand:
     def __init__(self, side, pos, ema_n=4):
         self.side, self.pos = side, np.asarray(pos, dtype=float)
         self.ik_joints, self.flex, self.abd = mano_rig()
-        self.out = MANO_DIR
-        if side == "left":
+        # The URDF's curl-verified axes ALL flex toward +y — including the thumb — which
+        # makes assets/mano FUNCTIONALLY a left hand whatever its right-hand meshes say
+        # (MANO canonical rotated to this frame puts the anatomical palm at -y; a real
+        # right hand can only fit these axes through a reflection — measured: 133 mm ->
+        # 52 mm on a fist frame). So each side loads the OTHER side's asset: the
+        # mirrored asset is functionally right, and the existing mirror IK path IS the
+        # reflection. If the URDF's axis signs get fixed upstream, swap these back.
+        if side == "right":
             from xsim.suite.models.robots.mano import mirror_mano_assets
 
             mirror_mano_assets(MANO_DIR, MANO_LEFT_DIR)  # idempotent
             self.out = MANO_LEFT_DIR
-        mirror = np.array([1.0 if side == "right" else -1.0, 1.0, 1.0])
+        else:
+            self.out = MANO_DIR
+        mirror = np.array([1.0 if side == "left" else -1.0, 1.0, 1.0])
         rest_kp = self.ik_joints[KP_TO_JOINT] * mirror
         self.o_rest, self.R_rest = palm_frame(rest_kp)
         self._rig_spans = np.linalg.norm(rest_kp[[5, 9, 13, 17]] - rest_kp[0], axis=1)  # wrist->MCP
@@ -382,8 +413,10 @@ class SimHand:
         self.targets = (np.zeros(len(self.finger_dofs)), base0)
 
     def set_local(self, kp_local, tgt_pos, tgt_quat):
-        """Finger kp already in this rig's rest frame + explicit wrist pose -> targets."""
-        kp_ik = kp_local * np.array([-1.0, 1.0, 1.0]) if self.side == "left" else kp_local
+        """Finger kp already in this rig's rest frame + explicit wrist pose -> targets.
+        The x-reflection routes through the shared (functionally-left) IK tables; with
+        the asset swap it applies to the RIGHT side (see __init__)."""
+        kp_ik = kp_local * np.array([-1.0, 1.0, 1.0]) if self.side == "right" else kp_local
         ang, err = retarget(kp_ik, self.ik_joints, self.flex, self.abd, warm=self.warm)
         ftgt = np.zeros(len(self.finger_dofs))
         for jid, a in ang.items():
