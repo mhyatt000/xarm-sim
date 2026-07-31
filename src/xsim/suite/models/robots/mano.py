@@ -124,9 +124,10 @@ class ManoR(RobotModel):
     fixed: bool = True  # world root fixed; the 6 base joints provide the float
     self_collision: bool = False  # curled postures jam on intra-hand pairs
     arm_dofs: int = _N_BASE
-    # base_3 = +pi/2 rolls the ANATOMICAL palm down (-y_hand -> world -z);
-    # -pi/2 is the dorsal-side-down impostor that reads left-handed on camera
-    default_arm_qpos: tuple[float, ...] = (0.0, 0.0, 0.0, math.pi / 2, 0.0, 0.0)
+    # home = intrinsic (-pi/2, 0, pi): anatomical palm down (-y_hand -> -z)
+    # AND fingers +x into the workspace, so the thumb sits inboard (+y at the
+    # -y base) — bimanual convention; the expert re-yaws freely after init
+    default_arm_qpos: tuple[float, ...] = (0.0, 0.0, 0.0, -math.pi / 2, 0.0, math.pi)
     ee_link_name: str = "link_00"
     # gravity-compensated entity (see build_entity), so the gains only shape
     # tracking, not droop; prismatics carry the hand + payload, revolutes the
@@ -221,11 +222,9 @@ class ManoL(ManoR):
     morph_file: str = str(_MANO_LEFT_DIR / "mano_hand_planar.urdf")
     gripper_name: str | None = "ManoGraspL"
     base_pos: tuple[float, float, float] = (_HOME_X, _HOME_Y, _HOME_Z)  # left at +y
-    # pre-yawed home (world-yaw pi = intrinsic (-pi/2, 0, pi), MHR precedent):
-    # the mirrored asset's fingers point +x_hand, so without the yaw the pair
-    # reads as x-mirrored, not centerline-mirrored — this puts both hands
-    # fingers -x with the anatomical palm down
-    default_arm_qpos: tuple[float, ...] = (0.0, 0.0, 0.0, -math.pi / 2, 0.0, math.pi)
+    # the mirrored asset's fingers already point +x_hand, so palm-down alone
+    # gives fingers +x with the thumb inboard (-y at the +y base)
+    default_arm_qpos: tuple[float, ...] = (0.0, 0.0, 0.0, math.pi / 2, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         # pure file ops (no genesis) -> safe at construction time
