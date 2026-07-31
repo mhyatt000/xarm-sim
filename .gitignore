@@ -28,6 +28,7 @@ depth.png
 depth.npy
 
 # generated MANO assets (mirror + floating-base wrapper are build artifacts)
-assets/mano/mano_hand_planar_floating.urdf
+assets/mano/*_floating.urdf
+assets/mano/*_teleop.urdf
 assets/mano_right/
 assets/mano_left/
