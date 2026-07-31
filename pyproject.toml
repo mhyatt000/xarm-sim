@@ -55,6 +55,8 @@ dependencies = [
     "albumentations>=2.0.8",
     "pytorch-kinematics>=0.10.0",
     "lewm",
+    "objaverse>=0.1.7",
+    "pypose>=0.9.5",
 ]
 
 [dependency-groups]

@@ -2,8 +2,9 @@
 
 ``PolicyViewer`` owns a viser server and displays camera images and joint
 values as GUI panels, plus a URDF robot in the 3D scene: solid at the
-measured joints, translucent ghost at the commanded pose (meaningful here
-because the DAgger policy outputs absolute joint targets).
+measured joints, translucent blue ghost at the next commanded pose, and a
+translucent red ghost at the final pose of the policy's action chunk
+(meaningful here because the DAgger policy outputs absolute joint targets).
 ``ViserWrappedPolicy`` wraps a policy and pushes each step's inputs and
 outputs to a viewer before returning — display errors are logged, never
 raised, so visualization can't break serving.
@@ -23,8 +24,10 @@ log = logging.getLogger(__name__)
 
 Images = np.ndarray | list[np.ndarray] | dict[str, np.ndarray]
 
-# translucent light-blue ghost used to render the commanded pose
+# translucent light-blue ghost = next commanded pose; red = final pose of
+# the current action chunk
 _GHOST_COLOR: tuple[int, int, int] = (120, 190, 255)
+_FINAL_COLOR: tuple[int, int, int] = (255, 110, 110)
 _GHOST_OPACITY: float = 0.25
 
 
@@ -81,9 +84,18 @@ class UrdfRobot:
                     )
                 )
 
+        self._visible = True
+
     @property
     def num_actuated(self) -> int:
         return len(self._urdf.actuated_joint_names)
+
+    def set_visible(self, visible: bool) -> None:
+        if visible == self._visible:
+            return
+        self._visible = visible
+        for m in self._meshes:
+            m.visible = visible
 
     def _name(self, frame_name: str) -> str:
         """Scene-node path from base_frame down to ``frame_name`` (see ViserUrdf)."""
@@ -162,10 +174,12 @@ class PolicyViewer:
         self._numbers: dict[str, viser.GuiNumberHandle] = {}
         self._folders: dict[str, viser.GuiFolderHandle] = {}
 
-        # solid robot at the current joints + translucent light-blue ghost at
-        # the commanded pose (created only when a URDF is given)
+        # solid robot at the current joints + translucent ghosts: blue at the
+        # next commanded pose, red at the final pose of the action chunk
+        # (created only when a URDF is given)
         self._robot: UrdfRobot | None = None
         self._ghost: UrdfRobot | None = None
+        self._ghost_final: UrdfRobot | None = None
         if urdf_path is not None:
             self._robot = UrdfRobot(self.server, urdf_path, root_node_name="/robot")
             if show_ghost:
@@ -176,6 +190,14 @@ class PolicyViewer:
                     color=_GHOST_COLOR,
                     opacity=_GHOST_OPACITY,
                 )
+                self._ghost_final = UrdfRobot(
+                    self.server,
+                    urdf_path,
+                    root_node_name="/ghost_final",
+                    color=_FINAL_COLOR,
+                    opacity=_GHOST_OPACITY,
+                )
+                self._ghost_final.set_visible(False)
 
     def show_robot(self, joints: np.ndarray, *, ghost: bool = False) -> None:
         """Set the solid (current) or ghost (commanded) robot's joint config."""
@@ -187,6 +209,21 @@ class PolicyViewer:
             vec = vec[0]
         robot.update_cfg(vec)
 
+    def show_plan(self, plan: np.ndarray) -> None:
+        """Ghost an action chunk: blue at its next action (row 0), red at its
+        final action (row -1, hidden when the plan is a single action)."""
+        plan = np.asarray(plan, dtype=np.float32)
+        while plan.ndim > 2:
+            plan = plan[0]
+        if plan.ndim == 1:
+            plan = plan[None]
+        if self._ghost is not None:
+            self._ghost.update_cfg(plan[0])
+        if self._ghost_final is not None:
+            self._ghost_final.set_visible(len(plan) > 1)
+            if len(plan) > 1:
+                self._ghost_final.update_cfg(plan[-1])
+
     def show_images(self, images: Images, *, prefix: str = "input") -> None:
         for name, img in _named_images(images).items():
             key = f"{prefix}/{name}"
@@ -196,18 +233,18 @@ class PolicyViewer:
                 with self._folder(prefix):
                     self._images[key] = self.server.gui.add_image(img, label=name)
 
-    def show_joints(self, joints: np.ndarray, *, prefix: str = "input") -> None:
-        """Display a 1D joint vector as read-only GUI numbers (extra lead dims take [0])."""
+    def show_joints(self, joints: np.ndarray, *, prefix: str = "input", label: str = "j") -> None:
+        """Display a 1D vector as read-only GUI numbers (extra lead dims take [0])."""
         vec = np.asarray(joints, dtype=np.float32)
         while vec.ndim > 1:
             vec = vec[0]
         for i, v in enumerate(vec):
-            key = f"{prefix}/j{i}"
+            key = f"{prefix}/{label}{i}"
             if key in self._numbers:
                 self._numbers[key].value = float(v)
             else:
                 with self._folder(prefix):
-                    self._numbers[key] = self.server.gui.add_number(f"j{i}", float(v), disabled=True)
+                    self._numbers[key] = self.server.gui.add_number(f"{label}{i}", float(v), disabled=True)
 
     def _folder(self, prefix: str) -> viser.GuiFolderHandle:
         if prefix not in self._folders:
@@ -217,12 +254,16 @@ class PolicyViewer:
 
 class ViserWrappedPolicy(BasePolicy):
     """Plot each step's inputs (camera images, measured joints) and output
-    (commanded joints, as numbers and the ghost robot) to a PolicyViewer,
-    then return the inner policy's result.
+    (commanded joints as numbers, blue ghost at the next action, red ghost
+    at the final action of the chunk) to a PolicyViewer, then return the
+    inner policy's result.
 
     Defaults match the scripts/serve_dagger.py contract: per-view image keys,
     ``robot0_joint_pos`` (7,) + ``robot0_gripper_norm`` (1,) proprio, and a
-    ``result["action"]`` of absolute joint targets + gripper.
+    ``result["action"]`` of absolute joint targets + gripper. Raw client obs
+    go under the ``input`` folder; when the inner policy has a
+    ``_preprocess``, the frames and proprio vector the net actually consumes
+    are also shown, under ``net``.
     """
 
     def __init__(
@@ -259,6 +300,19 @@ class ViserWrappedPolicy(BasePolicy):
         images = {name: obs[name] for name in self.views if name in obs}
         if images:
             self.viewer.show_images(images)
+        prep = getattr(self.inner, "_preprocess", None)
+        if prep is not None:
+            # what the net actually sees: resized/cropped frames in training
+            # view order + the concatenated proprio vector
+            prop, rgb = prep(obs)
+            frames = np.asarray(rgb)
+            while frames.ndim > 4:
+                frames = frames[0]  # (V, 3, H, W)
+            self.viewer.show_images(
+                {name: f.transpose(1, 2, 0) for name, f in zip(self.views, frames)},
+                prefix="net",
+            )
+            self.viewer.show_joints(prop, prefix="net", label="p")
         joints = obs.get(self.joint_key)
         if joints is None:
             return
@@ -270,9 +324,13 @@ class ViserWrappedPolicy(BasePolicy):
 
     def _show_outputs(self, result: dict) -> None:
         action = result.get("action") if isinstance(result, dict) else None
-        if action is not None and np.ndim(action) == 2:  # flow chunk plan: show its first step
-            action = action[0]
         if action is None:
             return
-        self.viewer.show_joints(action, prefix="output")
-        self.viewer.show_robot(action, ghost=True)
+        # the full remaining horizon when the inner policy exposes it (see
+        # DaggerPolicy.horizon) — in rtc/replan modes the returned action is
+        # a single row of a chunk the wrapper would otherwise never see
+        plan = getattr(self.inner, "horizon", None)
+        if plan is None:
+            plan = np.asarray(action)
+        self.viewer.show_plan(plan)
+        self.viewer.show_joints(plan, prefix="output")

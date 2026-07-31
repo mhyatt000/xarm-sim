@@ -6,7 +6,10 @@ from itertools import permutations
 
 import numpy as np
 
-from xsim.suite.environments.manipulation.manipulation_env import ManipulationEnv
+from xsim.suite.environments.manipulation.manipulation_env import (
+    ManipulationEnv,
+    pose_mats,
+)
 from xsim.suite.models import BoxObject, TableArena, Task
 from xsim.suite.utils import UniformRandomSampler
 
@@ -166,17 +169,6 @@ class Stack(ManipulationEnv):
             best = np.maximum(best, pairs)
         return best
 
-    def _robot_contact(self, cube: BoxObject) -> np.ndarray:
-        """Per-env: is ``cube`` in contact with any robot body?"""
-        contacts = cube.entity.get_contacts(with_entity=self.robots[0].entity)
-        mask = contacts.get("valid_mask") if isinstance(contacts, dict) else None
-        if mask is None:
-            return np.zeros(self.n_envs, dtype=bool)
-        mask = np.asarray(mask.detach().cpu() if hasattr(mask, "detach") else mask)
-        if mask.ndim == 1:  # non-parallelized scene: (n_contacts,)
-            return np.full(self.n_envs, bool(mask.any()))
-        return mask.any(axis=-1)
-
     def _raw_success(self) -> np.ndarray:
         """Instantaneous released-tower condition; success needs it for
         ``success_hold_ticks`` consecutive control steps."""
@@ -212,6 +204,21 @@ class Stack(ManipulationEnv):
 
     def _check_terminated(self) -> np.ndarray:
         return self._check_success()
+
+    def _datagen_object_poses(self) -> dict[str, np.ndarray]:
+        return {c.name: pose_mats(c.get_pos(), c.get_quat()) for c in self.cubes}
+
+    def _datagen_term_signals(self) -> dict[str, np.ndarray]:
+        # place signals follow the first allowed order (the canonical one for
+        # StackRGY); the base cube never gets a place signal
+        signals = {f"grasp_{c.name}": self._grasped(c) for c in self.cubes}
+        base, mid, top = self.stack_orders[0]
+        for upper, lower in ((mid, base), (top, mid)):
+            c, b = self.cubes[upper], self.cubes[lower]
+            signals[f"place_{c.name}"] = self._pair_on(
+                c.get_pos(), b.get_pos()
+            ) & ~self._robot_contact(c)
+        return signals
 
 
 class StackRGY(Stack):

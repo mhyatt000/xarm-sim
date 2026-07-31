@@ -843,6 +843,12 @@ wheels = [
 ]
 
 [[package]]
+name = "gputil"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/0e/5c61eedde9f6c87713e89d794f01e378cfd9565847d4576fa627d758c554/GPUtil-1.4.0.tar.gz", hash = "sha256:099e52c65e512cdfa8c8763fca67f5a5c2afb63469602d5dcb4d296b3661efb9", size = 5545, upload-time = "2018-12-18T09:12:13.63Z" }
+
+[[package]]
 name = "gs-madrona"
 version = "0.0.8"
 source = { editable = "extra/gs-madrona" }
@@ -1102,6 +1108,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a9/01/15bb152d77b21318514a96f43af312635eb2500c96b55398d020c93d86ea/importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc", size = 56405, upload-time = "2026-03-20T06:42:56.999Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/38/3d/2d244233ac4f76e38533cfcb2991c9eb4c7bf688ae0a036d30725b8faafe/importlib_metadata-9.0.0-py3-none-any.whl", hash = "sha256:2d21d1cc5a017bd0559e36150c21c830ab1dc304dedd1b7ea85d20f45ef3edd7", size = 27789, upload-time = "2026-03-20T06:42:55.665Z" },
+]
+
+[[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
 ]
 
 [[package]]
@@ -1970,6 +1985,24 @@ wheels = [
 ]
 
 [[package]]
+name = "objaverse"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fsspec", marker = "sys_platform == 'linux'" },
+    { name = "gputil", marker = "sys_platform == 'linux'" },
+    { name = "loguru", marker = "sys_platform == 'linux'" },
+    { name = "pandas", marker = "sys_platform == 'linux'" },
+    { name = "pyarrow", marker = "sys_platform == 'linux'" },
+    { name = "requests", marker = "sys_platform == 'linux'" },
+    { name = "tqdm", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/7d/8d27ed42c6468eef11e57198a51e5b8c43fcc8b8f3cf8c420dcec73e0841/objaverse-0.1.7.tar.gz", hash = "sha256:2e65205bd4e27ef72803fc9cda3225e7ebdf1dc2a829bcd983b682a85617bf94", size = 24606, upload-time = "2023-11-01T03:42:24.365Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/bd/e639a506581ee27b77cf036530d596ab80674d8aaec316226b4594680506/objaverse-0.1.7-py3-none-any.whl", hash = "sha256:7396d119efde5794d0e87d3ca03047d0b0585b2a83ea381a8cc2ddc219d6f1a3", size = 32228, upload-time = "2023-11-01T03:42:22.843Z" },
+]
+
+[[package]]
 name = "omegaconf"
 version = "2.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2159,6 +2192,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/79/4f/428f6d959818d7425a94c190a6b26fbc58035cbef40bf249be0b62a9aedd/plotly-5.24.1.tar.gz", hash = "sha256:dbc8ac8339d248a4bcc36e08a5659bacfe1b079390b8953533f4eb22169b4bae", size = 9479398, upload-time = "2024-09-12T15:36:31.068Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/ae/580600f441f6fc05218bd6c9d5794f4aef072a7d9093b291f1c50a9db8bc/plotly-5.24.1-py3-none-any.whl", hash = "sha256:f67073a1e637eb0dc3e46324d9d51e2fe76e9727c892dde64ddf1e1b51f29089", size = 19054220, upload-time = "2024-09-12T15:36:24.08Z" },
+]
+
+[[package]]
+name = "pluggy"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
 ]
 
 [[package]]
@@ -2451,6 +2493,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pypose"
+version = "0.9.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest", marker = "sys_platform == 'linux'" },
+    { name = "torch", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/12/13/61d469b89065763ba03d62b7947d0316dac08db587a0369a0f9cbe6b4fab/pypose-0.9.5.tar.gz", hash = "sha256:653d82dbf599270ab075948cef26ef887022640e11d7f09a13b2b5b270a40227", size = 130705, upload-time = "2026-04-12T23:08:32.552Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/94/2ccc00b389f459215f44f55a58dec233efef3c4e3381c28a2178f1746625/pypose-0.9.5-py3-none-any.whl", hash = "sha256:ba9e8babbf5b54b1d54168fb030458d8ef84e66f7d5d013d5263eec27b70bed1", size = 144189, upload-time = "2026-04-12T23:08:31.254Z" },
+]
+
+[[package]]
 name = "pyquaternion"
 version = "0.9.9"
 source = { registry = "https://pypi.org/simple" }
@@ -2479,6 +2534,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/40/75/dcaa1d59b01ea9966b3c18d9782bae2ffc3a37cd2b4e2236673ff3830339/pysplashsurf-0.14.1.0-cp310-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:9ecbe468c93d7fbc3af4a410801a2468b822f8a5406d0ce7289614003d331d64", size = 2818475, upload-time = "2026-03-21T20:18:54.684Z" },
     { url = "https://files.pythonhosted.org/packages/17/26/e4b5356840220b535fc6585028d1cb805758c26084b114153508fa382c36/pysplashsurf-0.14.1.0-cp310-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:0efaa134417426b2a5739794c06920e2181f8fb331752068726a7f6c73e0826f", size = 2986990, upload-time = "2026-03-21T20:18:56.048Z" },
     { url = "https://files.pythonhosted.org/packages/16/f6/1870e6faadb0eae58c2ac4c03e47ecff954717d5da68de8d43e41b037c66/pysplashsurf-0.14.1.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:27a96c2e8350b14715a9c13987ece9747cbfca30736f9d95e27edf61c5978510", size = 2970359, upload-time = "2026-03-21T20:18:57.414Z" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "iniconfig", marker = "sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
+    { name = "pluggy", marker = "sys_platform == 'linux'" },
+    { name = "pygments", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
 ]
 
 [[package]]
@@ -3549,7 +3619,9 @@ dependencies = [
     { name = "jax", marker = "sys_platform == 'linux'" },
     { name = "lewm", marker = "sys_platform == 'linux'" },
     { name = "ninja", marker = "sys_platform == 'linux'" },
+    { name = "objaverse", marker = "sys_platform == 'linux'" },
     { name = "protobuf", marker = "sys_platform == 'linux'" },
+    { name = "pypose", marker = "sys_platform == 'linux'" },
     { name = "pytorch-kinematics", marker = "sys_platform == 'linux'" },
     { name = "rich", marker = "sys_platform == 'linux'" },
     { name = "tensordict", marker = "sys_platform == 'linux'" },
@@ -3587,7 +3659,9 @@ requires-dist = [
     { name = "jax", specifier = ">=0.10.2" },
     { name = "lewm", editable = "../le-wm" },
     { name = "ninja", specifier = ">=1.13.0" },
+    { name = "objaverse", specifier = ">=0.1.7" },
     { name = "protobuf", specifier = ">=7.35.1" },
+    { name = "pypose", specifier = ">=0.9.5" },
     { name = "pytorch-kinematics", specifier = ">=0.10.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "tensordict", specifier = ">=0.13.0" },

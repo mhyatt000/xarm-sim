@@ -7,6 +7,7 @@ eval, play, and real-robot inference without the training script.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -146,6 +147,43 @@ def time_features(t: torch.Tensor) -> torch.Tensor:
     return torch.cat([ang.sin(), ang.cos()], dim=-1)
 
 
+@dataclass(frozen=True)
+class RTCGuidance:
+    """Real-time chunking guidance (Black et al. 2025, arXiv:2506.07339).
+
+    Inpaints a fresh chunk onto the tail of the previous plan that keeps
+    executing while inference runs: rows [0, delay) are committed (they run
+    before the new plan can land, so they must match), rows [delay, horizon)
+    are pulled toward the previous plan with decaying weight, and rows
+    [horizon, chunk) are generated freely.
+    """
+
+    prev: np.ndarray  # (N, chunk, act_dim) previous-plan tail in action units;
+                      # row 0 = the action executing when inference starts
+    delay: int        # d: steps that will execute before the new plan lands
+    horizon: int      # H - s: rows past it ignore the previous plan entirely
+    schedule: str = "exp"  # prefix weight decay: exp | linear | ones | zeros
+    beta: float = 10.0     # max guidance weight (paper's clip, their addition
+                           # for stability at few denoising steps)
+
+
+def prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
+    """RTC soft mask over chunk rows: 1 on [0, start), a decaying ramp on
+    [start, end), 0 on [end, total); ``end`` takes precedence over ``start``.
+    start=2, end=6, total=10 (linear) -> 1 1 4/5 3/5 2/5 1/5 0 0 0 0."""
+    start = min(start, end)
+    i = torch.arange(total, dtype=torch.float32)
+    if schedule == "ones":
+        w = torch.ones(total)
+    elif schedule == "zeros":
+        w = (i < start).float()
+    else:  # linear / exp ramp
+        w = ((start - 1 - i) / (end - start + 1) + 1).clamp(0.0, 1.0)
+        if schedule == "exp":
+            w = w * torch.expm1(w) / (math.e - 1)
+    return w * (i < end)
+
+
 class _FlowHead:
     """Rectified-flow chunk head shared by the image and state flow students.
 
@@ -185,16 +223,41 @@ class _FlowHead:
         h: (N, hidden); x: (N, chunk*act_dim) normalized; t: (N, 1)."""
         return self.flow_net(torch.cat([h, x, time_features(t)], dim=-1))
 
-    def sample(self, h: torch.Tensor) -> torch.Tensor:
-        """Integrate noise -> plan; returns (N, chunk, act_dim) in action units."""
+    def sample(self, h: torch.Tensor, rtc: RTCGuidance | None = None) -> torch.Tensor:
+        """Integrate noise -> plan; returns (N, chunk, act_dim) in action units.
+
+        With ``rtc``, each Euler step adds the pinv (inpainting) guidance of
+        Black et al. 2025: the soft-masked error between the previous plan and
+        the endpoint estimate, pulled back through the denoiser by a vjp. Our
+        head predicts the endpoint x1 directly, so the paper's denoiser
+        x_t + (1 - t) v is exactly ``predict_x1``.
+        """
         n = h.shape[0]
         x = torch.randn(n, self.chunk * self.act_dim, device=h.device)
         dt = 1.0 / self.flow_steps
+        if rtc is not None:
+            prev = torch.as_tensor(rtc.prev, dtype=torch.float32, device=h.device)
+            y = ((prev - self.act_mean) / self.act_std).reshape(n, -1)
+            w = prefix_weights(rtc.delay, rtc.horizon, self.chunk, rtc.schedule)
+            w = w.to(h.device).repeat_interleave(self.act_dim)[None]
         for k in range(self.flow_steps):
-            t = torch.full((n, 1), k * dt, device=h.device)
-            # velocity of the linear path from the endpoint estimate; the last
-            # step (t = 1 - dt) lands exactly on x1, so 1 - t stays >= dt > 0
-            x = x + dt * (self.predict_x1(h, x, t) - x) / (1.0 - k * dt)
+            t = k * dt
+            tt = torch.full((n, 1), t, device=h.device)
+            if rtc is None:
+                # velocity of the linear path from the endpoint estimate; the
+                # last step (t = 1 - dt) lands on x1, so 1 - t stays >= dt > 0
+                x = x + dt * (self.predict_x1(h, x, tt) - x) / (1.0 - t)
+                continue
+            with torch.enable_grad():
+                xg = x.detach().requires_grad_(True)
+                x1 = self.predict_x1(h, xg, tt)
+                err = (w * (y - x1)).detach()
+                corr = torch.autograd.grad(x1, xg, grad_outputs=err)[0]
+            # min(beta, (1-t)/(t r_t^2)) with r_t^2 = (1-t)^2/(t^2 + (1-t)^2);
+            # the t=0 pole clips to beta (paper's nan_to_num + min)
+            inv_r2 = (t * t + (1.0 - t) ** 2) / (1.0 - t) ** 2
+            gw = min((1.0 - t) / t * inv_r2, rtc.beta) if t > 0 else rtc.beta
+            x = x + dt * ((x1.detach() - x) / (1.0 - t) + gw * corr)
         a = x.reshape(n, self.chunk, self.act_dim) * self.act_std + self.act_mean
         return a.clamp(self.act_low, self.act_high)
 
@@ -224,12 +287,13 @@ class FlowImageStudent(_FlowHead, ImageStudent):
         return self.predict_x1(h, x_t, t), self.aux_head(h), h
 
     @torch.no_grad()
-    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    def act(self, obs: tuple[np.ndarray, np.ndarray],
+            rtc: RTCGuidance | None = None) -> np.ndarray:
         prop, rgb = obs
         device = self.prop_mean.device
         x = torch.from_numpy(np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
         p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
-        return self.sample(self.features(x, p)).cpu().numpy()
+        return self.sample(self.features(x, p), rtc).cpu().numpy()
 
 
 class _Block(nn.Module):
@@ -368,7 +432,8 @@ class ViTFlowImageStudent(_FlowHead, nn.Module):
         return self.predict_x1(h, x_t, t), self.aux_head(h), h
 
     @torch.no_grad()
-    def act(self, obs: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    def act(self, obs: tuple[np.ndarray, np.ndarray],
+            rtc: RTCGuidance | None = None) -> np.ndarray:
         # BN and dropout live in this net (unlike the CNN student): inference
         # must run in eval mode or plans get batch-stat drift + dropout noise
         was_training = self.training
@@ -379,7 +444,7 @@ class ViTFlowImageStudent(_FlowHead, nn.Module):
             x = torch.from_numpy(
                 np.ascontiguousarray(rgb)).to(device).float() / 255.0 - 0.5
             p = torch.from_numpy(np.asarray(prop, dtype=np.float32)).to(device)
-            return self.sample(self.features(x, p)).cpu().numpy()
+            return self.sample(self.features(x, p), rtc).cpu().numpy()
         finally:
             self.train(was_training)
 
@@ -415,7 +480,7 @@ class FlowStateStudent(_FlowHead, Student):
         return self.predict_x1(h, x_t, t), h
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray) -> np.ndarray:
+    def act(self, obs: np.ndarray, rtc: RTCGuidance | None = None) -> np.ndarray:
         device = self.obs_mean.device
         x = torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device)
-        return self.sample(self.features(x)).cpu().numpy()
+        return self.sample(self.features(x), rtc).cpu().numpy()
