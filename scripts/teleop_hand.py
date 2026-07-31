@@ -597,7 +597,7 @@ class MadronaRecorder:
             print(f"wrote {path} ({len(frames)} frames)")
 
 
-def build_scene(hands, vis, record, splat_bg=True, offset=(0.0, 0.0, 0.0)):
+def build_scene(hands, vis, record, splat_bg=True, offset=(0.0, 0.0, 0.0), viewer_res=(640, 480)):
     """One scene holding all `hands` (rigid, no MPM). With `record`, adds the madrona
     batch raytracer + the teleop-pose and TableArena rig cameras + the suite light pair.
     The ground plane collides but never renders (the splat supplies the floor pixels)."""
@@ -614,7 +614,7 @@ def build_scene(hands, vis, record, splat_bg=True, offset=(0.0, 0.0, 0.0)):
         ),
         vis_options=gs.options.VisOptions(rendered_envs_idx=[0]),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=view, camera_lookat=tuple(mid), camera_fov=45, max_FPS=40
+            res=tuple(viewer_res), camera_pos=view, camera_lookat=tuple(mid), camera_fov=45, max_FPS=40
         ),
         show_viewer=vis,
         **({"renderer": gs.options.renderers.BatchRenderer(use_rasterizer=False)} if record else {}),
@@ -865,18 +865,27 @@ def _build_env(a):
     env.scene."""
     from xsim import suite
 
+    import genesis as gs
+
     names = _register_teleop_robots()
     sides = {"lr": ["right", "left"], "r": ["right"], "l": ["left"]}[a.hands]
-    env = suite.make(
-        "Lift",
-        robots=[names[s] for s in sides],
-        n_envs=1,
-        show_viewer=a.vis,
-        render_backend="batch" if a.record else "raster",
-        camera_res=CAM_RES,
-        randomize_cameras=False,
-        horizon=10**9,
-    )
+    # the env doesn't plumb viewer options; scope a smaller default viewer res in
+    # (gs.Scene constructs `ViewerOptions()` at call time, so this lands)
+    orig_vo = gs.options.ViewerOptions
+    gs.options.ViewerOptions = lambda **kw: orig_vo(**{"res": tuple(a.viewer_res), **kw})
+    try:
+        env = suite.make(
+            "Lift",
+            robots=[names[s] for s in sides],
+            n_envs=1,
+            show_viewer=a.vis,
+            render_backend="batch" if a.record else "raster",
+            camera_res=CAM_RES,
+            randomize_cameras=False,
+            horizon=10**9,
+        )
+    finally:
+        gs.options.ViewerOptions = orig_vo
     env.reset()
     hands = {}
     for s, robot in zip(sides, env.robots):
@@ -893,7 +902,7 @@ def _build_hands(a):
     sides = {"lr": ["right", "left"], "r": ["right"], "l": ["left"]}[a.hands]
     off = np.asarray(a.offset)
     hands = {s: SimHand(s, np.array(LIVE_POS[s]) + off, ema_n=a.ema) for s in sides}
-    scene, rec = build_scene(list(hands.values()), a.vis, a.record, not a.no_splat_bg, a.offset)
+    scene, rec = build_scene(list(hands.values()), a.vis, a.record, not a.no_splat_bg, a.offset, a.viewer_res)
     return hands, scene, rec
 
 
@@ -988,11 +997,14 @@ def live(a):
     last_t = time.monotonic()
     try:
         while (scene.viewer.is_alive() if scene and a.vis else True) and (not a.steps or step < a.steps):
+            t0 = time.monotonic()
             ok, frame = cap.read()
             if not ok:
                 print("camera read failed")
                 continue
+            t1 = time.monotonic()
             dets = (client.step({"image": frame, "type": "image"}) or {}).get("hands") or []
+            t2 = time.monotonic()
             if preview:
                 preview.push(_annotate(frame.copy(), dets))
             got = _dets_to_world(dets, K, world_from_cam_rdf)
@@ -1026,11 +1038,15 @@ def live(a):
                 if rec:
                     rec.capture()
                 if step % 30 == 0:
+                    t3 = time.monotonic()
                     stat = "  ".join(
                         f"{s}:{'miss' if h.misses else f'{e * 1e3:5.1f}mm'}"
                         for (s, h), e in zip(hands.items(), errs.values())
                     )
-                    print(f"frame {step:6d}  {stat}")
+                    print(
+                        f"frame {step:6d}  {stat}  | cam {(t1 - t0) * 1e3:4.0f}ms wilor {(t2 - t1) * 1e3:4.0f}ms "
+                        f"sim({n_steps}) {(t3 - t2) * 1e3:4.0f}ms"
+                    )
             step += 1
     except KeyboardInterrupt:
         pass
@@ -1117,6 +1133,7 @@ def main():
     l.add_argument("--record", type=str, default=None, help="mp4 rendered via madrona+gsplat from the teleop-cam pose")
     l.add_argument("--no-splat-bg", action="store_true")
     l.add_argument("--no-arena", action="store_true", help="bare-plane scene instead of the TableArena Lift env")
+    l.add_argument("--viewer-res", type=int, nargs=2, default=[640, 480], metavar=("W", "H"), help="live viewer window size")
     l.add_argument("--steps", type=int, default=0, help="0 = run until stopped")
     l.add_argument(
         "--offset", type=float, nargs=3, default=list(WORLD_OFFSET), metavar=("X", "Y", "Z"),
