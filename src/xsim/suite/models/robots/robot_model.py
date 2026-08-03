@@ -83,6 +83,14 @@ class RobotModel:
     ik_w_pos: float = 4.0        # position residual weight  [m]
     ik_w_rot: float = 2.0        # orientation residual weight [rad, angle-axis]
     ik_w_home: float = 0.01      # rest-pose (q - q_home) regularizer weight
+    # Optional per-joint scaling of the home block, applied as
+    # ``ik_w_home * ik_home_hierarchy``. Parking the big proximal joints harder
+    # than the wrist makes tracking recruit the wrist first, so the arm keeps a
+    # natural elbow instead of the nearest-branch contortion a uniform weight
+    # allows (xclients/pyroki uses (4,4,2,4,2,1,1) on the xArm7). None = uniform.
+    ik_home_hierarchy: tuple[float, ...] | None = None
+    # Rest pose the home block pulls toward; None = the model's home qpos.
+    ik_home_qpos: tuple[float, ...] | None = None
     ik_w_limit: float = 1.0      # soft joint-limit barrier weight
     ik_w_manip: float = 0.0      # manipulability ascent weight (0 = off; approximate)
     ik_iters: int = 25           # Gauss-Newton/LM iterations

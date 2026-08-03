@@ -276,6 +276,10 @@ class Robot:
         lo = lo.to(device=gs.device, dtype=gs.tc_float).reshape(-1)
         hi = hi.to(device=gs.device, dtype=gs.tc_float).reshape(-1)
         q_home = self._init_qpos[:n].to(device=gs.device, dtype=gs.tc_float)
+        if m.ik_home_qpos is not None:
+            q_home = torch.as_tensor(
+                m.ik_home_qpos[:n], device=gs.device, dtype=gs.tc_float
+            )
 
         # save full state to restore on exit (IK must not perturb the sim)
         q_full0 = self.entity.get_qpos().clone()
@@ -287,6 +291,14 @@ class Robot:
 
         wp, wr = float(m.ik_w_pos), float(m.ik_w_rot)
         wh, wl, wm = float(m.ik_w_home), float(m.ik_w_limit), float(m.ik_w_manip)
+        # per-joint home weights: (n,) so the home block is a diagonal, not a
+        # scalar multiple of I (uniform stays exactly as before)
+        wh_vec = torch.full((n,), wh, device=gs.device, dtype=gs.tc_float)
+        if m.ik_home_hierarchy is not None:
+            wh_vec = wh_vec * torch.as_tensor(
+                m.ik_home_hierarchy[:n], device=gs.device, dtype=gs.tc_float
+            )
+        wh_sq = (wh_vec * wh_vec).unsqueeze(0)  # (1,n)
         lam = float(m.ik_sc_damping)
         eye = torch.eye(n, device=gs.device, dtype=gs.tc_float).unsqueeze(0)
         margin = 0.05      # rad, joint-limit barrier onset before the hard limit
@@ -309,11 +321,11 @@ class Robot:
             # normal equations: H = sum_k Jk^T Jk, g = sum_k Jk^T rk (weights^2)
             H = (wp * wp) * (Jp.transpose(1, 2) @ Jp)
             H = H + (wr * wr) * (Jr.transpose(1, 2) @ Jr)
-            H = H + (wh * wh) * eye
+            H = H + torch.diag_embed(wh_sq.expand(B, -1))
             H = H + (wl * wl) * torch.diag_embed(active)
             g = (wp * wp) * torch.einsum("bij,bi->bj", Jp, e_pos)
             g = g + (wr * wr) * torch.einsum("bij,bi->bj", Jr, e_rot)
-            g = g + (wh * wh) * (q - q_home)
+            g = g + wh_sq * (q - q_home)
             g = g + (wl * wl) * (over - under)
 
             dq = -torch.linalg.solve(H + lam * eye, g.unsqueeze(-1)).squeeze(-1)

@@ -9,10 +9,57 @@ fields carry any base offset.
 
 from __future__ import annotations
 
+import math
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
 
 from xsim.suite.models.cameras import CameraSpec
 from xsim.suite.models.robots.xarm7 import PROJECT_ROOT, XArm7
+
+
+def roll_eef_urdf(src: Path, deg: float = 180.0, link: str = "link_eef") -> Path:
+    """Sibling URDF with everything mounted on ``link`` rolled about its z axis
+    (the flange/tool axis). Only the mount joints' origins move — the arm and
+    the end-effector's internal geometry are untouched — so a gripper's
+    measured TCP transforms by the same Rz. Idempotent; writes *_roll<deg>.urdf
+    next to ``src`` so relative mesh paths keep resolving."""
+    dst = src.with_name(f"{src.stem}_roll{int(deg)}.urdf")
+    if dst.exists():
+        return dst
+    a = math.radians(deg)
+    Rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
+
+    tree = ET.parse(src)
+    for joint in tree.getroot().findall("joint"):
+        if joint.find("parent").get("link") != link:
+            continue
+        origin = joint.find("origin")
+        xyz = np.array([float(v) for v in origin.get("xyz", "0 0 0").split()])
+        r, p, y = (float(v) for v in origin.get("rpy", "0 0 0").split())
+        # URDF rpy is fixed-axis: R = Rz(y) Ry(p) Rx(r); pre-multiplying by Rz
+        # rotates the mount frame in the parent (flange) frame
+        cr, sr, cp, sp, cy, sy = (
+            math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+        )
+        R = Rz @ np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ])
+        origin.set("xyz", " ".join(f"{v:.9g}" for v in Rz @ xyz))
+        origin.set(
+            "rpy",
+            " ".join(f"{v:.9g}" for v in (
+                math.atan2(R[2, 1], R[2, 2]),
+                math.atan2(-R[2, 0], math.hypot(R[2, 1], R[2, 2])),
+                math.atan2(R[1, 0], R[0, 0]),
+            )),
+        )
+    tree.write(dst, xml_declaration=True, encoding="utf-8")
+    return dst
 
 
 @dataclass
